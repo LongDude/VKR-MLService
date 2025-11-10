@@ -1,0 +1,127 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: vkr-ml-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-password123}
+      MINIO_DEFAULT_BUCKETS: "pdf-raw,parsed-text,ml-models"
+    ports:
+      - 9000:9000  # API порт
+      - 8083:9001  # Console порт - 
+    volumes:
+      - minio_data:/data
+      - ./core/minio-setup.sh:/etc/minio-setup.sh
+    networks:
+      - ml_network # В остальном пусть не мешает
+      - vkr-outer-network # открываем доступ вовне для console
+
+  redis:
+    image: redis:7-alpine
+    container_name: vkr-ml-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD:-redis123}
+    ports:
+      - 6379:6379
+    volumes:
+      - redis_data:/data
+    networks:
+      - ml_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: vkr-ml-redis-commander
+    restart: unless-stopped
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redis123}
+      - REDIS_DB=0
+    ports:
+      - 8082:8081
+    depends_on:
+      - redis
+    networks:
+      - ml_network
+      - vkr-outer-network
+    
+  ml-core:
+    build: 
+      context: .
+      dockerfile: core/Dockerfile
+    container_name: vkr-ml-core
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - ml_network
+      - vkr-inner-network
+      - vkr-outer-network
+    environment:
+      - PYTHONPATH=/app/src
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./core:/app/core
+      - ./src:/app/src
+      - .env:/app/.env
+    ports:
+      - 8000:8000  # FastAPI порт
+
+  ml-console:
+    build: 
+      context: .
+      dockerfile: core/Dockerfile
+    container_name: vkr-ml-console
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - ml_network
+      - vkr-inner-network
+      - vkr-outer-network
+    environment:
+      - PYTHONPATH=/app/src
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./core:/app/core
+      - ./src:/app/src
+      - .env:/app/.env
+    stdin_open: true
+    tty: true
+    command: ["/bin/sh", "-c", "source /app/.venv/bin/activate && exec /bin/sh"]
+
+volumes:
+  minio_data:
+    name: "vkr-volume-minio" 
+  redis_data:
+    name: "vkr-volume-redis"
+
+networks:
+  ml_network: # Локальная сеть для данного контейнера
+    name: vkr-scinside-ml-network
+    driver: bridge
+    internal: true
+    external: false
+  vkr-inner-network:
+    name: vkr-scinside-internal
+    driver: bridge
+    internal: true
+    external: true
+  vkr-outer-network:
+    name: vkr-scinside-external
+    driver: bridge
+    internal: false
+    external: true
