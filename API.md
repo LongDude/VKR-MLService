@@ -12,7 +12,7 @@ metadata_queue: Stream - поток статей на загрузку в вре
 1. Подключаемся через docker exec к контейнеру
 2. Проводим предварительную инициализацию бакетов:
     ./etc/minio-setup.sh
-3. Создаем пользователя и ключи доступа
+~~3. Создаем пользователя и ключи доступа~~
     ```sh
     # Создание пользователя
     mc admin user add myminio <MINIO_USER> <MINIO_PASSWORD>
@@ -29,4 +29,5 @@ metadata_queue: Stream - поток статей на загрузку в вре
     # Expiration: no-expiry
     # Сохраняем ключи в .env
     ```
+3. ACCESS_KEYS устарели: рекомендуется исползовать ROOT_USER и ROOT_PASSWORD
 4. Сохраняем ключи и исползованные данные пользователя в `.env`, см. `.env.example`
