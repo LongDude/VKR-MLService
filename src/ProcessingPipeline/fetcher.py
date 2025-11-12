@@ -1,45 +1,17 @@
 # fetcher.py
 import asyncio
 import aiohttp
-import hashlib
 import datetime
 import xml.etree.ElementTree as ET
+from psycopg2 import connect 
 from redis import asyncio as aioredis
-from psycopg2 import connect
 import json
-import os
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
+from service_lib import ServiceConnectionFactory
 
 if load_dotenv(): print("INFO: loaded dotenv")
 ARXIV_API = "http://export.arxiv.org/oai2"
-
-# Redis URL should resolve to the compose service when running inside the ML docker network.
-REDIS_URL = os.getenv("REDIS_URL")
-if not REDIS_URL:
-    redis_host = os.getenv("REDIS_HOST", "redis")
-    redis_port = os.getenv("REDIS_PORT", "6379")
-    redis_password = os.getenv("REDIS_PASSWORD")
-    redis_auth = f":{redis_password}@" if redis_password else ""
-    REDIS_URL = f"redis://{redis_auth}{redis_host}:{redis_port}/0"
-
-# Build a Postgres DSN that fits both local dev and the shared docker network.
-DB_DSN = os.getenv("DATABASE_DSN")
-if not DB_DSN:
-    pg_user = os.getenv("POSTGRES_USER", "user")
-    pg_password = os.getenv("POSTGRES_PASSWORD", "pass")
-    pg_host = os.getenv("POSTGRES_HOST", "vkr-database")
-    pg_port = os.getenv("POSTGRES_PORT", "5432")
-    pg_db = os.getenv("POSTGRES_DB", "db")
-    DB_DSN = f"postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}"  # Используется в дедупл части
-
-create_db_conn = lambda: connect(
-    host="vkr-database",
-    port=5432,
-    user=os.getenv('POSTGRES_USER','postgres'),
-    password=os.getenv('POSTGRES_PASSWORD', 'gresP0st'),
-    database=os.getenv('POSTGRES_DB','vkr-db'),
-)
 
 async def fetch_arxiv_newest(hours_window=24, max_results=100, *, hours_offset=0,  days_offset=0, days_window=0):
     end_date = datetime.datetime.now() - datetime.timedelta(hours=hours_offset, days=days_offset)
@@ -130,14 +102,11 @@ def parse_records_from_xml(xml_text: str) -> List[Dict[str, str]]:
                         keyname = keyname_elem.text.strip() if keyname_elem is not None and keyname_elem.text else None
                         forenames = forenames_elem.text.strip() if forenames_elem is not None and forenames_elem.text else None
 
-                        name_parts = []
-                        if forenames:
-                            name_parts.append(forenames)
-                        if keyname:
-                            name_parts.append(keyname)
-
-                        if name_parts:
-                            authors.append(" ".join(name_parts))
+                        if keyname or forenames:
+                            authors.append({
+                                "keyname": keyname or "",
+                                "forenames": forenames or ""
+                            })
 
                     if authors:
                         record_data['authors'] = authors
@@ -201,48 +170,54 @@ def extract_resumption_token(xml_text: str) -> Optional[str]:
         return None
 
 async def deduplication(entries):
-    conn = create_db_conn()
-    r = await aioredis.from_url(REDIS_URL)
+    conn = ServiceConnectionFactory.createDatabaseConnection()
+    r = ServiceConnectionFactory.getRedisClient()
     dedup_entries = []
 
     for e in entries:
         # check redis for cached requests
-        already = await r.sismember("seen_arxiv_ids", e["id"]) # type: ignore
+        already = r.sismember("seen_arxiv_ids", e["id"]) # type: ignore
         if already: continue
 
         try:
             id_key, id_val = e["id"].split(":")
-            result = 0
             with conn.cursor() as cursor:
                 cursor.execute("SELECT add_unique_publication(%s, %s, %s, %s, %s)",
                                (e["title"], e["abstract"], e["submitted_date"], id_key, id_val))
-                result = cursor.fetchone()[0]
-                conn.commit()
-            if result != 0:
-                dedup_entries.append(e)
-
+                new_pub_id = cursor.fetchone()[0]
+                if new_pub_id != 0:
+                    print(f"VERB: Добавлена запись {e['id']} с новым id: {new_pub_id} ")
+                    e["db_id"] = new_pub_id
+                    if e["authors"]:
+                        for author in e["authors"]:
+                            cursor.execute("SELECT add_author_publication(%s, %s, %s, %s)",
+                                           (author["keyname"], author["forenames"], "Не указано", new_pub_id))
+                            print(f"VERB: Добавлен автор {author['keyname']} {author['forenames']} для публикации {new_pub_id}")
+                    dedup_entries.append(e)
+            conn.commit()
         except Exception as e:
             conn.rollback()
             print(f"ERR: Ошибка добавления записи: {e} ")
     
     print(f"INFO: Количество записей после дедупликации: {len(dedup_entries)}/{len(entries)}")
+    conn.close()
     return dedup_entries
 
 
-async def push_to_redis(dedupl_entries):
-    r = await aioredis.from_url(REDIS_URL)
+def push_to_redis(dedupl_entries):
+    r = ServiceConnectionFactory.getRedisClient()
     for e in dedupl_entries:
         # make a deterministic fingerprint for dedup in DB
         payload = json.dumps(e, ensure_ascii=False)
-        await r.xadd("metadata_queue", {"data": payload})
-        await r.sadd("seen_arxiv_ids", e["id"]) # type: ignore
+        r.xadd("metadata_queue", {"data": payload})
+        r.sadd("seen_arxiv_ids", e["id"]) # type: ignore
     print(f"INFO: Сохранил {len(dedupl_entries)} в Redis")
 
 async def main():
-    newest_entries = await fetch_arxiv_newest(max_results=0, hours_window=0, days_window=5)
+    newest_entries = await fetch_arxiv_newest(max_results=500, hours_window=0, days_window=1)
     # Filter by published within last 24h:
     deduplicated_entries = await deduplication(newest_entries)
-    await push_to_redis(deduplicated_entries)
+    push_to_redis(deduplicated_entries)
 
 if __name__ == "__main__":
     asyncio.run(main())

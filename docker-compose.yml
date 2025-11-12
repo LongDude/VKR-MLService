@@ -4,6 +4,8 @@ services:
     container_name: vkr-ml-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
+    env_file:
+      - .env
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-password123}
@@ -58,6 +60,8 @@ services:
       dockerfile: core/Dockerfile
     container_name: vkr-ml-core
     restart: unless-stopped
+    env_file:
+      - .env
     depends_on:
       redis:
         condition: service_healthy
@@ -83,6 +87,8 @@ services:
       dockerfile: core/Dockerfile
     container_name: vkr-ml-console
     restart: unless-stopped
+    env_file:
+      - .env
     depends_on:
       redis:
         condition: service_healthy
@@ -98,7 +104,7 @@ services:
     volumes:
       - ./core:/app/core
       - ./src:/app/src
-      - .env:/app/.env
+      - .env:/app/.env # hotswap env params while in dev 
     stdin_open: true
     tty: true
     command: ["/bin/sh", "-c", "source /app/.venv/bin/activate && exec /bin/sh"]
