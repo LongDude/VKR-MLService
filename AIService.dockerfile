@@ -31,6 +31,7 @@ COPY --from=builder /app/.venv /app/.venv
 # Копируем исходный код
 COPY src/ /app/src/
 COPY core/ /app/core/
+COPY ./main.py /app/main.py
 
 # Используем Python из venv
-CMD ["/app/.venv/bin/python", "-m", "uvicorn", "core.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["/app/.venv/bin/python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

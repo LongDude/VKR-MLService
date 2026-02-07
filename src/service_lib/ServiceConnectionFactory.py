@@ -6,7 +6,7 @@ from os import getcwd, getenv
 
 # Предварительная прогрузка при импорте
 print("Импортирован класс ServiceConnectionFactory")
-if load_dotenv(): 
+if load_dotenv("./core/.env"): 
     print("INFO [ServiceConnectionFactory]: loaded dotenv")
 else:
     raise Exception(f"ERR: Ошибка загрузки .env из рабочей директории: {getcwd()}")

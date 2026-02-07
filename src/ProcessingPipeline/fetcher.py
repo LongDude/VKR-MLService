@@ -10,7 +10,7 @@ from typing import List, Dict, Optional
 from dotenv import load_dotenv
 from service_lib import ServiceConnectionFactory
 
-if load_dotenv(): print("INFO: loaded dotenv")
+if load_dotenv("./core/.env"): print("INFO: loaded dotenv")
 ARXIV_API = "http://export.arxiv.org/oai2"
 
 async def fetch_arxiv_newest(hours_window=24, max_results=100, *, hours_offset=0,  days_offset=0, days_window=0):

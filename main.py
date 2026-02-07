@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 import os
 
 app = FastAPI(title="ML Service")
-load_dotenv()
+load_dotenv("./core/.env")
 
 # Инициализация клиентов
 redis_client = redis.Redis(
