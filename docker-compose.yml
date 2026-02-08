@@ -15,6 +15,9 @@ services:
     networks:
       - ml_network # В остальном пусть не мешает
       - vkr-outer-network # открываем доступ вовне для console
+    profiles:
+      - service
+      - manual
 
   redis:
     image: redis:7-alpine
@@ -34,6 +37,9 @@ services:
       interval: 10s
       timeout: 3s
       retries: 3
+    profiles:
+      - service
+      - manual
 
   redis-commander:
     image: rediscommander/redis-commander:latest
@@ -52,12 +58,15 @@ services:
     networks:
       - ml_network
       - vkr-outer-network
-    
-  ml-core:
+    profiles:
+      - service
+      - manual
+
+  ml-service:
     build: 
       context: .
-      dockerfile: AIService.dockerfile
-    container_name: vkr-ml-core
+      dockerfile: ./core/TransformersBase.dockerfile
+    container_name: vkr-ml-service
     restart: unless-stopped
     env_file:
       - ./core/.env
@@ -76,15 +85,27 @@ services:
     volumes:
       - ./core:/app/core
       - ./src:/app/src
-      - ./core/.env:/app/.env
-      - ./main.py:/app/main.py
+      - ./logs:/app/logs
+      - ./.models:/app/.models
+      - ./.cache:/root/.cache
+      - ./.venv-lin:/app/.venv-lin
     ports:
       - 8000:8000  # FastAPI порт
+    command: ["/app/.venv-lin/bin/python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    profiles:
+      - service
+    deploy:
+        resources:
+          reservations:
+            devices:
+              - driver: nvidia
+                count: 1
+                capabilities: [gpu]
 
   ml-console:
     build: 
       context: .
-      dockerfile: AIService.dockerfile
+      dockerfile: ./core/TransformersBase.dockerfile
     container_name: vkr-ml-console
     restart: unless-stopped
     env_file:
@@ -104,12 +125,22 @@ services:
     volumes:
       - ./core:/app/core
       - ./src:/app/src
-      - ./core/.env:/app/.env # hotswap env params while in dev 
-      - ./main.py:/app/main.py
-
+      - ./logs:/app/logs
+      - ./.models:/app/.models
+      - ./.cache:/root/.cache
+      - ./.venv-lin:/app/.venv-lin
     stdin_open: true
     tty: true
-    command: ["/bin/sh", "-c", "source /app/.venv/bin/activate && exec /bin/sh"]
+    command: ["/bin/bash", "-c", "/app/core/update-venv.sh && exec /bin/bash"]
+    profiles:
+      - manual
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
 volumes:
   minio_data:

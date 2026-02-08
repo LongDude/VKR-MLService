@@ -214,7 +214,7 @@ def push_to_redis(dedupl_entries):
     print(f"INFO: Сохранил {len(dedupl_entries)} в Redis")
 
 async def main():
-    newest_entries = await fetch_arxiv_newest(max_results=500, hours_window=0, days_window=1)
+    newest_entries = await fetch_arxiv_newest(max_results=500, hours_window=0, days_window=3)
     # Filter by published within last 24h:
     deduplicated_entries = await deduplication(newest_entries)
     push_to_redis(deduplicated_entries)

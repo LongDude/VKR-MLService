@@ -58,8 +58,8 @@ class ServiceConnectionFactory(object):
         minio_url = getenv("MINIO_URL")
         if not minio_url:
             minio_endpoint = getenv("MINIO_ENDPOINT")
-            minio_access = getenv("MINIO_ACCESS_KEY")
-            minio_secret = getenv("MINIO_SECRET_KEY")
+            minio_access = getenv("MINIO_ROOT_USER")
+            minio_secret = getenv("MINIO_ROOT_PASSWORD")
             minio_secure = False # *: есть возможность расширить конфигурацию .conf файлом
         print(f"INFO: Minio Client: {minio_access} {minio_secret}")
         return Minio(
