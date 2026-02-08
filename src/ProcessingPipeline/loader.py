@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 import redis
 import requests
 from minio import Minio
@@ -24,7 +24,8 @@ class Loader:
         redis_preprocess_stream_key: str = 'preprocess_queue',
         redis_err_stream_key: str = 'err_queue',
         minio_bucket: str = 'pdf-raw',
-        arxiv_api_url: str = 'https://arxiv.org/pdf/',
+        arxiv_pdf_url: str = 'https://arxiv.org/pdf/',
+        arxiv_source_url: str = 'https://arxiv.org/src/',
         max_batch_articles: Optional[int] = None,
         max_queue_articles: Optional[int] = None
     ):
@@ -36,14 +37,15 @@ class Loader:
             redis_raw_pdf_stream_key: Ключ Redis Stream для потока обработки
             minio_bucket: Бакет Minio для хранения PDF
             minio_secure: Использовать SSL для Minio
-            arxiv_api_url: Базовый URL ArXive API
+            arxiv_pdf_url: Базовый URL для PDF на arXiv
             max_articles: Максимальное количество статей для обработки (опционально)
         """
         self.redis_download_stream_key = redis_download_stream_key
         self.redis_preprocess_stream_key = redis_preprocess_stream_key
         self.redis_err_stream_key = redis_err_stream_key
         self.minio_bucket = minio_bucket
-        self.arxiv_api_url = arxiv_api_url
+        self.arxiv_pdf_url = arxiv_pdf_url.rstrip('/')
+        self.arxiv_source_url = arxiv_source_url.rstrip('/')
         self.max_batch_articles = max_batch_articles
         self.max_queue_articles = max_queue_articles
         self.processed_count = 0
@@ -105,43 +107,73 @@ class Loader:
             logger.error(f"Ошибка при получении записи из Redis: {e}")
             return None
     
-    def download_pdf_from_arxiv(self, arxiv_id: str) -> Optional[bytes]:
-        """
-        Загружает PDF файл статьи из ArXive
-        
-        Args:
-            arxiv_id: ID статьи в формате 'arxiv:<id>' или просто '<id>'
-            
-        Returns:
-            Optional[bytes]: PDF данные или None при ошибке
-        """
+
+    def _clean_arxiv_identifier(self, article_id: Optional[str]) -> str:
+        if not article_id:
+            return ""
+        return article_id.split(":")[-1]
+
+    def _build_download_candidates(self, record: Dict[str, Any]) -> List[Dict[str, str]]:
+        arxiv_id = record.get("id") or record.get("article_id")
+        clean_id = self._clean_arxiv_identifier(arxiv_id)
+        preferences = record.get("download_preferences") or {}
+        preferred_format = str(record.get("preferred_format") or "source").lower()
+
+        order: List[str] = []
+        if preferred_format:
+            order.append(preferred_format)
+        order.extend(["source", "pdf"])
+
+        final_order: List[str] = []
+        seen: set[str] = set()
+        for fmt in order:
+            if fmt and fmt not in seen:
+                seen.add(fmt)
+                final_order.append(fmt)
+
+        fallback_urls: Dict[str, str] = {}
+        if clean_id:
+            fallback_urls["source"] = f"{self.arxiv_source_url}/{clean_id}"
+            fallback_urls["pdf"] = f"{self.arxiv_pdf_url}/{clean_id}.pdf"
+
+        candidates: List[Dict[str, str]] = []
+        for fmt in final_order:
+            pref_entry = preferences.get(fmt) if isinstance(preferences, dict) else None
+            url = None
+            extension = None
+            if isinstance(pref_entry, dict):
+                url = pref_entry.get("url")
+                extension = pref_entry.get("extension")
+            elif isinstance(pref_entry, str):
+                url = pref_entry
+
+            if not url:
+                url = fallback_urls.get(fmt)
+            if not url:
+                continue
+
+            if not extension:
+                extension = "tar.gz" if fmt == "source" else "pdf"
+
+            candidates.append({"format": fmt, "url": url, "extension": extension})
+
+        if not candidates and fallback_urls:
+            for fmt, url in fallback_urls.items():
+                candidates.append({"format": fmt, "url": url, "extension": "tar.gz" if fmt == "source" else "pdf"})
+
+        return candidates
+
+    def _download_from_url(self, url: str) -> Optional[Tuple[bytes, str]]:
         try:
-            # Извлекаем чистый ID статьи
-            clean_id = arxiv_id.split(":")[-1]
-            
-            # Формируем URL для скачивания PDF
-            pdf_url = f"{self.arxiv_api_url}{clean_id}.pdf"
-            
-            logger.info(f"Загрузка PDF: {pdf_url}")
-            
-            # Загружаем PDF
-            response = requests.get(pdf_url, timeout=30)
+            response = requests.get(url, timeout=60)
             response.raise_for_status()
-            
-            # Проверяем что это действительно PDF
-            content_type = response.headers.get('content-type', '')
-            if 'application/pdf' not in content_type:
-                logger.warning(f"Получен не PDF файл: {content_type}")
-                return None
-            
-            logger.info(f"PDF успешно загружен, размер: {len(response.content)} байт")
-            return response.content
-            
-        except requests.RequestException as e:
-            logger.error(f"Ошибка при загрузке PDF: {e}")
+            content_type = response.headers.get("content-type", "application/octet-stream")
+            return response.content, content_type
+        except requests.RequestException as exc:
+            logger.error(f"Ошибка скачивания %s: %s", url, exc)
             return None
-    
-    def upload_to_minio(self, pdf_data: bytes, object_name: str) -> bool:
+
+    def upload_to_minio(self, pdf_data: bytes, object_name: str, content_type: str = 'application/pdf') -> bool:
         """
         Загружает PDF файл в Minio
         
@@ -162,7 +194,7 @@ class Loader:
                 object_name=object_name,
                 data=pdf_stream,
                 length=len(pdf_data),
-                content_type='application/pdf'
+                content_type=content_type or 'application/octet-stream'
             )
             res.location
             
@@ -209,27 +241,33 @@ class Loader:
             return False
 
 
-    def redis_save_to_preprocess_stream(self, paper_pdf_path: str, paper_database_idx: int, paper_arxive_idx: str): 
-        """
-        Сохраняет в очередь предобработки связь статьи в бакете, id статьи и статьи в БД
-        
-        Returns:
-            bool: True если статья успешно обработана, False если нет записей или ошибка
-        """
+
+    def redis_save_to_preprocess_stream(
+        self,
+        paper_pdf_path: str,
+        paper_database_idx: int,
+        paper_arxive_idx: str,
+        download_format: str,
+        download_url: Optional[str] = None,
+    ):
+        """Persist metadata about the downloaded object into preprocess queue."""
 
         link_object = {
             "article_id": paper_arxive_idx,
             "db_id": paper_database_idx,
-            "pdf_path": paper_pdf_path
+            "pdf_path": paper_pdf_path,
+            "download_format": download_format,
         }
+        if download_url:
+            link_object["download_url"] = download_url
 
         try:
             payload = json.dumps(link_object, ensure_ascii=False)
             self.redis_client.xadd(self.redis_preprocess_stream_key, {"data": payload})
-        except redis.RedisError as e:
-            logger.error(f"Ошибка при удалении записи: {e}")
+        except redis.RedisError as exc:
+            logger.error(f"Failed to push preprocess record: {exc}")
             return False
-        pass    
+        return True
 
     def process_single_article(self) -> bool:
         """
@@ -263,27 +301,41 @@ class Loader:
             return False
         
         try:
-            # Загружаем PDF
-            pdf_data = self.download_pdf_from_arxiv(article_id)
-            if not pdf_data:
-                logger.error(f"Не удалось загрузить PDF для статьи: {article_id}")
+            candidates = self._build_download_candidates(record)
+            download_blob = None
+            chosen_candidate = None
+
+            for candidate in candidates:
+                download_blob = self._download_from_url(candidate["url"])
+                if download_blob:
+                    chosen_candidate = candidate
+                    logger.info("Загружен %s формат для статьи %s", candidate["format"], article_id)
+                    break
+
+            if not download_blob or not chosen_candidate:
+                logger.error("Не удалось скачать материалы для статьи: %s", article_id)
                 return False
-            
-            # Формируем имя файла для Minio
-            clean_id = article_id.replace('arxiv:', '')
-            object_name = f"{clean_id}.pdf"
-            
-            # Загружаем в Minio
-            if self.upload_to_minio(pdf_data, object_name):
-                # Удаляем запись из потока только при успешной загрузке
+
+            file_bytes, content_type = download_blob
+            clean_id = self._clean_arxiv_identifier(article_id) or article_id.replace(':', '_')
+            extension = chosen_candidate.get("extension") or ("tar.gz" if chosen_candidate["format"] == "source" else "pdf")
+            if not extension.startswith('.'):
+                extension = f".{extension}"
+            object_name = f"{clean_id}{extension}"
+
+            if self.upload_to_minio(file_bytes, object_name, content_type):
                 self.remove_record_from_stream(stream_id)
-                self.redis_save_to_preprocess_stream(object_name, db_id, article_id)
+                self.redis_save_to_preprocess_stream(
+                    object_name,
+                    db_id,
+                    article_id,
+                    chosen_candidate["format"],
+                    chosen_candidate.get("url"),
+                )
                 self.processed_count += 1
-                logger.info(f"Статья успешно обработана: {article_id}")
+                logger.info("Статья успешно обработана (%s): %s", chosen_candidate["format"], article_id)
                 return True
-            else:
-                return False
-                
+            return False
         except Exception as e:
             logger.error(f"Ошибка при обработке статьи {article_id}: {e}")
             return False

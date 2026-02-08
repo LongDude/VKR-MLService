@@ -1,9 +1,28 @@
-uvicorn
-redis
-pymupdf
-psycopg2-binary
-fastapi
-minio
 dotenv
 aiohttp
+
+# Control flow
+uvicorn
+fastapi
+pydantic
+
+# Services
+psycopg2-binary
+redis
+minio
+
+# Text parsing
+pymupdf
 pdfplumber
+wordninja
+pylatexenc
+
+# Keyword extraction
+yake
+keybert
+scispacy
+spacy
+sentence_transformers
+qdrant_client
+https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_sm-0.5.4.tar.gz
+langdetect

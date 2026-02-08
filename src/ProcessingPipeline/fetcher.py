@@ -1,223 +1,262 @@
-# fetcher.py
+
+"""ArXiv fetcher that ingests metadata into Redis queues."""
+
 import asyncio
-import aiohttp
 import datetime
-import xml.etree.ElementTree as ET
-from psycopg2 import connect 
-from redis import asyncio as aioredis
 import json
-from typing import List, Dict, Optional
+import xml.etree.ElementTree as ET
+from typing import Any, Dict, List, Optional
+
+import aiohttp
 from dotenv import load_dotenv
+
 from service_lib import ServiceConnectionFactory
 
-if load_dotenv("./core/.env"): print("INFO: loaded dotenv")
 ARXIV_API = "http://export.arxiv.org/oai2"
+ARXIV_PDF_BASE = "https://arxiv.org/pdf"
+ARXIV_SOURCE_BASE = "https://arxiv.org/e-print"
 
-async def fetch_arxiv_newest(hours_window=24, max_results=100, *, hours_offset=0,  days_offset=0, days_window=0):
-    end_date = datetime.datetime.now() - datetime.timedelta(hours=hours_offset, days=days_offset)
-    start_date = end_date - datetime.timedelta(hours=hours_window, days=days_window)
 
-    start_str = start_date.strftime("%Y-%m-%d")
-    end_str = end_date.strftime("%Y-%m-%d")
+class ArxivFetcher:
+    """High-level orchestrator for reading ArXiv OAI feed and pushing into Redis."""
 
-    query = f"verb=ListRecords&metadataPrefix=arXiv&from={start_str}&until={end_str}"
-    url = f"{ARXIV_API}?{query}"
-    print(f"INFO: request string: {url}")
+    def __init__(
+        self,
+        metadata_queue: str = "metadata_queue",
+        seen_ids_set: str = "seen_arxiv_ids",
+        hours_window: int = 24,
+        max_results: int = 100,
+    ) -> None:
+        if load_dotenv("./core/.env"):
+            print("INFO: loaded dotenv")
 
-    all_records=[]
-    async with aiohttp.ClientSession() as session:
-        while url and (len(all_records) < max_results or max_results <= 0):
-            async with session.get(url) as resp:
-                text = await resp.text()
-                print(f"INFO: got result for time window [{start_str}, {end_str}]. Size: {text.__sizeof__()} bytes")
-                
-                records = parse_records_from_xml(text)
+        self.metadata_queue = metadata_queue
+        self.seen_ids_set = seen_ids_set
+        self.hours_window = hours_window
+        self.max_results = max_results
+        self.redis_client = ServiceConnectionFactory.getRedisClient()
 
-                print(f"INFO: extracted {len(records)} records")
-                all_records.extend(records)
+    async def fetch_newest(
+        self,
+        *,
+        hours_window: Optional[int] = None,
+        max_results: Optional[int] = None,
+        hours_offset: int = 0,
+        days_offset: int = 0,
+        days_window: int = 0,
+    ) -> List[Dict[str, Any]]:
+        hours_window = hours_window if hours_window is not None else self.hours_window
+        max_results = max_results if max_results is not None else self.max_results
 
-                resumption_token = extract_resumption_token(text)
-                if resumption_token:
-                    print(f"INFO: Обнаружен токен продолжения ({resumption_token})")
-                    if len(all_records) >= max_results > 0:
-                        print(f"INFO: скипаем повторный запрос (переполнение очереди)")
+        end_date = datetime.datetime.now() - datetime.timedelta(hours=hours_offset, days=days_offset)
+        start_date = end_date - datetime.timedelta(hours=hours_window, days=days_window)
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
+
+        query = f"verb=ListRecords&metadataPrefix=arXiv&from={start_str}&until={end_str}"
+        url = f"{ARXIV_API}?{query}"
+        print(f"INFO: request string: {url}")
+
+        records: List[Dict[str, Any]] = []
+        async with aiohttp.ClientSession() as session:
+            while url and (len(records) < max_results or max_results <= 0):
+                async with session.get(url) as resp:
+                    text = await resp.text()
+                    print(f"INFO: got result for window [{start_str}, {end_str}] ({len(text)} bytes)")
+
+                    batch = self.parse_records_from_xml(text)
+                    for record in batch:
+                        self._add_download_preferences(record)
+                    records.extend(batch)
+
+                    token = self.extract_resumption_token(text)
+                    if not token:
                         break
-                    url = f"{ARXIV_API}?verb=ListRecords&resumptionToken={resumption_token}"
-                else:
-                    break
-    
-    print(f"INFO: получена очередь записей: {len(all_records)}/{max_results} записей")
-    return all_records[:max_results] if max_results > 0 else all_records
+                    if len(records) >= max_results > 0:
+                        print("INFO: record limit reached before resumption; stopping pagination")
+                        break
+                    url = f"{ARXIV_API}?verb=ListRecords&resumptionToken={token}"
 
+        print(f"INFO: collected {len(records)}/{max_results} records from ArXiv")
+        return records[:max_results] if max_results > 0 else records
 
-def parse_records_from_xml(xml_text: str) -> List[Dict[str, str]]:
-    records = []
-    try:
-        root = ET.fromstring(xml_text)
-        
-        # Определяем namespace OAI-PMH
-        ns = {
-            'oai': 'http://www.openarchives.org/OAI/2.0/',
-            'arxiv': 'http://arxiv.org/OAI/arXiv/'
-        }
-        
-        # Находим все элементы Record
-        record_elements = root.findall('.//oai:record', ns)
-        
-        for record_elem in record_elements:
-            record_data = {}
-            
-            # Извлекаем идентификатор
-            header = record_elem.find('oai:header', ns)
-            if header is not None:
-                identifier_elem = header.find('oai:identifier', ns)
-                if identifier_elem is not None:
-                    oai_id = identifier_elem.text
-                    if oai_id.startswith("oai:"):  # type: ignore
-                        record_data['id'] = oai_id[4:] # type: ignore
-                    else:
-                        record_data['id'] = oai_id
-                
-                # Дата публикации
-                datestamp_elem = header.find('oai:datestamp', ns)
-                if datestamp_elem is not None:
-                    record_data['submitted_date'] = datestamp_elem.text
-            
-            # Извлекаем метаданные arXiv
-            metadata = record_elem.find('oai:metadata', ns)
-            if metadata is not None:
-                arxiv_data = metadata.find('arxiv:arXiv', ns)
-                if arxiv_data is not None:
-                    # Основные поля
-                    title_elem = arxiv_data.find('arxiv:title', ns)
-                    if title_elem is not None:
-                        record_data['title'] = title_elem.text
-                    
-                    authors_elems = arxiv_data.findall('arxiv:authors/arxiv:author', ns)
-                    authors = []
-                    for author_elem in authors_elems:
-                        keyname_elem = author_elem.find('arxiv:keyname', ns)
-                        forenames_elem = author_elem.find('arxiv:forenames', ns)
-
-                        keyname = keyname_elem.text.strip() if keyname_elem is not None and keyname_elem.text else None
-                        forenames = forenames_elem.text.strip() if forenames_elem is not None and forenames_elem.text else None
-
-                        if keyname or forenames:
-                            authors.append({
-                                "keyname": keyname or "",
-                                "forenames": forenames or ""
-                            })
-
-                    if authors:
-                        record_data['authors'] = authors
-                
-                    abstract_elem = arxiv_data.find('arxiv:abstract', ns)
-                    if abstract_elem is not None:
-                        record_data['abstract'] = abstract_elem.text
-                    
-                    categories_elem = arxiv_data.find('arxiv:categories', ns)
-                    if categories_elem is not None:
-                        record_data['categories'] = categories_elem.text
-                    
-                    # DOI (если есть)
-                    doi_elem = arxiv_data.find('arxiv:doi', ns)
-                    if doi_elem is not None:
-                        record_data['doi'] = doi_elem.text
-                    
-                    # Версия
-                    version_elem = arxiv_data.find('arxiv:version', ns)
-                    if version_elem is not None:
-                        record_data['version'] = version_elem.text
-            
-            if record_data:  # Добавляем только если есть данные
-                records.append(record_data)
-                
-    except ET.ParseError as e:
-        print(f"ERR: Ошибка парсинга XML: {e}")
-    except Exception as e:
-        print(f"ERR: Ошибка при обработке XML: {e}")
-    
-    # print(f"VERBOSE: {records}")
-    return records
-
-def extract_resumption_token(xml_text: str) -> Optional[str]:
-    """
-    Извлекает resumptionToken из XML ответа OAI.
-    
-    Args:
-        xml_text: XML строка ответа от OAI API
-        
-    Returns:
-        Resumption token или None, если его нет
-    """
-    try:
-        root = ET.fromstring(xml_text)
-        ns = {'oai': 'http://www.openarchives.org/OAI/2.0/'}
-        
-        # Ищем resumptionToken
-        resumption_token_elem = root.find('.//oai:resumptionToken', ns)
-        
-        if resumption_token_elem is not None and resumption_token_elem.text:
-            return resumption_token_elem.text
-        else:
-            return None
-            
-    except ET.ParseError as e:
-        print(f"ERR: Ошибка парсинга XML при извлечении resumptionToken: {e}")
-        return None
-    except Exception as e:
-        print(f"ERR: Ошибка при извлечении resumptionToken: {e}")
-        return None
-
-async def deduplication(entries):
-    conn = ServiceConnectionFactory.createDatabaseConnection()
-    r = ServiceConnectionFactory.getRedisClient()
-    dedup_entries = []
-
-    for e in entries:
-        # check redis for cached requests
-        already = r.sismember("seen_arxiv_ids", e["id"]) # type: ignore
-        if already: continue
-
+    @staticmethod
+    def parse_records_from_xml(xml_text: str) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
         try:
-            id_key, id_val = e["id"].split(":")
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT add_unique_publication(%s, %s, %s, %s, %s)",
-                               (e["title"], e["abstract"], e["submitted_date"], id_key, id_val))
-                new_pub_id = cursor.fetchone()[0]
-                if new_pub_id != 0:
-                    print(f"VERB: Добавлена запись {e['id']} с новым id: {new_pub_id} ")
-                    e["db_id"] = new_pub_id
-                    if e["authors"]:
-                        for author in e["authors"]:
-                            cursor.execute("SELECT add_author_publication(%s, %s, %s, %s)",
-                                           (author["keyname"], author["forenames"], "Не указано", new_pub_id))
-                            print(f"VERB: Добавлен автор {author['keyname']} {author['forenames']} для публикации {new_pub_id}")
-                    dedup_entries.append(e)
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            print(f"ERR: Ошибка добавления записи: {e} ")
-    
-    print(f"INFO: Количество записей после дедупликации: {len(dedup_entries)}/{len(entries)}")
-    conn.close()
-    return dedup_entries
+            root = ET.fromstring(xml_text)
+            ns = {
+                "oai": "http://www.openarchives.org/OAI/2.0/",
+                "arxiv": "http://arxiv.org/OAI/arXiv/",
+            }
+
+            for record_elem in root.findall(".//oai:record", ns):
+                record_data: Dict[str, Any] = {}
+
+                header = record_elem.find("oai:header", ns)
+                if header is not None:
+                    identifier_elem = header.find("oai:identifier", ns)
+                    if identifier_elem is not None and identifier_elem.text:
+                        oai_id = identifier_elem.text
+                        record_data["id"] = oai_id[4:] if oai_id.startswith("oai:") else oai_id
+
+                    datestamp_elem = header.find("oai:datestamp", ns)
+                    if datestamp_elem is not None:
+                        record_data["submitted_date"] = datestamp_elem.text
+
+                metadata = record_elem.find("oai:metadata", ns)
+                if metadata is not None:
+                    arxiv_data = metadata.find("arxiv:arXiv", ns)
+                    if arxiv_data is not None:
+                        title_elem = arxiv_data.find("arxiv:title", ns)
+                        if title_elem is not None:
+                            record_data["title"] = title_elem.text
+
+                        authors: List[Dict[str, str]] = []
+                        for author_elem in arxiv_data.findall("arxiv:authors/arxiv:author", ns):
+                            keyname_elem = author_elem.find("arxiv:keyname", ns)
+                            forenames_elem = author_elem.find("arxiv:forenames", ns)
+                            keyname = (keyname_elem.text or "").strip() if keyname_elem is not None else ""
+                            forenames = (forenames_elem.text or "").strip() if forenames_elem is not None else ""
+                            if keyname or forenames:
+                                authors.append({"keyname": keyname, "forenames": forenames})
+                        if authors:
+                            record_data["authors"] = authors
+
+                        abstract_elem = arxiv_data.find("arxiv:abstract", ns)
+                        if abstract_elem is not None:
+                            record_data["abstract"] = abstract_elem.text
+
+                        categories_elem = arxiv_data.find("arxiv:categories", ns)
+                        if categories_elem is not None:
+                            record_data["categories"] = categories_elem.text
+
+                        doi_elem = arxiv_data.find("arxiv:doi", ns)
+                        if doi_elem is not None:
+                            record_data["doi"] = doi_elem.text
+
+                        version_elem = arxiv_data.find("arxiv:version", ns)
+                        if version_elem is not None:
+                            record_data["version"] = version_elem.text
+
+                if record_data:
+                    records.append(record_data)
+
+        except ET.ParseError as exc:
+            print(f"ERR: XML parsing error: {exc}")
+        except Exception as exc:
+            print(f"ERR: unexpected error while parsing XML: {exc}")
+
+        return records
+
+    @staticmethod
+    def extract_resumption_token(xml_text: str) -> Optional[str]:
+        try:
+            root = ET.fromstring(xml_text)
+            ns = {"oai": "http://www.openarchives.org/OAI/2.0/"}
+            token_elem = root.find(".//oai:resumptionToken", ns)
+            if token_elem is not None and token_elem.text:
+                return token_elem.text
+            return None
+        except ET.ParseError as exc:
+            print(f"ERR: XML parsing error when extracting resumption token: {exc}")
+            return None
+        except Exception as exc:
+            print(f"ERR: unexpected error when extracting resumption token: {exc}")
+            return None
+
+    def _add_download_preferences(self, record: Dict[str, Any]) -> None:
+        identifier = record.get("id") or ""
+        clean_id = identifier.split(":", 1)[-1] if identifier else ""
+        if not clean_id:
+            return
+
+        pdf_url = f"{ARXIV_PDF_BASE}/{clean_id}.pdf"
+        source_url = f"{ARXIV_SOURCE_BASE}/{clean_id}"
+
+        record["download_preferences"] = {
+            "source": {
+                "url": source_url,
+                "description": "LaTeX source tarball (preferred)",
+            },
+            "pdf": {
+                "url": pdf_url,
+                "description": "Rendered PDF",
+            },
+        }
+        record["preferred_format"] = "source"
+
+    async def deduplicate(self, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        conn = ServiceConnectionFactory.createDatabaseConnection()
+        dedup_entries: List[Dict[str, Any]] = []
+
+        for entry in entries:
+            identifier = entry.get("id")
+            if not identifier:
+                continue
+
+            already_seen = self.redis_client.sismember(self.seen_ids_set, identifier)  # type: ignore[attr-defined]
+            if already_seen:
+                continue
+
+            try:
+                id_key, id_val = identifier.split(":")
+            except ValueError:
+                print(f"WARN: unexpected identifier format {identifier}")
+                continue
+
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT add_unique_publication(%s, %s, %s, %s, %s)",
+                        (entry.get("title"), entry.get("abstract"), entry.get("submitted_date"), id_key, id_val),
+                    )
+                    new_pub_id = cursor.fetchone()[0]
+                    if new_pub_id != 0:
+                        entry["db_id"] = new_pub_id
+                        authors = entry.get("authors") or []
+                        for author in authors:
+                            cursor.execute(
+                                "SELECT add_author_publication(%s, %s, %s, %s)",
+                                (author.get("keyname"), author.get("forenames"), "Not specified", new_pub_id),
+                            )
+                        dedup_entries.append(entry)
+                conn.commit()
+            except Exception as exc:
+                conn.rollback()
+                print(f"ERR: failed to add publication {identifier}: {exc}")
+
+        conn.close()
+        print(f"INFO: deduplicated {len(dedup_entries)}/{len(entries)} entries")
+        return dedup_entries
+
+    def push_to_redis(self, entries: List[Dict[str, Any]]) -> None:
+        for entry in entries:
+            payload = json.dumps(entry, ensure_ascii=False)
+            self.redis_client.xadd(self.metadata_queue, {"data": payload})
+            identifier = entry.get("id")
+            if identifier:
+                self.redis_client.sadd(self.seen_ids_set, identifier)
+        print(f"INFO: pushed {len(entries)} entries to Redis stream {self.metadata_queue}")
+
+    async def run(self) -> None:
+        newest_entries = await self.fetch_newest(max_results=self.max_results, hours_window=self.hours_window)
+        deduplicated_entries = await self.deduplicate(newest_entries)
+        self.push_to_redis(deduplicated_entries)
 
 
-def push_to_redis(dedupl_entries):
-    r = ServiceConnectionFactory.getRedisClient()
-    for e in dedupl_entries:
-        # make a deterministic fingerprint for dedup in DB
-        payload = json.dumps(e, ensure_ascii=False)
-        r.xadd("metadata_queue", {"data": payload})
-        r.sadd("seen_arxiv_ids", e["id"]) # type: ignore
-    print(f"INFO: Сохранил {len(dedupl_entries)} в Redis")
+def ensure_event_loop():
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
-async def main():
-    newest_entries = await fetch_arxiv_newest(max_results=500, hours_window=0, days_window=3)
-    # Filter by published within last 24h:
-    deduplicated_entries = await deduplication(newest_entries)
-    push_to_redis(deduplicated_entries)
+
+async def main() -> None:
+    fetcher = ArxivFetcher(max_results=500, hours_window=96)
+    await fetcher.run()
+
 
 if __name__ == "__main__":
+    ensure_event_loop()
     asyncio.run(main())

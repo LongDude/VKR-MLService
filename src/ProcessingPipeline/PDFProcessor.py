@@ -13,6 +13,7 @@ from minio.error import S3Error
 from PIL import Image
 
 from service_lib import ServiceConnectionFactory
+from ProcessingPipeline.TextNormalisation import TextNormalisation
 
 try:
     import fitz
@@ -24,13 +25,8 @@ try:
 except ImportError:  # pragma: no cover
     pytesseract = None  # type: ignore[assignment]
 
-try:
-    from deepseek_ocr import DeepSeekOCR, OCRMode
-    from deepseek_ocr.exceptions import ConfigurationError as DeepSeekConfigurationError
-except ImportError:  # pragma: no cover
-    # DeepSeekOCR = None  # type: ignore[assignment]
-    OCRMode = None  # type: ignore[assignment]
-    DeepSeekConfigurationError = None  # type: ignore[assignment]
+OCRMode = None  # type: ignore[assignment]
+DeepSeekConfigurationError = None  # type: ignore[assignment]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -57,9 +53,9 @@ class PDFProcessor:
         self.ocr_page_limit = ocr_page_limit
         self.redis_client = ServiceConnectionFactory.getRedisClient()
         self.minio_client = ServiceConnectionFactory.getMinioClient()
-        self.deepseek_client: Optional[DeepSeekOCR] = None
         self._ensure_bucket(self.raw_pdf_bucket)
         self._ensure_bucket(self.parsed_text_bucket)
+        self.text_normalizer = TextNormalisation()
 
     def _ensure_bucket(self, bucket_name: str) -> None:
         try:
@@ -135,25 +131,29 @@ class PDFProcessor:
                 except Exception:
                     logger.debug("Failed to release Minio response connection", exc_info=False)
 
+    def _postprocess_text(self, text: str) -> str:
+        if not text:
+            return ""
+        return self.text_normalizer.normalize(text)
+
     def _extract_with_pdfplumber(self, pdf_bytes: bytes) -> str:
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                pages_count = len(pdf.pages)
                 chunks: List[str] = []
                 for page in pdf.pages:
                     text = page.extract_text()
                     if text:
                         chunks.append(text.strip())
-            return "\n\n".join(chunks).strip()
+            raw_text = "\n\n".join(chunks).strip()
+            return raw_text, pages_count
         except Exception as exc:
             logger.debug("pdfplumber failed to parse PDF: %s", exc)
-            return ""
+            return "", 0
 
-    def _get_deepseek_client(self) -> Optional[DeepSeekOCR]:
-        if self.deepseek_client:
-            return self.deepseek_client
-        if DeepSeekOCR is None:
-            logger.debug("DeepSeekOCR package is not installed")
-            return None
+    def _get_deepseek_client(self):
+        logger.debug("DeepSeekOCR package is not installed")
+        return None
 
         try:
             self.deepseek_client = DeepSeekOCR()
@@ -216,15 +216,15 @@ class PDFProcessor:
         return "\n\n".join(chunks).strip()
 
     def _extract_text(self, pdf_bytes: bytes) -> Tuple[str, str]:
-        text = self._extract_with_pdfplumber(pdf_bytes)
+        text, pages_count = self._postprocess_text(self._extract_with_pdfplumber(pdf_bytes))
         if text:
             return text, "pdfplumber"
 
-        text = self._extract_with_deepseek(pdf_bytes)
+        text, pages_count = self._postprocess_text(self._extract_with_deepseek(pdf_bytes))
         if text:
             return text, "deepseek"
 
-        text = self._extract_with_local_ocr(pdf_bytes)
+        text, pages_count = self._postprocess_text(self._extract_with_local_ocr(pdf_bytes))
         return text, "pytesseract"
 
     def _extract_citations(self, text: str) -> List[str]:
@@ -311,7 +311,9 @@ class PDFProcessor:
         article_id = record.get("article_id")
         pdf_raw_path = record.get("pdf_path", "")
         logger.info("Processing article %s (stream id %s)", article_id, stream_id)
-        object_name = self._normalize_object_name(pdf_raw_path)
+        # object_name = self._normalize_object_name(pdf_raw_path)
+        object_name = pdf_raw_path
+
         pdf_bytes = self._download_pdf(object_name)
         if not pdf_bytes:
             self._move_to_error_queue(record, reason="pdf_missing")
@@ -359,4 +361,4 @@ class PDFProcessor:
 
 if __name__ == "__main__":
     processor = PDFProcessor()
-    processor.run(continuous=True)
+    processor.run(continuous=False)
