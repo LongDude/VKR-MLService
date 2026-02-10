@@ -156,7 +156,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-
+          cpus: '4'
 volumes:
   minio_data:
     name: "vkr-volume-minio" 

@@ -13,7 +13,7 @@ import subprocess
 import tarfile
 import tempfile
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -24,20 +24,26 @@ from minio.error import S3Error
 from service_lib import ServiceConnectionFactory
 from ProcessingPipeline.TextNormalisation import TextNormalisation
 
-try:
-    from trafilatura import extract as trafilatura_extract
-except ImportError:  # pragma: no cover
-    trafilatura_extract = None  # type: ignore[assignment]
+from trafilatura import extract as trafilatura_extract
 
+if not shutil.which("pandoc"):
+    raise RuntimeError("pandoc_not_found")
 
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 
 @dataclass
 class ExtractionResult:
-    tex_files: List[Path]
+    tex_files: List[Path] = field(default_factory=list)
     handled: bool = False
     reason: Optional[str] = None
+    citation_files: List[Path] = field(default_factory=list)
 
 
 class TEXProcessor:
@@ -54,6 +60,7 @@ class TEXProcessor:
         pdf_bucket: str = "pdf-papers",
         failed_source_bucket: str = "failed-src",
         redis_stage_streams: Optional[Dict[str, str]] = None,
+        pandoc_timeout_seconds: int = 120,
     ) -> None:
         self.redis_preprocess_stream_key = redis_preprocess_stream_key
         self.redis_postprocess_stream_key = redis_postprocess_stream_key
@@ -71,6 +78,7 @@ class TEXProcessor:
             "pdf_redirect": "tex_stage_pdf_redirect",
             "failed": "tex_stage_failed",
         }
+        self.pandoc_timeout_seconds = max(30, pandoc_timeout_seconds)
         self.redis_client = ServiceConnectionFactory.getRedisClient()
         self.minio_client = ServiceConnectionFactory.getMinioClient()
         self.text_normalizer = TextNormalisation()
@@ -118,6 +126,10 @@ class TEXProcessor:
         if not stream_key:
             return
         payload = {**self._clean_record(record), "stage": stage, **extra}
+        identifier = record.get("article_id") or record.get("pdf_path") or "unknown"
+        extra_bits = [f"{key}={value}" for key, value in extra.items() if value is not None]
+        extra_summary = ", ".join(extra_bits) if extra_bits else "no extra metadata"
+        logger.info("Stage %s recorded for %s (%s)", stage, identifier, extra_summary)
         self._publish_stream_payload(stream_key, payload)
 
     def _get_last_record(self) -> Optional[Dict[str, Any]]:
@@ -153,10 +165,17 @@ class TEXProcessor:
     def _clean_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
         return {key: value for key, value in record.items() if key != "stream_id"}
 
-    def _move_to_error_queue(self, record: Dict[str, Any], reason: str) -> None:
+    def _move_to_error_queue(
+        self,
+        record: Dict[str, Any],
+        reason: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
         payload = self._clean_record(record)
         payload["error"] = reason
-        self._record_stage("failed", record, reason=reason)
+        if extra:
+            payload.update(extra)
+        self._record_stage("failed", record, reason=reason, **(extra or {}))
         self._publish_stream_payload(self.redis_error_stream_key, payload)
         stream_id = record.get("stream_id")
         if stream_id:
@@ -208,13 +227,21 @@ class TEXProcessor:
     def _extract_to_temp(self, record: Dict[str, Any], archive_bytes: bytes, temp_dir: Path) -> ExtractionResult:
         if self._extract_tar_bytes(archive_bytes, temp_dir):
             tex_files = self._gather_tex_files(temp_dir)
+            citation_files = self._gather_citation_files(temp_dir)
             if tex_files:
-                return ExtractionResult(tex_files=tex_files)
+                return ExtractionResult(tex_files=tex_files, citation_files=citation_files)
             pdf_files = [path for path in temp_dir.rglob("*.pdf") if path.is_file()]
             if pdf_files:
                 handled = self._handle_pdf_redirect(record, pdf_files[0].read_bytes())
-                return ExtractionResult(tex_files=[], handled=handled, reason=None if handled else "pdf_upload_failed")
-            return ExtractionResult(tex_files=[], handled=False, reason="tex_not_found")
+                return ExtractionResult(
+                    tex_files=[],
+                    handled=handled,
+                    reason=None if handled else "pdf_upload_failed",
+                    citation_files=citation_files,
+                )
+            return ExtractionResult(
+                tex_files=[], handled=False, reason="tex_not_found", citation_files=citation_files
+            )
         if archive_bytes.startswith(b"\x1f\x8b"):
             gzip_result = self._extract_from_gzip(record, archive_bytes, temp_dir)
             if gzip_result:
@@ -234,13 +261,21 @@ class TEXProcessor:
             return None
         if self._extract_tar_bytes(decompressed, temp_dir):
             tex_files = self._gather_tex_files(temp_dir)
+            citation_files = self._gather_citation_files(temp_dir)
             if tex_files:
-                return ExtractionResult(tex_files=tex_files)
+                return ExtractionResult(tex_files=tex_files, citation_files=citation_files)
             pdf_files = [path for path in temp_dir.rglob("*.pdf") if path.is_file()]
             if pdf_files:
                 handled = self._handle_pdf_redirect(record, pdf_files[0].read_bytes())
-                return ExtractionResult(tex_files=[], handled=handled, reason=None if handled else "pdf_upload_failed")
-            return ExtractionResult(tex_files=[], handled=False, reason="tex_not_found")
+                return ExtractionResult(
+                    tex_files=[],
+                    handled=handled,
+                    reason=None if handled else "pdf_upload_failed",
+                    citation_files=citation_files,
+                )
+            return ExtractionResult(
+                tex_files=[], handled=False, reason="tex_not_found", citation_files=citation_files
+            )
         if self._looks_like_pdf(decompressed):
             handled = self._handle_pdf_redirect(record, decompressed)
             return ExtractionResult(tex_files=[], handled=handled, reason=None if handled else "pdf_upload_failed")
@@ -281,6 +316,16 @@ class TEXProcessor:
     def _gather_tex_files(self, temp_dir: Path) -> List[Path]:
         return sorted([path for path in temp_dir.rglob("*.tex") if path.is_file()])
 
+    def _gather_citation_files(self, temp_dir: Path) -> List[Path]:
+        citation_exts = {".bib", ".bbl"}
+        return sorted(
+            [
+                path
+                for path in temp_dir.rglob("*")
+                if path.is_file() and path.suffix.lower() in citation_exts
+            ]
+        )
+
     def _write_single_tex(self, temp_dir: Path, data: bytes) -> Path:
         target = temp_dir / f"document-{uuid.uuid4().hex}.tex"
         target.write_bytes(data)
@@ -320,27 +365,31 @@ class TEXProcessor:
         if not pandoc_bin:
             raise RuntimeError("pandoc_not_found")
         cmd = [pandoc_bin, tex_path.name, "--from=latex", "--to=html", "--standalone"]
-        process = subprocess.run(
-            cmd,
-            cwd=str(tex_path.parent),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            process = subprocess.run(
+                cmd,
+                cwd=str(tex_path.parent),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=self.pandoc_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            logger.error(
+                "pandoc timed out after %d seconds for %s",
+                self.pandoc_timeout_seconds,
+                tex_path,
+            )
+            raise RuntimeError("pandoc_timeout") from exc
+        except OSError as exc:
+            logger.error("Failed to start pandoc for %s: %s", tex_path, exc)
+            raise RuntimeError("pandoc_failed") from exc
         if process.returncode != 0:
             logger.error("pandoc failed for %s: %s", tex_path, process.stderr.strip())
             raise RuntimeError("pandoc_failed")
         if not process.stdout:
             raise RuntimeError("pandoc_failed")
         return process.stdout
-
-    def _strip_functions_from_html(self, html: str) -> str:
-        if not html:
-            return ""
-        script_pattern = re.compile(r"<script\\b[^>]*>.*?</script>", re.IGNORECASE | re.DOTALL)
-        function_pattern = re.compile(r"function\\s+[a-zA-Z0-9_]*\\s*\\([^)]*\\)\\s*\\{.*?\\}", re.DOTALL)
-        without_scripts = script_pattern.sub("", html)
-        return function_pattern.sub("", without_scripts)
 
     def _extract_plain_text(self, html: str) -> str:
         if not trafilatura_extract:
@@ -350,6 +399,22 @@ class TEXProcessor:
             text = trafilatura_extract(html, output_format="txt") or ""
         text = self.text_normalizer.normalize(text)
         return text.strip()
+
+    def _build_citation_bundle(self, citation_files: List[Path]) -> str:
+        if not citation_files:
+            return ""
+        parts: List[str] = []
+        for path in citation_files:
+            try:
+                content = path.read_text(encoding="utf-8", errors="ignore").strip()
+            except OSError as exc:
+                logger.warning("Unable to read citation file %s: %s", path, exc)
+                continue
+            if not content:
+                continue
+            header = f"### {path.name}"
+            parts.append(f"{header}\n{content}")
+        return "\n\n".join(parts).strip()
 
     def _save_failed_source(self, record: Dict[str, Any], archive_bytes: bytes, reason: str) -> None:
         if not self.failed_source_bucket or not archive_bytes:
@@ -366,32 +431,54 @@ class TEXProcessor:
         success = self._upload_bytes(self.pdf_bucket, object_name, pdf_bytes, "application/pdf")
         if success:
             self._record_stage("pdf_redirect", record, pdf_path=object_name, bucket=self.pdf_bucket)
+            identifier = record.get("article_id") or record.get("db_id") or object_name
+            logger.info(
+                "Uploaded PDF redirect for %s to %s/%s",
+                identifier,
+                self.pdf_bucket,
+                object_name,
+            )
         return success
 
-    def process_last_record(self) -> bool:
-        record = self._get_last_record()
-        if not record:
-            return False
+    def _handle_record(self, record: Dict[str, Any]) -> bool:
         object_name = record.get("pdf_path")
+        article_identifier = record.get("article_id") or record.get("db_id") or object_name or "unknown"
+        logger.info("Processing record %s (object=%s)", article_identifier, object_name or "n/a")
         archive_bytes = self._download_archive(object_name)
         if not archive_bytes:
             self._move_to_error_queue(record, "archive_missing")
             return False
+        logger.info(
+            "Downloaded source object %s (%d bytes) from bucket %s",
+            object_name,
+            len(archive_bytes),
+            self.source_bucket,
+        )
         self._record_stage("downloaded", record, object_name=object_name)
         with tempfile.TemporaryDirectory(prefix="texproc-") as temp_dir_name:
             temp_dir = Path(temp_dir_name)
             extraction = self._extract_to_temp(record, archive_bytes, temp_dir)
+            logger.info(
+                "Extraction summary for %s: tex=%d, citations=%d, handled=%s, reason=%s",
+                article_identifier,
+                len(extraction.tex_files),
+                len(extraction.citation_files),
+                extraction.handled,
+                extraction.reason or "none",
+            )
             if extraction.handled:
                 stream_id = record.get("stream_id")
                 if stream_id:
                     self._remove_stream_record(stream_id)
-                logger.info("Record %s redirected to PDF bucket", record.get("article_id") or object_name)
+                logger.info("Record %s redirected to PDF bucket", article_identifier)
                 return True
             if extraction.reason and not extraction.tex_files:
+                logger.warning("Extraction failed for %s: %s", article_identifier, extraction.reason)
                 self._save_failed_source(record, archive_bytes, extraction.reason)
                 self._move_to_error_queue(record, extraction.reason)
                 return False
             tex_files = extraction.tex_files
+            citation_files = extraction.citation_files or []
             primary_tex = self._select_primary_tex_file(tex_files)
             if not primary_tex:
                 self._save_failed_source(record, archive_bytes, "primary_tex_missing")
@@ -401,13 +488,31 @@ class TEXProcessor:
                 relative_primary = str(primary_tex.relative_to(temp_dir))
             except ValueError:
                 relative_primary = str(primary_tex)
+            logger.info("Selected primary TEX file %s for %s", relative_primary, article_identifier)
             self._record_stage("extracted", record, tex_count=len(tex_files), primary_tex=relative_primary)
             try:
+                logger.info("Running pandoc conversion for %s", relative_primary)
                 html_content = self._convert_tex_to_html(primary_tex)
+                logger.info(
+                    "Converted %s to HTML for %s (chars=%d)",
+                    relative_primary,
+                    article_identifier,
+                    len(html_content),
+                )
             except RuntimeError as exc:
                 reason = str(exc)
+                extra_error: Dict[str, Any] = {}
+                if reason == "pandoc_timeout":
+                    with contextlib.suppress(OSError):
+                        tex_size_bytes = primary_tex.stat().st_size
+                        extra_error["tex_size_kb"] = round(tex_size_bytes / 1024, 2)
+                        logger.info(
+                            "Pandoc timeout for %s (size %.2f KB)",
+                            article_identifier,
+                            extra_error["tex_size_kb"],
+                        )
                 self._save_failed_source(record, archive_bytes, reason)
-                self._move_to_error_queue(record, reason)
+                self._move_to_error_queue(record, reason, extra=extra_error or None)
                 return False
             base_name = self._build_base_name(record)
             html_object_name = f"{base_name}.html"
@@ -419,11 +524,21 @@ class TEXProcessor:
             ):
                 self._move_to_error_queue(record, "html_upload_failed")
                 return False
+            logger.info(
+                "Uploaded HTML artifact for %s to %s/%s",
+                article_identifier,
+                self.converted_html_bucket,
+                html_object_name,
+            )
             self._record_stage("html", record, html_path=html_object_name, bucket=self.converted_html_bucket)
-            cleaned_html = self._strip_functions_from_html(html_content)
-            logger.info("Cleaned html; processing plain text")
+            logger.info("Skipping function stripping for %s (handled downstream)", article_identifier)
             try:
-                plain_text = self._extract_plain_text(cleaned_html)
+                plain_text = self._extract_plain_text(html_content)
+                logger.info(
+                    "Extracted plain text for %s (chars=%d)",
+                    article_identifier,
+                    len(plain_text),
+                )
             except RuntimeError as exc:
                 reason = str(exc)
                 self._save_failed_source(record, archive_bytes, reason)
@@ -441,7 +556,40 @@ class TEXProcessor:
             ):
                 self._move_to_error_queue(record, "text_upload_failed")
                 return False
+            logger.info(
+                "Uploaded processed text for %s to %s/%s",
+                article_identifier,
+                self.processed_text_bucket,
+                text_object_name,
+            )
             self._record_stage("text", record, text_path=text_object_name, bucket=self.processed_text_bucket)
+            if citation_files:
+                logger.info(
+                    "Preparing citation export from %d files for %s",
+                    len(citation_files),
+                    article_identifier,
+                )
+                citation_bundle = self._build_citation_bundle(citation_files)
+                if citation_bundle:
+                    citation_object_name = f"{base_name}-cit.txt"
+                    if self._upload_bytes(
+                        self.processed_text_bucket,
+                        citation_object_name,
+                        citation_bundle.encode("utf-8"),
+                        "text/plain",
+                    ):
+                        logger.info(
+                            "Uploaded citation bundle for %s to %s/%s",
+                            article_identifier,
+                            self.processed_text_bucket,
+                            citation_object_name,
+                        )
+                    else:
+                        logger.warning("Failed to upload citation bundle for %s", article_identifier)
+                else:
+                    logger.info("Citation files for %s contained no readable data", article_identifier)
+            else:
+                logger.info("No citation files discovered for %s", article_identifier)
             stream_id = record.get("stream_id")
             if stream_id:
                 self._remove_stream_record(stream_id)
@@ -454,11 +602,20 @@ class TEXProcessor:
             )
             return True
 
+    def process_last_record(self) -> bool:
+        record = self._get_last_record()
+        if not record:
+            return False
+        return self._handle_record(record)
+
     def run(self, continuous: bool = False) -> None:
         logger.info("TEXProcessor started")
         if continuous:
-            while self.process_last_record():
-                continue
+            while True:
+                record = self._get_last_record()
+                if not record:
+                    break
+                self._handle_record(record)
         else:
             self.process_last_record()
         logger.info("TEXProcessor stopped after %d articles", self.processed_count)
@@ -466,4 +623,4 @@ class TEXProcessor:
 
 __all__ = ["TEXProcessor"]
 if __name__ == "__main__":
-    TEXProcessor().run()
+    TEXProcessor().run(continuous=True)

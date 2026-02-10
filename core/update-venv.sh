@@ -24,3 +24,4 @@ easydict \
 einops
 
 pip install -r $ROOT/core/requirements.txt
+echo "Installation complete!"

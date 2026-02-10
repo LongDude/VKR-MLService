@@ -393,8 +393,8 @@ class CeleryLoaderTask:
 if __name__ == "__main__":
     # Создание экземпляра Loader
     loader = Loader(
-        max_batch_articles=30,  # Обработать максимум 30 статей
-        max_queue_articles=40
+        max_batch_articles=100,  # Обработать максимум 30 статей
+        max_queue_articles=100
     )
     
     loader.run(continuous=True)
