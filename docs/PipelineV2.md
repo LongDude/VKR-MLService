@@ -35,8 +35,15 @@
 
 - `POST /pipeline/v2/run-once`
 - `POST /pipeline/v2/run-continuous`
+- `POST /pipeline/v2/fetch-arxiv-fixed`
 
 Параметр `profile` можно передать в query-string, иначе используется `PIPELINE_PROFILE`.
+
+`/pipeline/v2/fetch-arxiv-fixed` поддерживает параметры:
+
+- `count` - фиксированное количество записей для запроса
+- `hours_window`, `hours_offset`, `days_offset`, `days_window` - окно выборки ArXiv OAI
+- `enqueue` - если `false`, только fetch без публикации в ingress stream
 
 ## Environment
 
@@ -46,4 +53,3 @@
 - `PIPELINE_CONFIG_PATH`
 - `COLD_MINIO_*`
 - `COLD_DATASET_ROOT`
-

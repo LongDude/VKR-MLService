@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import gzip
-import io
+import io as io_lib
 import re
 import shutil
 import subprocess
@@ -54,7 +54,7 @@ def _safe_tar_members(members: List[tarfile.TarInfo], target_dir: Path) -> List[
 
 
 def _extract_tex_candidates(payload: bytes, target_dir: Path) -> List[Path]:
-    file_obj = io.BytesIO(payload)
+    file_obj = io_lib.BytesIO(payload)
     with contextlib.suppress(tarfile.TarError):
         with tarfile.open(fileobj=file_obj, mode="r:*") as tar:
             members = _safe_tar_members(tar.getmembers(), target_dir)
@@ -318,7 +318,7 @@ class PdfExtractFallbackHandler(BaseExtractHandler):
                 stage=self.stage.value,
                 handler_id=self.handler_id,
             )
-        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+        with pdfplumber.open(io_lib.BytesIO(raw_bytes)) as pdf:
             for page in pdf.pages:
                 extracted_parts.append(page.extract_text() or "")
         raw_text = "\n".join(part for part in extracted_parts if part)

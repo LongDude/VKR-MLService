@@ -57,12 +57,16 @@ class PipelineManager:
         self.profile_cfg = self.config.get("profiles", {}).get(self.profile, {})
         if not self.profile_cfg:
             raise ValueError(f"Unknown pipeline profile '{self.profile}' in {config_path}")
+        logger.info("PipelineManager profile selected: %s", self.profile)
 
         self.registry = registry or HandlerRegistry()
         if registry is None:
             from pipeline_handlers import load_builtin_handlers
 
             load_builtin_handlers(self.registry)
+            logger.info("Builtin handlers loaded")
+        else:
+            logger.info("Custom handler registry provided")
 
         streams_cfg = self.profile_cfg.get("streams", {})
         io_cfg = self.config.get("io", {})
@@ -85,6 +89,11 @@ class PipelineManager:
                 stage,
                 enabled_handlers=enabled,
                 handler_configs=self.handler_configs,
+            )
+            logger.info(
+                "Stage chain configured: stage=%s handlers=%s",
+                stage.value,
+                [handler.handler_id for handler in self.handlers_by_stage[stage]],
             )
         from pipeline_handlers.publish import ErrorPublishHandler
 
@@ -117,15 +126,27 @@ class PipelineManager:
     def _run_stage(self, stage: StageName, ctx: PipelineContext) -> PipelineContext:
         chain = self.handlers_by_stage.get(stage, [])
         if not chain:
+            logger.info("Stage skipped (no handlers configured): %s", stage.value)
             return ctx
 
         attempted = False
         recoverable_errors: list[PipelineError] = []
+        logger.info(
+            "Stage started: stage=%s article_id=%s",
+            stage.value,
+            ctx.article_id or "unknown",
+        )
         for handler in chain:
             if not handler.can_handle(ctx):
+                logger.info(
+                    "Handler skipped by can_handle: stage=%s handler=%s",
+                    stage.value,
+                    handler.handler_id,
+                )
                 continue
             attempted = True
             started_at = _utc_now()
+            logger.info("Handler started: stage=%s handler=%s", stage.value, handler.handler_id)
             try:
                 result = handler.handle(ctx, self.io)
             except Exception as exc:
@@ -138,6 +159,12 @@ class PipelineManager:
                         stage=stage.value,
                         handler_id=handler.handler_id,
                     )
+                    logger.warning(
+                        "Handler failed recoverably: stage=%s handler=%s error=%s",
+                        stage.value,
+                        handler.handler_id,
+                        exc,
+                    )
                 else:
                     result = StageResult.fatal_error(
                         ctx,
@@ -145,6 +172,11 @@ class PipelineManager:
                         message=str(exc),
                         stage=stage.value,
                         handler_id=handler.handler_id,
+                    )
+                    logger.exception(
+                        "Handler failed fatally: stage=%s handler=%s",
+                        stage.value,
+                        handler.handler_id,
                     )
             finished_at = _utc_now()
             ctx = result.ctx
@@ -157,6 +189,12 @@ class PipelineManager:
                     finished_at=finished_at,
                     error=result.error.to_dict() if result.error else None,
                 )
+            )
+            logger.info(
+                "Handler finished: stage=%s handler=%s status=%s",
+                stage.value,
+                handler.handler_id,
+                result.status.value,
             )
 
             if result.status == StageStatus.SUCCESS:
@@ -182,12 +220,18 @@ class PipelineManager:
             )
 
         if not attempted:
+            logger.warning("Stage had handlers but none accepted context: stage=%s", stage.value)
             return ctx
 
         if recoverable_errors:
             final_error = recoverable_errors[-1]
             final_error.code = "stage_fallback_exhausted"
             final_error.recoverable = False
+            logger.error(
+                "Stage fallback exhausted: stage=%s last_error=%s",
+                stage.value,
+                final_error.message,
+            )
             raise PipelineStageFailure(stage, final_error, ctx)
 
         raise PipelineStageFailure(
@@ -203,23 +247,33 @@ class PipelineManager:
         )
 
     def run_once(self) -> bool:
+        logger.info("Polling ingress stream for next record")
         record_info = self.io.poll_ingress()
         if not record_info:
+            logger.info("No ingress records available")
             return False
         stream_id, payload = record_info
+        logger.info("Ingress record received: stream_id=%s keys=%s", stream_id, sorted(payload.keys()))
         ctx = self._build_context(payload, stream_id, self.profile)
         try:
             for stage in self.stage_order:
                 ctx = self._run_stage(stage, ctx)
             if ctx.ingress_stream_id:
                 self.io.ack_ingress(ctx.ingress_stream_id)
+                logger.info("Ingress record acknowledged: stream_id=%s", ctx.ingress_stream_id)
             return True
         except PipelineStageFailure as failure:
             try:
                 self.error_handler.publish_error(ctx=failure.ctx, error=failure.error, io=self.io)
+                logger.info(
+                    "Error record published: stage=%s code=%s",
+                    failure.stage.value,
+                    failure.error.code,
+                )
             finally:
                 if ctx.ingress_stream_id:
                     self.io.ack_ingress(ctx.ingress_stream_id)
+                    logger.info("Failed ingress record acknowledged: stream_id=%s", ctx.ingress_stream_id)
             logger.error("Pipeline failed at stage %s: %s", failure.stage.value, failure.error.message)
             return True
 

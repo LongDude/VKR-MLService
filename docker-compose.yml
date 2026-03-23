@@ -147,6 +147,8 @@ services:
     stdin_open: true
     tty: true
     command: ["/bin/bash", "-c", "/app/core/update-venv.sh && exec /bin/bash"]
+    ports:
+      - 8000:8000  # FastAPI порт
     profiles:
       - manual
     deploy:

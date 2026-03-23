@@ -42,7 +42,9 @@ class RedisStreamGateway:
 
     def xadd_json(self, stream: str, payload: Dict[str, Any]) -> str:
         try:
-            return self.client.xadd(stream, {"data": json.dumps(payload, ensure_ascii=False)})
+            stream_id = self.client.xadd(stream, {"data": json.dumps(payload, ensure_ascii=False)})
+            logger.info("Redis xadd success: stream=%s stream_id=%s", stream, stream_id)
+            return stream_id
         except RedisError as exc:
             raise PipelineIOOperationError(
                 PipelineError(
@@ -59,11 +61,14 @@ class RedisStreamGateway:
         try:
             entries = self.client.xrange(stream, count=1)
             if not entries:
+                logger.info("Redis xrange empty: stream=%s", stream)
                 return None
             stream_id, payload = entries[0]
             data = payload.get("data")
             if data is None:
+                logger.warning("Redis record without data field: stream=%s stream_id=%s", stream, stream_id)
                 return None
+            logger.info("Redis xrange success: stream=%s stream_id=%s", stream, stream_id)
             return stream_id, json.loads(data)
         except (RedisError, json.JSONDecodeError) as exc:
             raise PipelineIOOperationError(
@@ -82,6 +87,7 @@ class RedisStreamGateway:
             return
         try:
             self.client.xdel(stream, stream_id)
+            logger.info("Redis xdel success: stream=%s stream_id=%s", stream, stream_id)
         except RedisError as exc:
             raise PipelineIOOperationError(
                 PipelineError(
@@ -292,6 +298,14 @@ class PipelineIO:
 
         if redis_module is None:
             raise RuntimeError("redis dependency is required for PipelineIO.from_env")
+        logger.info(
+            "PipelineIO.from_env hot endpoints ready: ingress=%s keywords=%s errors=%s cache_bucket=%s buffer=%s",
+            ingress_stream,
+            keywords_stream,
+            error_stream,
+            cache_bucket,
+            buffer_size_bytes,
+        )
 
         cold_endpoint = os.getenv("COLD_MINIO_ENDPOINT", "")
         cold_store = None
@@ -320,13 +334,21 @@ class PipelineIO:
         )
 
     def poll_ingress(self) -> Optional[Tuple[str, Dict[str, Any]]]:
+        logger.info("Polling ingress stream: %s", self.ingress_stream)
         return self.redis.read_first_json(self.ingress_stream)
 
     def ack_ingress(self, stream_id: str) -> None:
+        logger.info("Acknowledging ingress stream_id=%s", stream_id)
         self.redis.xdel(self.ingress_stream, stream_id)
 
     def publish_keywords(self, payload: Dict[str, Any]) -> None:
+        logger.info("Publishing keywords payload for article_id=%s", payload.get("article_id"))
         self.redis.xadd_json(self.keywords_stream, payload)
 
     def publish_error(self, payload: Dict[str, Any]) -> None:
+        logger.info(
+            "Publishing error payload for article_id=%s code=%s",
+            payload.get("article_id"),
+            (payload.get("error") or {}).get("code") if isinstance(payload.get("error"), dict) else None,
+        )
         self.redis.xadd_json(self.error_stream, payload)

@@ -34,14 +34,14 @@ profiles:
         ttl_seconds: 86400
     handlers:
       ingest:
-        - cold_dataset_ingest
-        - cold_object_ingest
+        # - cold_dataset_ingest
+        # - cold_object_ingest
         - arxiv_ingest
       acquire:
-        - cold_object_read
+        # - cold_object_read
         - hot_object_read
       extract:
-        - dataset_text_passthrough
+        # - dataset_text_passthrough
         - tex_pandoc
         - pdf_extract_fallback
       keywords:
@@ -64,6 +64,11 @@ profiles:
         max_text_chars: 30000
         max_keywords: 25
         spacy_model: en_core_sci_sm
+      keyword_publish:
+        enable_postgres: true
+        enable_qdrant: true
+        qdrant_collection: paper_keywords
+        embedding_model_name: sentence-transformers/all-MiniLM-L6-v2
 
   bootstrap_cold:
     mode: bootstrap_cold
@@ -108,6 +113,11 @@ profiles:
     handler_configs:
       cold_object_read:
         cold_bucket: cold-raw
+      keyword_publish:
+        enable_postgres: true
+        enable_qdrant: true
+        qdrant_collection: paper_keywords
+        embedding_model_name: sentence-transformers/all-MiniLM-L6-v2
 
   prod_live:
     mode: prod_live
@@ -147,3 +157,9 @@ profiles:
         - keyword_ensemble
       publish:
         - keyword_publish
+    handler_configs:
+      keyword_publish:
+        enable_postgres: true
+        enable_qdrant: true
+        qdrant_collection: paper_keywords
+        embedding_model_name: sentence-transformers/all-MiniLM-L6-v2

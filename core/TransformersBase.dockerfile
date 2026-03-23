@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install --yes --no-install-recommends\
 
 # Work dependencies
 RUN apt-get update --yes && apt-get install --yes --no-install-recommends \
-    postgresql
+    postgresql pandoc
 
 # Чистка
 RUN apt-get clean && rm -rf /var/lib/apt/lists/* && \

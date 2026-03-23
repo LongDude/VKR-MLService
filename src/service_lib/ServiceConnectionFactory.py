@@ -1,73 +1,108 @@
-from redis import Redis
+from __future__ import annotations
+
+import logging
+from os import getenv
+from urllib.parse import urlparse
+
+from dotenv import load_dotenv
 from minio import Minio
 from psycopg2 import connect
-from dotenv import load_dotenv
-from os import getcwd, getenv
+from redis import Redis
 
-# Предварительная прогрузка при импорте
-print("Импортирован класс ServiceConnectionFactory")
-if load_dotenv("./core/.env"): 
-    print("INFO [ServiceConnectionFactory]: loaded dotenv")
+logger = logging.getLogger(__name__)
+
+ENV_PATH = "./core/.env"
+if load_dotenv(ENV_PATH):
+    logger.info("Loaded environment from %s", ENV_PATH)
 else:
-    raise Exception(f"ERR: Ошибка загрузки .env из рабочей директории: {getcwd()}")
+    logger.warning("Environment file not found or not loaded: %s", ENV_PATH)
 
-class ServiceConnectionFactory(object):
-    @staticmethod
-    def getRedisClient():
-        ''' Инициализирует Redis клиент из параметров в .env '''
-        redis_url = getenv("REDIS_URL")
 
-        if redis_url: 
-            return Redis.from_url(redis_url)
-        else:
-            redis_host = getenv("REDIS_HOST", "redis")
-            redis_port = getenv("REDIS_PORT", "6379")
-            redis_password = getenv("REDIS_PASSWORD")
-     
-            # redis_auth = f":{redis_password}@" if redis_password else ""
-            # redis_url = f"redis://{redis_auth}{redis_host}:{redis_port}/0"
-    
-            return Redis(
-                host=redis_host,
-                port=redis_port,
-                password=redis_password,
-                decode_responses=True
-            )
+class ServiceConnectionFactory:
+    @staticmethod
+    def getRedisClient() -> Redis:
+        """Build Redis client from env vars."""
+        redis_url = getenv("REDIS_URL", "").strip()
+        if redis_url:
+            logger.info("Redis client configured from REDIS_URL")
+            return Redis.from_url(redis_url, decode_responses=True)
 
-    @staticmethod
-    def getDatabaseDSN():
-        ''' Собирает из .env DNS для соединения с базой данных '''
-        DB_DSN = getenv("DATABASE_DSN")
-        if not DB_DSN:
-            pg_user = getenv("POSTGRES_USER", "user")
-            pg_password = getenv("POSTGRES_PASSWORD", "pass")
-            pg_host = getenv("POSTGRES_HOST", "vkr-database")
-            pg_port = getenv("POSTGRES_PORT", "5432")
-            pg_db = getenv("POSTGRES_DB", "db")
-            DB_DSN = f"postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}"
-        return DB_DSN 
-    
-    @staticmethod
-    def createDatabaseConnection():
-        ''' Инициализирует и возвращает новое соединение с базой данных '''
-        return connect(ServiceConnectionFactory.getDatabaseDSN())
-
-    @staticmethod
-    def getMinioClient():
-        ''' Инициализирует Minio клиент из параметров в .env '''
-        minio_url = getenv("MINIO_URL")
-        if not minio_url:
-            minio_endpoint = getenv("MINIO_ENDPOINT")
-            minio_access = getenv("MINIO_ROOT_USER")
-            minio_secret = getenv("MINIO_ROOT_PASSWORD")
-            minio_secure = False # *: есть возможность расширить конфигурацию .conf файлом
-        print(f"INFO: Minio Client: {minio_access} {minio_secret}")
-        return Minio(
-            minio_endpoint,
-            access_key=minio_access,
-            secret_key=minio_secret,
-            secure=minio_secure
+        redis_host = getenv("REDIS_HOST", "redis")
+        redis_port = int(getenv("REDIS_PORT", "6379"))
+        redis_password = getenv("REDIS_PASSWORD")
+        logger.info("Redis client configured from host/port: host=%s port=%s", redis_host, redis_port)
+        return Redis(
+            host=redis_host,
+            port=redis_port,
+            password=redis_password,
+            decode_responses=True,
         )
 
+    @staticmethod
+    def getDatabaseDSN() -> str:
+        """Build Postgres DSN from env vars."""
+        db_dsn = getenv("DATABASE_DSN", "").strip()
+        if db_dsn:
+            logger.info("Database DSN configured from DATABASE_DSN")
+            return db_dsn
+
+        pg_user = getenv("POSTGRES_USER", "user")
+        pg_password = getenv("POSTGRES_PASSWORD", "pass")
+        pg_host = getenv("POSTGRES_HOST", "vkr-database")
+        pg_port = getenv("POSTGRES_PORT", "5432")
+        pg_db = getenv("POSTGRES_DB", "db")
+        logger.info("Database DSN configured from host/port: host=%s port=%s db=%s", pg_host, pg_port, pg_db)
+        return f"postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}"
+
+    @staticmethod
+    def createDatabaseConnection():
+        """Create a new Postgres connection."""
+        dsn = ServiceConnectionFactory.getDatabaseDSN()
+        logger.info("Opening new database connection")
+        return connect(dsn)
+
+    @staticmethod
+    def getMinioClient() -> Minio:
+        """Build Minio client from env vars."""
+        minio_url = getenv("MINIO_URL", "").strip()
+        access_key = getenv("MINIO_ACCESS_KEY") or getenv("MINIO_ROOT_USER")
+        secret_key = getenv("MINIO_SECRET_KEY") or getenv("MINIO_ROOT_PASSWORD")
+
+        if minio_url:
+            parsed = urlparse(minio_url)
+            endpoint = parsed.netloc or parsed.path
+            secure = parsed.scheme.lower() == "https"
+            logger.info("Minio client configured from MINIO_URL: endpoint=%s secure=%s", endpoint, secure)
+            return Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
+
+        endpoint = getenv("MINIO_ENDPOINT", "minio:9000")
+        secure = getenv("MINIO_SECURE", "false").lower() == "true"
+        logger.info("Minio client configured from endpoint: endpoint=%s secure=%s", endpoint, secure)
+        return Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
+
+
 if __name__ == "__main__":
-    print("Служебный класс для создания соединения с внутренними сервисами")
+    logging.basicConfig(level=logging.INFO)
+    logger.info("ServiceConnectionFactory diagnostics start")
+    try:
+        redis_client = ServiceConnectionFactory.getRedisClient()
+        redis_client.ping()
+        logger.info("Redis ping OK")
+    except Exception:
+        logger.exception("Redis ping failed")
+
+    try:
+        minio_client = ServiceConnectionFactory.getMinioClient()
+        _ = minio_client.list_buckets()
+        logger.info("Minio list_buckets OK")
+    except Exception:
+        logger.exception("Minio check failed")
+
+    try:
+        conn = ServiceConnectionFactory.createDatabaseConnection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        conn.close()
+        logger.info("Database probe OK")
+    except Exception:
+        logger.exception("Database check failed")

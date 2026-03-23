@@ -80,6 +80,25 @@ class ArxivFetcher:
         print(f"INFO: collected {len(records)}/{max_results} records from ArXiv")
         return records[:max_results] if max_results > 0 else records
 
+    async def fetch_fixed_count(
+        self,
+        count: int,
+        *,
+        hours_window: Optional[int] = None,
+        hours_offset: int = 0,
+        days_offset: int = 0,
+        days_window: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Fetch exactly up to ``count`` newest records from ArXiv API window."""
+        safe_count = max(1, int(count))
+        return await self.fetch_newest(
+            hours_window=hours_window,
+            max_results=safe_count,
+            hours_offset=hours_offset,
+            days_offset=days_offset,
+            days_window=days_window,
+        )
+
     @staticmethod
     def parse_records_from_xml(xml_text: str) -> List[Dict[str, Any]]:
         records: List[Dict[str, Any]] = []
