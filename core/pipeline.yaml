@@ -1,0 +1,149 @@
+default_profile: dev_cold
+
+io:
+  buffer_size_bytes: 65536
+  object_chunk_size_bytes: 65536
+  redis_batch_size: 1
+
+profiles:
+  dev_cold:
+    mode: dev_cold
+    streams:
+      ingress: pipeline_ingress_v2
+      keywords: pipeline_keywords_v2
+      errors: pipeline_errors_v2
+    cache_bucket: pipeline-cache-v2
+    cache:
+      metadata:
+        enabled: true
+        ttl_seconds: 86400
+      raw_object:
+        enabled: true
+        ttl_seconds: 86400
+      extracted_bundle:
+        enabled: false
+        ttl_seconds: 0
+      html:
+        enabled: true
+        ttl_seconds: 86400
+      clean_text:
+        enabled: true
+        ttl_seconds: 86400
+      keywords:
+        enabled: true
+        ttl_seconds: 86400
+    handlers:
+      ingest:
+        - cold_dataset_ingest
+        - cold_object_ingest
+        - arxiv_ingest
+      acquire:
+        - cold_object_read
+        - hot_object_read
+      extract:
+        - dataset_text_passthrough
+        - tex_pandoc
+        - pdf_extract_fallback
+      keywords:
+        - keyword_ensemble
+      publish:
+        - keyword_publish
+    handler_configs:
+      hot_object_read:
+        source_bucket: pdf-raw
+        http_timeout_seconds: 60
+      cold_object_read:
+        cold_bucket: cold-raw
+      tex_pandoc:
+        pandoc_timeout_seconds: 120
+        html_bucket: converted-html-v2
+        text_bucket: processed-text-v2
+      pdf_extract_fallback:
+        text_bucket: processed-text-v2
+      keyword_ensemble:
+        max_text_chars: 30000
+        max_keywords: 25
+        spacy_model: en_core_sci_sm
+
+  bootstrap_cold:
+    mode: bootstrap_cold
+    streams:
+      ingress: pipeline_ingress_v2
+      keywords: pipeline_keywords_v2
+      errors: pipeline_errors_v2
+    cache_bucket: pipeline-cache-v2
+    cache:
+      metadata:
+        enabled: true
+        ttl_seconds: 604800
+      raw_object:
+        enabled: true
+        ttl_seconds: 604800
+      extracted_bundle:
+        enabled: false
+        ttl_seconds: 0
+      html:
+        enabled: true
+        ttl_seconds: 604800
+      clean_text:
+        enabled: true
+        ttl_seconds: 604800
+      keywords:
+        enabled: true
+        ttl_seconds: 604800
+    handlers:
+      ingest:
+        - cold_dataset_ingest
+        - cold_object_ingest
+      acquire:
+        - cold_object_read
+      extract:
+        - dataset_text_passthrough
+        - tex_pandoc
+        - pdf_extract_fallback
+      keywords:
+        - keyword_ensemble
+      publish:
+        - keyword_publish
+    handler_configs:
+      cold_object_read:
+        cold_bucket: cold-raw
+
+  prod_live:
+    mode: prod_live
+    streams:
+      ingress: pipeline_ingress_v2
+      keywords: pipeline_keywords_v2
+      errors: pipeline_errors_v2
+    cache_bucket: pipeline-cache-v2
+    cache:
+      metadata:
+        enabled: true
+        ttl_seconds: 21600
+      raw_object:
+        enabled: false
+        ttl_seconds: 0
+      extracted_bundle:
+        enabled: false
+        ttl_seconds: 0
+      html:
+        enabled: false
+        ttl_seconds: 0
+      clean_text:
+        enabled: true
+        ttl_seconds: 86400
+      keywords:
+        enabled: true
+        ttl_seconds: 86400
+    handlers:
+      ingest:
+        - arxiv_ingest
+      acquire:
+        - hot_object_read
+      extract:
+        - tex_pandoc
+        - pdf_extract_fallback
+      keywords:
+        - keyword_ensemble
+      publish:
+        - keyword_publish

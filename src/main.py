@@ -1,10 +1,12 @@
 # core/main.py
 from fastapi import FastAPI
+from fastapi import HTTPException
 import redis
 from minio import Minio
 from psycopg2 import connect, extensions
 from dotenv import load_dotenv
 import os
+from pipeline_core.manager import PipelineManager
 
 app = FastAPI(title="ML Service")
 load_dotenv("./core/.env")
@@ -65,6 +67,30 @@ async def health():
         "minio": minio_status,
         "database": database_status
     }
+
+
+@app.post("/pipeline/v2/run-once")
+async def pipeline_v2_run_once(profile: str | None = None):
+    config_path = os.getenv("PIPELINE_CONFIG_PATH", "./core/pipeline.yaml")
+    selected_profile = profile or os.getenv("PIPELINE_PROFILE")
+    try:
+        manager = PipelineManager(config_path=config_path, profile=selected_profile)
+        processed = manager.run_once()
+        return {"processed": processed, "profile": manager.profile}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"pipeline_v2_run_once_failed: {exc}") from exc
+
+
+@app.post("/pipeline/v2/run-continuous")
+async def pipeline_v2_run_continuous(profile: str | None = None):
+    config_path = os.getenv("PIPELINE_CONFIG_PATH", "./core/pipeline.yaml")
+    selected_profile = profile or os.getenv("PIPELINE_PROFILE")
+    try:
+        manager = PipelineManager(config_path=config_path, profile=selected_profile)
+        manager.run_continuous()
+        return {"status": "completed", "profile": manager.profile}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"pipeline_v2_run_continuous_failed: {exc}") from exc
 
 if __name__ == "__main__":
     import uvicorn
