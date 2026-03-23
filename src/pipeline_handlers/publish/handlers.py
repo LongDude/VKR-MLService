@@ -6,7 +6,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pipeline_core.contracts import PipelineContext, PipelineError, StageResult
 from pipeline_handlers.base import BasePublishHandler
@@ -37,6 +37,7 @@ class KeywordPublishHandler(BasePublishHandler):
     def __init__(self, config: dict | None = None) -> None:
         super().__init__(config=config)
         self.enable_postgres = bool(self.config.get("enable_postgres", True))
+        self.postgres_autocreate_publication = bool(self.config.get("postgres_autocreate_publication", True))
         self.enable_qdrant = bool(self.config.get("enable_qdrant", True))
         self.qdrant_collection = str(self.config.get("qdrant_collection", "paper_keywords"))
         self.embedding_model_name = str(
@@ -62,11 +63,69 @@ class KeywordPublishHandler(BasePublishHandler):
         return value.split(":")[-1].strip()
 
     @staticmethod
+    def _split_index(article_id: str) -> Tuple[str, str]:
+        candidate = (article_id or "").strip()
+        if not candidate:
+            return "arXiv", ""
+        if ":" in candidate:
+            idx_type, idx_value = candidate.split(":", 1)
+            idx_type = idx_type.strip() or "arXiv"
+            idx_value = idx_value.strip()
+            return idx_type, idx_value
+        return "arXiv", candidate
+
+    @staticmethod
+    def _normalize_date_for_sql(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+        return raw[:10]
+
+    @staticmethod
     def _normalize_keyword(value: str) -> str:
         clean = re.sub(r"[^a-zA-Z0-9]+", " ", value or "")
         return re.sub(r"\s+", " ", clean).strip().lower()
 
-    def _resolve_publication_id(self, ctx: PipelineContext) -> Optional[int]:
+    def _find_publication_id(
+        self,
+        *,
+        conn: Any,
+        index_value: str,
+        index_type: Optional[str] = None,
+    ) -> Optional[int]:
+        if not index_value:
+            return None
+        with conn.cursor() as cursor:
+            if index_type:
+                cursor.execute(
+                    """
+                    SELECT ia.fk_publication
+                    FROM indexed_at ia
+                    JOIN external_indexes ei ON ei.id = ia.fk_external_index
+                    WHERE ia.external_index_value = %s
+                      AND LOWER(ei.index_name) = LOWER(%s)
+                    LIMIT 1
+                    """,
+                    (index_value, index_type),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT ia.fk_publication
+                    FROM indexed_at ia
+                    WHERE ia.external_index_value = %s
+                    LIMIT 1
+                    """,
+                    (index_value,),
+                )
+            row = cursor.fetchone()
+            if row and row[0]:
+                return int(row[0])
+        return None
+
+    def _resolve_or_create_publication_id(self, ctx: PipelineContext) -> Optional[int]:
         from service_lib import ServiceConnectionFactory
 
         if ctx.db_id:
@@ -76,30 +135,60 @@ class KeywordPublishHandler(BasePublishHandler):
         if not article_id:
             return None
 
-        candidates = []
+        candidates: List[str] = []
         clean_id = self._clean_article_id(article_id)
         if clean_id:
             candidates.append(clean_id)
         if article_id not in candidates:
             candidates.append(article_id)
 
+        index_type, index_value = self._split_index(article_id)
+        metadata = ctx.metadata if isinstance(ctx.metadata, dict) else {}
+        title = str(metadata.get("title") or article_id).strip() or article_id
+        annotation = metadata.get("abstract") or metadata.get("annotation")
+        publication_date = self._normalize_date_for_sql(metadata.get("submitted_date") or metadata.get("date"))
+
         conn = ServiceConnectionFactory.createDatabaseConnection()
         try:
+            for candidate in candidates:
+                publication_id = self._find_publication_id(conn=conn, index_value=candidate, index_type=index_type)
+                if publication_id is not None:
+                    return publication_id
+
+            if not self.postgres_autocreate_publication:
+                return None
+
             with conn.cursor() as cursor:
-                for candidate in candidates:
-                    cursor.execute(
-                        """
-                        SELECT ia.fk_publication
-                        FROM indexed_at ia
-                        WHERE ia.external_index_value = %s
-                        LIMIT 1
-                        """,
-                        (candidate,),
-                    )
-                    row = cursor.fetchone()
-                    if row and row[0]:
-                        return int(row[0])
+                cursor.execute(
+                    "SELECT add_unique_publication(%s, %s, %s, %s, %s)",
+                    (title, annotation, publication_date, index_type, index_value),
+                )
+                row = cursor.fetchone()
+                created_id = int(row[0]) if row and row[0] is not None else 0
+            conn.commit()
+
+            if created_id > 0:
+                logger.info(
+                    "PostgreSQL publication created for article_id=%s publication_id=%s",
+                    article_id,
+                    created_id,
+                )
+                return created_id
+
+            # add_unique_publication returns 0 when the record already exists.
+            publication_id = self._find_publication_id(conn=conn, index_value=index_value, index_type=index_type)
+            if publication_id is not None:
+                logger.info(
+                    "PostgreSQL publication resolved after add_unique_publication returned 0: article_id=%s publication_id=%s",
+                    article_id,
+                    publication_id,
+                )
+                return publication_id
             return None
+        except Exception:
+            conn.rollback()
+            logger.exception("Failed to resolve/create publication for article_id=%s", article_id)
+            raise
         finally:
             conn.close()
 
@@ -273,10 +362,10 @@ class KeywordPublishHandler(BasePublishHandler):
 
         if self.enable_postgres:
             try:
-                publication_id = self._resolve_publication_id(ctx)
+                publication_id = self._resolve_or_create_publication_id(ctx)
                 if publication_id is None:
                     logger.warning(
-                        "PostgreSQL save skipped: publication_id not found for article_id=%s",
+                        "PostgreSQL save skipped: publication_id not resolved for article_id=%s",
                         ctx.article_id,
                     )
                     persist_status["postgres"] = {"saved": False, "reason": "publication_not_found"}

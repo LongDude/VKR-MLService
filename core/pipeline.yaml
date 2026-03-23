@@ -66,6 +66,7 @@ profiles:
         spacy_model: en_core_sci_sm
       keyword_publish:
         enable_postgres: true
+        postgres_autocreate_publication: true
         enable_qdrant: true
         qdrant_collection: paper_keywords
         embedding_model_name: sentence-transformers/all-MiniLM-L6-v2
@@ -115,6 +116,7 @@ profiles:
         cold_bucket: cold-raw
       keyword_publish:
         enable_postgres: true
+        postgres_autocreate_publication: true
         enable_qdrant: true
         qdrant_collection: paper_keywords
         embedding_model_name: sentence-transformers/all-MiniLM-L6-v2
@@ -160,6 +162,7 @@ profiles:
     handler_configs:
       keyword_publish:
         enable_postgres: true
+        postgres_autocreate_publication: true
         enable_qdrant: true
         qdrant_collection: paper_keywords
         embedding_model_name: sentence-transformers/all-MiniLM-L6-v2
