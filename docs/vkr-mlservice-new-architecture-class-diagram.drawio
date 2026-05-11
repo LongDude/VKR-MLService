@@ -1,0 +1,163 @@
+﻿<mxfile host="app.diagrams.net" modified="2026-03-24T10:00:00.000Z" version="24.7.17" type="device">
+  <diagram id="vkr-mlservice-uml" name="VKR-MLService UML">
+    <mxGraphModel dx="1800" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2200" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="pkg_core" value="pipeline_core" style="swimlane;rounded=0;whiteSpace=wrap;html=1;startSize=28;container=1;horizontal=1;" vertex="1" parent="1">
+          <mxGeometry x="20" y="20" width="1020" height="560" as="geometry"/>
+        </mxCell>
+        <mxCell id="pkg_handlers" value="pipeline_handlers" style="swimlane;rounded=0;whiteSpace=wrap;html=1;startSize=28;container=1;horizontal=1;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="20" width="1100" height="1080" as="geometry"/>
+        </mxCell>
+        <mxCell id="pkg_contracts" value="contracts" style="swimlane;rounded=0;whiteSpace=wrap;html=1;startSize=28;container=1;horizontal=1;" vertex="1" parent="1">
+          <mxGeometry x="20" y="600" width="1020" height="500" as="geometry"/>
+        </mxCell>
+        <mxCell id="pm" value="PipelineManager&#xa;---&#xa;+run_once(): bool&#xa;+run_continuous()&#xa;-_run_stage()" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_core">
+          <mxGeometry x="20" y="40" width="220" height="130" as="geometry"/>
+        </mxCell>
+        <mxCell id="hr" value="HandlerRegistry&#xa;---&#xa;+register()&#xa;+register_many()&#xa;+resolve_chain()" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_core">
+          <mxGeometry x="270" y="40" width="220" height="130" as="geometry"/>
+        </mxCell>
+        <mxCell id="pio" value="PipelineIO&#xa;---&#xa;+poll_ingress()&#xa;+ack_ingress()&#xa;+publish_keywords()&#xa;+publish_error()" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_core">
+          <mxGeometry x="520" y="40" width="230" height="140" as="geometry"/>
+        </mxCell>
+        <mxCell id="rsg" value="RedisStreamGateway&#xa;---&#xa;+xadd_json()&#xa;+read_first_json()&#xa;+xdel()" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_core">
+          <mxGeometry x="20" y="220" width="220" height="120" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="osg" value="ObjectStoreGateway&#xa;---&#xa;+ensure_bucket()&#xa;+put_bytes()&#xa;+get_bytes()&#xa;+exists()" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_core">
+          <mxGeometry x="270" y="220" width="220" height="130" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="ldg" value="LocalDatasetGateway&#xa;---&#xa;+resolve()&#xa;+read_json()&#xa;+read_text()&#xa;+exists()" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_core">
+          <mxGeometry x="520" y="220" width="230" height="130" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="sc" value="StageCache&#xa;---&#xa;+enabled()&#xa;+write_bytes()&#xa;+read_bytes()" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_core">
+          <mxGeometry x="780" y="220" width="210" height="120" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="bhandler" value="&lt;&lt;abstract&gt;&gt; BaseHandler&#xa;---&#xa;+handler_id&#xa;+stage&#xa;+priority&#xa;+can_handle()&#xa;+handle()" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;" vertex="1" parent="pkg_handlers">
+          <mxGeometry x="20" y="40" width="230" height="150" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="bfallback" value="&lt;&lt;abstract&gt;&gt; BaseFallbackAwareHandler&#xa;---&#xa;+recoverable(err)" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;" vertex="1" parent="pkg_handlers">
+          <mxGeometry x="280" y="40" width="240" height="110" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="bstages" value="&lt;&lt;abstract&gt;&gt; Stage Base Handlers&#xa;---&#xa;BaseIngestHandler&#xa;BaseAcquireHandler&#xa;BaseExtractHandler&#xa;BaseKeywordHandler&#xa;BasePublishHandler" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;" vertex="1" parent="pkg_handlers">
+          <mxGeometry x="550" y="40" width="260" height="160" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="ingest" value="Ingest Handlers&#xa;---&#xa;ColdDatasetIngestHandler&#xa;ColdObjectIngestHandler&#xa;ArxivIngestHandler" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_handlers">
+          <mxGeometry x="20" y="250" width="230" height="130" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="acquire" value="Acquire Handlers&#xa;---&#xa;ColdObjectReadHandler&#xa;HotObjectReadHandler" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_handlers">
+          <mxGeometry x="280" y="250" width="240" height="120" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="extract" value="Extract Handlers&#xa;---&#xa;DatasetTextPassthroughHandler&#xa;TexPandocHandler&#xa;PdfExtractFallbackHandler" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_handlers">
+          <mxGeometry x="550" y="250" width="260" height="140" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="keywords" value="KeywordEnsembleHandler" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_handlers">
+          <mxGeometry x="20" y="430" width="230" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="publish" value="KeywordPublishHandler" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_handlers">
+          <mxGeometry x="280" y="430" width="240" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="epublish" value="ErrorPublishHandler&#xa;+publish_error()" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_handlers">
+          <mxGeometry x="550" y="430" width="260" height="80" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="pctx" value="PipelineContext&#xa;---&#xa;+metadata&#xa;+artifacts&#xa;+trace&#xa;+runtime_data" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_contracts">
+          <mxGeometry x="20" y="40" width="230" height="130" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="sresult" value="StageResult&#xa;---&#xa;+status: StageStatus&#xa;+ctx: PipelineContext&#xa;+error?: PipelineError" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_contracts">
+          <mxGeometry x="280" y="40" width="230" height="130" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="perr" value="PipelineError&#xa;---&#xa;+code&#xa;+message&#xa;+stage&#xa;+handler_id" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_contracts">
+          <mxGeometry x="540" y="40" width="230" height="130" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="aref" value="ArtifactRef" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_contracts">
+          <mxGeometry x="20" y="220" width="230" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="trace" value="StageTrace" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="pkg_contracts">
+          <mxGeometry x="280" y="220" width="230" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="pm" target="hr">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="pm" target="pio">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="pm" target="epublish">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=diamond;" edge="1" parent="1" source="pio" target="rsg">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=diamond;" edge="1" parent="1" source="pio" target="osg">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=diamond;" edge="1" parent="1" source="pio" target="ldg">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=diamond;" edge="1" parent="1" source="pio" target="sc">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="hr" target="bhandler">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="bfallback" target="bhandler">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="bstages" target="bfallback">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="ingest" target="bstages">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="acquire" target="bstages">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e13" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="extract" target="bstages">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e14" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="keywords" target="bstages">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e15" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="publish" target="bstages">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="epublish" target="bstages">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e17" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="pm" target="pctx">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e18" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="pm" target="sresult">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e19" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="sresult" target="perr">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e20" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=diamond;" edge="1" parent="1" source="pctx" target="aref">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e21" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=diamond;" edge="1" parent="1" source="pctx" target="trace">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
