@@ -5,7 +5,9 @@ fastapi
 # Services
 psycopg2
 SQLAlchemy
-
 redis
 minio
 qdrant_client
+
+# MISC
+dotenv

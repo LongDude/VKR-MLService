@@ -18,6 +18,8 @@ services:
     image: redis:7-alpine
     container_name: vkr-ml-redis
     restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis123}
     command: ["/bin/sh",  "-c",  "redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru --requirepass \"$${REDIS_PASSWORD:-redis123}\""]
     ports:
       - 6379:6379
@@ -26,7 +28,7 @@ services:
     networks:
       - ml_network
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD:-redis123}\" redis-cli ping | grep -q '^PONG$'"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -34,9 +36,9 @@ services:
   redis-commander:
     image: rediscommander/redis-commander:latest
     container_name: vkr-ml-redis-commander
-    restart: unless-stopped
     environment:
       - REDIS_HOST=redis
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redis123}
       - REDIS_PORT=6379
       - REDIS_DB=0
     ports:
