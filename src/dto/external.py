@@ -72,7 +72,7 @@ class ExternalPaperDTO(BaseDTO):
     raw: dict[str, Any] | None = None
 
 
-class OpenAlyxSearchFiltersDTO(BaseDTO):
+class OpenAlexSearchFiltersDTO(BaseDTO):
     query: str | None = None
     publication_year_from: int | None = None
     publication_year_to: int | None = None
@@ -99,5 +99,5 @@ __all__ = [
     "ExternalPaperDTO",
     "ExternalSearchResultDTO",
     "ExternalTopicDTO",
-    "OpenAlyxSearchFiltersDTO",
+    "OpenAlexSearchFiltersDTO",
 ]

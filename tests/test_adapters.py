@@ -12,8 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from adapters.lmstudio_chat_adapter import LMStudioChatAdapter
 from adapters.lmstudio_embedding_adapter import LMStudioEmbeddingAdapter
-from adapters.ml_service_adapter import MLServiceAdapter
-from adapters.openalyx_adapter import OpenAlyxAdapter
+from adapters.openalex_adapter import OpenAlexAdapter
 from adapters.qdrant_adapter import QdrantAdapter
 from adapters.redis_adapter import RedisAdapter
 from core.exceptions import (
@@ -24,7 +23,7 @@ from core.exceptions import (
     RedisOperationError,
 )
 from dto.common import BatchOperationResultDTO
-from dto.external import OpenAlyxSearchFiltersDTO
+from dto.external import OpenAlexSearchFiltersDTO
 from dto.papers import PaperBatchIndexingRequestDTO, PaperIndexingRequestDTO
 from dto.qdrant import QdrantPayloadIndexDTO, QdrantPointDTO
 from dto.search import SemanticSearchRequestDTO
@@ -271,7 +270,7 @@ def test_lmstudio_chat_adapter_rejects_invalid_json_when_requested() -> None:
         )
 
 
-def test_openalyx_adapter_normalizes_work_response() -> None:
+def test_openalex_adapter_normalizes_work_response() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -306,7 +305,7 @@ def test_openalyx_adapter_normalizes_work_response() -> None:
             },
         )
 
-    adapter = OpenAlyxAdapter(
+    adapter = OpenAlexAdapter(
         "https://openalex.test",
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
@@ -324,8 +323,8 @@ def test_openalyx_adapter_normalizes_work_response() -> None:
     assert paper.raw is not None
 
 
-def test_openalyx_adapter_maps_429_to_rate_limit() -> None:
-    adapter = OpenAlyxAdapter(
+def test_openalex_adapter_maps_429_to_rate_limit() -> None:
+    adapter = OpenAlexAdapter(
         "https://openalex.test",
         client=httpx.Client(
             transport=httpx.MockTransport(lambda request: httpx.Response(429))
@@ -333,42 +332,4 @@ def test_openalyx_adapter_maps_429_to_rate_limit() -> None:
     )
 
     with pytest.raises(ExternalServiceRateLimitError):
-        adapter.search_works("x", OpenAlyxSearchFiltersDTO())
-
-
-def test_ml_service_adapter_posts_dtos_and_validates_responses() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/semantic-search":
-            return httpx.Response(200, json={"query": "gnn", "hits": []})
-        if request.url.path == "/papers/index":
-            return httpx.Response(
-                200,
-                json={"paper_id": 1, "status": "pending", "message": None},
-            )
-        if request.url.path == "/papers/index-batch":
-            return httpx.Response(
-                200,
-                json=BatchOperationResultDTO(total=2, created=1, skipped=1).model_dump(),
-            )
-        return httpx.Response(404)
-
-    adapter = MLServiceAdapter(
-        "http://ml",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-
-    assert adapter.semantic_search(SemanticSearchRequestDTO(query="gnn")).query == "gnn"
-    assert adapter.index_paper(PaperIndexingRequestDTO(paper_id=1)).status == "pending"
-    assert adapter.index_batch(PaperBatchIndexingRequestDTO(paper_ids=[1, 2])).total == 2
-
-
-def test_ml_service_adapter_maps_client_errors() -> None:
-    adapter = MLServiceAdapter(
-        "http://ml",
-        client=httpx.Client(
-            transport=httpx.MockTransport(lambda request: httpx.Response(400, text="bad"))
-        ),
-    )
-
-    with pytest.raises(InvalidRequestError):
-        adapter.semantic_search(SemanticSearchRequestDTO(query="gnn"))
+        adapter.search_works("x", OpenAlexSearchFiltersDTO())

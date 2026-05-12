@@ -20,11 +20,11 @@ from dto.external import (
     ExternalPaperDTO,
     ExternalSearchResultDTO,
     ExternalTopicDTO,
-    OpenAlyxSearchFiltersDTO,
+    OpenAlexSearchFiltersDTO,
 )
 
 
-class OpenAlyxAdapter:
+class OpenAlexAdapter:
     def __init__(
         self,
         base_url: str = "https://api.openalex.org",
@@ -55,7 +55,7 @@ class OpenAlyxAdapter:
     def search_works(
         self,
         query: str,
-        filters: OpenAlyxSearchFiltersDTO,
+        filters: OpenAlexSearchFiltersDTO,
         page: int = 1,
         per_page: int = 25,
     ) -> ExternalSearchResultDTO:
@@ -77,7 +77,7 @@ class OpenAlyxAdapter:
         page: int = 1,
         per_page: int = 25,
     ) -> ExternalSearchResultDTO:
-        filters = OpenAlyxSearchFiltersDTO(date_from=date_from, date_to=date_to)
+        filters = OpenAlexSearchFiltersDTO(date_from=date_from, date_to=date_to)
         return self.search_works("", filters, page=page, per_page=per_page)
 
     def _get_json(
@@ -96,24 +96,24 @@ class OpenAlyxAdapter:
             return None
         if response.status_code == 429:
             raise ExternalServiceRateLimitError(
-                "OpenAlyx/OpenAlex rate limit exceeded",
+                "OpenAlex/OpenAlex rate limit exceeded",
                 details={"status_code": response.status_code, "body": response.text},
             )
         if response.status_code >= 500:
             raise ExternalServiceUnavailableError(
-                "OpenAlyx/OpenAlex service is unavailable",
+                "OpenAlex/OpenAlex service is unavailable",
                 details={"status_code": response.status_code, "body": response.text},
             )
         if response.status_code >= 400:
             raise ExternalResponseFormatError(
-                "OpenAlyx/OpenAlex returned an unexpected client error",
+                "OpenAlex/OpenAlex returned an unexpected client error",
                 details={"status_code": response.status_code, "body": response.text},
             )
         try:
             return response.json()
         except ValueError as exc:
             raise ExternalResponseFormatError(
-                "OpenAlyx/OpenAlex response is not valid JSON",
+                "OpenAlex/OpenAlex response is not valid JSON",
                 details={"reason": str(exc)},
             ) from exc
 
@@ -134,11 +134,11 @@ class OpenAlyxAdapter:
                 or len(results)
             )
         else:
-            raise ExternalResponseFormatError("OpenAlyx/OpenAlex search response is empty")
+            raise ExternalResponseFormatError("OpenAlex/OpenAlex search response is empty")
 
         if not isinstance(results, list):
             raise ExternalResponseFormatError(
-                "OpenAlyx/OpenAlex search results are not a list"
+                "OpenAlex/OpenAlex search results are not a list"
             )
 
         return ExternalSearchResultDTO(
@@ -390,7 +390,7 @@ class OpenAlyxAdapter:
             return self._bool_or_none(open_access.get("is_oa"))
         return None
 
-    def _build_filter_param(self, filters: OpenAlyxSearchFiltersDTO) -> str | None:
+    def _build_filter_param(self, filters: OpenAlexSearchFiltersDTO) -> str | None:
         values: list[str] = []
         if filters.date_from is not None:
             values.append(f"from_publication_date:{filters.date_from.isoformat()}")
@@ -439,4 +439,4 @@ class OpenAlyxAdapter:
             return None
 
 
-__all__ = ["OpenAlyxAdapter"]
+__all__ = ["OpenAlexAdapter"]

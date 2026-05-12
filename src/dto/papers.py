@@ -77,7 +77,7 @@ class PaperResolveRequestDTO(BaseDTO):
 
 class PaperResolveResponseDTO(BaseDTO):
     paper: PaperShortDTO | None
-    source: Literal["local_cache", "external_openalyx", "not_found"]
+    source: Literal["local_cache", "external_openalex", "not_found"]
     was_created_locally: bool
     indexing_status: IndexingStatus | None
 
