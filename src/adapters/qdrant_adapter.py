@@ -5,9 +5,43 @@ from typing import Any
 from core.exceptions import QdrantIndexError
 from dto.qdrant import QdrantPayloadIndexDTO, QdrantPointDTO, QdrantSearchHitDTO
 
+try:
+    from qdrant_client import QdrantClient, models as qdrant_models
+except ImportError:
+    QdrantClient = None
+    qdrant_models = None
+
 
 class QdrantAdapter:
-    def __init__(self, client: Any) -> None:
+    def __init__(
+        self,
+        client: Any | None = None,
+        *,
+        url: str | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        api_key: str | None = None,
+        timeout_seconds: float | None = None,
+        prefer_grpc: bool = False,
+    ) -> None:
+        if client is None:
+            if QdrantClient is None:
+                raise QdrantIndexError(
+                    "qdrant_client is not installed. Install qdrant-client to use QdrantAdapter.",
+                    details={"qdrant_client_installed": False},
+                )
+            client_kwargs: dict[str, Any] = {"prefer_grpc": prefer_grpc}
+            if url is not None:
+                client_kwargs["url"] = url
+            if host is not None:
+                client_kwargs["host"] = host
+            if port is not None:
+                client_kwargs["port"] = port
+            if api_key is not None:
+                client_kwargs["api_key"] = api_key
+            if timeout_seconds is not None:
+                client_kwargs["timeout"] = timeout_seconds
+            client = QdrantClient(**client_kwargs)
         self._client = client
 
     def ensure_collection(
@@ -40,7 +74,7 @@ class QdrantAdapter:
                 self._client.create_payload_index(
                     collection_name=collection_name,
                     field_name=index.field_name,
-                    field_schema=index.field_schema,
+                    field_schema=self._payload_schema(index.field_schema),
                 )
         except Exception as exc:
             raise self._error(
@@ -86,7 +120,17 @@ class QdrantAdapter:
         filters: dict[str, Any] | None = None,
     ) -> list[QdrantSearchHitDTO]:
         try:
-            if hasattr(self._client, "search"):
+            if hasattr(self._client, "query_points"):
+                result = self._client.query_points(
+                    collection_name=collection_name,
+                    query=vector,
+                    limit=top_k,
+                    query_filter=filters,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                result = getattr(result, "points", result)
+            elif hasattr(self._client, "search"):
                 result = self._client.search(
                     collection_name=collection_name,
                     query_vector=vector,
@@ -94,13 +138,7 @@ class QdrantAdapter:
                     query_filter=filters,
                 )
             else:
-                result = self._client.query_points(
-                    collection_name=collection_name,
-                    query=vector,
-                    limit=top_k,
-                    query_filter=filters,
-                )
-                result = getattr(result, "points", result)
+                raise RuntimeError("Qdrant client has neither query_points nor search method")
             return [self._to_search_hit(point) for point in result]
         except Exception as exc:
             raise self._error(
@@ -146,21 +184,40 @@ class QdrantAdapter:
             return False
 
     def _vector_params(self, vector_size: int, distance: str) -> Any:
-        models = self._qdrant_models()
-        if models is None:
+        if qdrant_models is None:
             return {"size": vector_size, "distance": distance}
-        distance_value = getattr(models.Distance, distance.upper(), distance)
-        return models.VectorParams(size=vector_size, distance=distance_value)
+        distance_value = getattr(qdrant_models.Distance, distance.upper(), None)
+        if distance_value is None:
+            raise ValueError(f"Unsupported Qdrant distance: {distance!r}")
+        return qdrant_models.VectorParams(size=vector_size, distance=distance_value)
 
     def _point_struct(self, point: QdrantPointDTO) -> Any:
-        models = self._qdrant_models()
-        if models is None:
+        if qdrant_models is None:
             return point.model_dump()
-        return models.PointStruct(
+        return qdrant_models.PointStruct(
             id=point.id,
             vector=point.vector,
             payload=point.payload,
         )
+
+    def _payload_schema(self, field_schema: str) -> Any:
+        if qdrant_models is None:
+            return field_schema
+        normalized = field_schema.lower()
+        schema_map = {
+            "keyword": qdrant_models.PayloadSchemaType.KEYWORD,
+            "integer": qdrant_models.PayloadSchemaType.INTEGER,
+            "int": qdrant_models.PayloadSchemaType.INTEGER,
+            "float": qdrant_models.PayloadSchemaType.FLOAT,
+            "bool": qdrant_models.PayloadSchemaType.BOOL,
+            "boolean": qdrant_models.PayloadSchemaType.BOOL,
+            "datetime": qdrant_models.PayloadSchemaType.DATETIME,
+            "text": qdrant_models.PayloadSchemaType.TEXT,
+        }
+        try:
+            return schema_map[normalized]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported Qdrant payload schema: {field_schema!r}") from exc
 
     def _to_search_hit(self, point: Any) -> QdrantSearchHitDTO:
         return QdrantSearchHitDTO(
@@ -182,15 +239,8 @@ class QdrantAdapter:
             return value.get(key, default)
         return getattr(value, key, default)
 
-    def _qdrant_models(self) -> Any | None:
-        try:
-            from qdrant_client import models
-        except ImportError:
-            return None
-        return models
-
     def _error(self, message: str, exc: Exception, **details: Any) -> QdrantIndexError:
-        if self._qdrant_models() is None:
+        if qdrant_models is None:
             details["qdrant_client_installed"] = False
         details["reason"] = str(exc)
         return QdrantIndexError(message, details=details)
