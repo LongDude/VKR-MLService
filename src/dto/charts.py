@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Literal
 
 from pydantic import Field
@@ -49,10 +50,16 @@ class ChartDTO(BaseDTO):
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
+class PeriodCountDTO(BaseDTO):
+    period_start: date
+    count: int
+
+
 __all__ = [
     "ChartAxisDTO",
     "ChartCellDTO",
     "ChartDTO",
     "ChartPointDTO",
     "ChartSeriesDTO",
+    "PeriodCountDTO",
 ]

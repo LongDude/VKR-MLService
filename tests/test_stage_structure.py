@@ -19,6 +19,7 @@ MODULES = [
     "models.base",
     "models.institution",
     "models.keyword",
+    "models.models",
     "models.paper",
     "models.session",
     "models.topic",
