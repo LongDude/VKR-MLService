@@ -1,13 +1,17 @@
 # Control flow
 uvicorn
 fastapi
+typer
 
 # Services
 psycopg2
-SQLAlchemy
+SQLAlchemy>=2
 redis
 minio
 qdrant_client
+httpx
 
 # MISC
 dotenv
+pydantic>=2
+pytest
