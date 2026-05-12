@@ -7,10 +7,11 @@ from sqlalchemy import BigInteger, DateTime, Text, text
 from sqlalchemy.ext.associationproxy import AssociationProxy, association_proxy
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from .associations import PaperAuthor
+from .associations import AuthorInstitution, PaperAuthor
 from .base import Base
 
 if TYPE_CHECKING:
+    from .institution import Institution
     from .paper import Paper
 
 
@@ -27,10 +28,18 @@ class Author(Base):
     paper_links: Mapped[list["PaperAuthor"]] = relationship(
         back_populates="author", cascade="all, delete-orphan"
     )
+    institution_links: Mapped[list["AuthorInstitution"]] = relationship(
+        back_populates="author", cascade="all, delete-orphan"
+    )
     papers: AssociationProxy[list["Paper"]] = association_proxy(
         "paper_links",
         "paper",
         creator=lambda paper: PaperAuthor(paper=paper),
+    )
+    institutions: AssociationProxy[list["Institution"]] = association_proxy(
+        "institution_links",
+        "institution",
+        creator=lambda institution: AuthorInstitution(institution=institution),
     )
 
     def __repr__(self) -> str:

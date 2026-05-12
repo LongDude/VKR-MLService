@@ -7,13 +7,19 @@ from sqlalchemy import BigInteger, DateTime, Text, text
 from sqlalchemy.ext.associationproxy import AssociationProxy, association_proxy
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from .associations import UserFavouritePaper, UserTrackedKeyword, UserTrackedTopic
+from .associations import (
+    UserFavouritePaper,
+    UserTrackedDomain,
+    UserTrackedKeyword,
+    UserTrackedSubfield,
+    UserTrackedTopic,
+)
 from .base import Base
 
 if TYPE_CHECKING:
     from .keyword import Keyword
     from .paper import Paper
-    from .topic import Topic
+    from .topic import Domain, Subfield, Topic
 
 
 class User(Base):
@@ -37,6 +43,12 @@ class User(Base):
     tracked_topic_links: Mapped[list["UserTrackedTopic"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    tracked_domain_links: Mapped[list["UserTrackedDomain"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    tracked_subfield_links: Mapped[list["UserTrackedSubfield"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
     tracked_keyword_links: Mapped[list["UserTrackedKeyword"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
@@ -49,6 +61,16 @@ class User(Base):
         "tracked_topic_links",
         "topic",
         creator=lambda topic: UserTrackedTopic(topic=topic),
+    )
+    tracked_domains: AssociationProxy[list["Domain"]] = association_proxy(
+        "tracked_domain_links",
+        "domain",
+        creator=lambda domain: UserTrackedDomain(domain=domain),
+    )
+    tracked_subfields: AssociationProxy[list["Subfield"]] = association_proxy(
+        "tracked_subfield_links",
+        "subfield",
+        creator=lambda subfield: UserTrackedSubfield(subfield=subfield),
     )
     tracked_keywords: AssociationProxy[list["Keyword"]] = association_proxy(
         "tracked_keyword_links",
