@@ -95,18 +95,28 @@ class QdrantPayloadBuilder:
             "status": data.get("status"),
             "source_topic_id": data.get("source_topic_id"),
             "paper_count": self._first(data, "paper_count", source=metrics),
+            "paper_count_total": data.get("paper_count_total"),
+            "paper_count_30d": data.get("paper_count_30d"),
+            "paper_count_90d": data.get("paper_count_90d"),
             "previous_paper_count": self._first(
                 data,
                 "previous_paper_count",
                 source=metrics,
             ),
+            "previous_30d_count": data.get("previous_30d_count"),
+            "previous_90d_count": data.get("previous_90d_count"),
             "growth_rate": self._first(data, "growth_rate", source=metrics),
+            "growth_rate_30d": data.get("growth_rate_30d"),
+            "growth_rate_90d": data.get("growth_rate_90d"),
+            "acceleration": data.get("acceleration"),
             "trend_score": self._first(data, "trend_score", source=metrics),
             "semantic_drift": self._first(data, "semantic_drift", source=metrics),
             "citation_count_sum": self._first(data, "citation_count_sum", source=metrics),
             "avg_cited_by_count": self._first(data, "avg_cited_by_count", source=metrics),
             "top_keywords": data.get("top_keywords"),
             "representative_paper_ids": data.get("representative_paper_ids"),
+            "summary_degraded": data.get("summary_degraded"),
+            "indexed_at": data.get("indexed_at"),
         }
         return self._compact_json_dict(payload)
 
