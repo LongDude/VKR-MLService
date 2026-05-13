@@ -131,6 +131,7 @@ class QdrantPayloadBuilder:
             "cluster_id": data.get("cluster_id"),
             "cluster_key": data.get("cluster_key"),
             "cluster_name": data.get("cluster_name"),
+            "granularity": data.get("granularity"),
             "period_start": data.get("period_start"),
             "period_end": data.get("period_end"),
             "paper_count": data.get("paper_count"),
@@ -138,10 +139,14 @@ class QdrantPayloadBuilder:
             "growth_rate": data.get("growth_rate"),
             "trend_score": data.get("trend_score"),
             "semantic_drift": data.get("semantic_drift"),
+            "centroid_dimension": data.get("centroid_dimension"),
             "citation_count_sum": data.get("citation_count_sum"),
             "avg_cited_by_count": data.get("avg_cited_by_count"),
             "top_keywords": data.get("top_keywords"),
+            "keyword_counts": data.get("keyword_counts"),
             "representative_paper_ids": data.get("representative_paper_ids"),
+            "indexed_paper_ids": data.get("indexed_paper_ids"),
+            "indexed_at": data.get("indexed_at"),
         }
         return self._compact_json_dict(payload)
 
