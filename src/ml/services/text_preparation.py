@@ -75,8 +75,10 @@ class TextPreparationService:
             {
                 "role": "system",
                 "content": (
-                    "You summarize research clusters. Return a compact JSON object "
-                    "with keys: name, summary, top_keywords, explanation."
+                    "You summarize research clusters. Return only a compact JSON "
+                    "object with keys: title, summary, key_methods, "
+                    "key_applications, limitations. Use short strings and arrays "
+                    "of short strings."
                 ),
             },
             {
@@ -142,4 +144,3 @@ class TextPreparationService:
 
 
 __all__ = ["TextPreparationService"]
-
