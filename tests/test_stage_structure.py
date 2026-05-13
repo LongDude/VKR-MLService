@@ -55,10 +55,7 @@ MODULES = [
     "adapters.lmstudio_embedding_adapter",
     "adapters.lmstudio_chat_adapter",
     "adapters.openalex_adapter",
-    "utils.text",
     "utils.hashing",
-    "utils.dates",
-    "utils.openalex_snapshot",
     "cli.warmup_snapshots",
 ]
 
