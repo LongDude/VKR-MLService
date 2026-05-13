@@ -58,7 +58,7 @@ class TrendDashboardResponseDTO(BaseDTO):
 
 
 class ClusterChartsRequestDTO(BaseDTO):
-    cluster_id: int
+    cluster_id: int | str
     date_range: DateRangeDTO = Field(default_factory=DateRangeDTO)
 
 
@@ -70,7 +70,7 @@ class ClusterDynamicsRequestDTO(BaseDTO):
 
 
 class ClusterChartsResponseDTO(BaseDTO):
-    cluster_id: int
+    cluster_id: int | str
     charts: list[ChartDTO] = Field(default_factory=list)
 
 
