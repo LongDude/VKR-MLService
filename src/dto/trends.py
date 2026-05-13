@@ -35,6 +35,15 @@ class TrendClusterDTO(BaseDTO):
     representative_paper_ids: list[int] = Field(default_factory=list)
 
 
+class ClusterSummaryDTO(BaseDTO):
+    title: str
+    summary: str
+    key_methods: list[str] = Field(default_factory=list)
+    key_applications: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    degraded: bool = False
+
+
 class TrendDashboardRequestDTO(BaseDTO):
     date_range: DateRangeDTO = Field(default_factory=DateRangeDTO)
     statuses: list[TrendStatus] = Field(default_factory=list)
@@ -53,6 +62,13 @@ class ClusterChartsRequestDTO(BaseDTO):
     date_range: DateRangeDTO = Field(default_factory=DateRangeDTO)
 
 
+class ClusterDynamicsRequestDTO(BaseDTO):
+    cluster_id: str
+    date_from: date
+    date_to: date
+    granularity: Literal["week", "month"] = "month"
+
+
 class ClusterChartsResponseDTO(BaseDTO):
     cluster_id: int
     charts: list[ChartDTO] = Field(default_factory=list)
@@ -61,6 +77,8 @@ class ClusterChartsResponseDTO(BaseDTO):
 __all__ = [
     "ClusterChartsRequestDTO",
     "ClusterChartsResponseDTO",
+    "ClusterDynamicsRequestDTO",
+    "ClusterSummaryDTO",
     "TrendClusterDTO",
     "TrendDashboardRequestDTO",
     "TrendDashboardResponseDTO",

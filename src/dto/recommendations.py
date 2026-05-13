@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import Field
 
 from .common import BaseDTO
 from .papers import PaperShortDTO
+
+
+class UserProfileDTO(BaseDTO):
+    user_id: int
+    source_counts: dict[str, Any] = Field(default_factory=dict)
+    vector_dimension: int
+    updated_at: datetime
 
 
 class RecommendationRequestDTO(BaseDTO):
@@ -46,4 +54,5 @@ __all__ = [
     "RecommendationRequestDTO",
     "RecommendationResponseDTO",
     "RecommendationScoreDetailsDTO",
+    "UserProfileDTO",
 ]
