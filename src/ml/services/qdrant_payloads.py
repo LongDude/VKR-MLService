@@ -15,6 +15,8 @@ class QdrantPayloadBuilder:
 
         payload = {
             "paper_id": self._first(data, "paper_id", "id"),
+            "text_hash": data.get("text_hash"),
+            "embedding_model": data.get("embedding_model"),
             "title": data.get("title"),
             "doi": data.get("doi"),
             "publication_year": data.get("publication_year"),
@@ -33,6 +35,11 @@ class QdrantPayloadBuilder:
             "keywords": data.get("keywords_values")
             or data.get("keyword_values")
             or self._extract_related_names(keywords, "keyword", "value"),
+            "author_ids": data.get("author_ids"),
+            "author_names": data.get("author_names"),
+            "institution_ids": data.get("institution_ids"),
+            "institution_names": data.get("institution_names"),
+            "external_ids": data.get("external_ids"),
         }
         return self._compact_json_dict(payload)
 
