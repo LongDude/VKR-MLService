@@ -70,6 +70,11 @@ class QdrantPayloadBuilder:
             "field_name": data.get("field_name"),
             "subfield_id": data.get("subfield_id"),
             "subfield_name": data.get("subfield_name"),
+            "paper_count": data.get("paper_count"),
+            "recent_paper_count": data.get("recent_paper_count"),
+            "embedding_model": data.get("embedding_model"),
+            "embedding_version": data.get("embedding_version"),
+            "indexed_at": data.get("indexed_at"),
         }
         return self._compact_json_dict(payload)
 
