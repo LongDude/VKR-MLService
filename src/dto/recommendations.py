@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import Field
@@ -19,8 +19,14 @@ class UserProfileDTO(BaseDTO):
 class RecommendationRequestDTO(BaseDTO):
     user_id: int | None = None
     seed_paper_ids: list[int] = Field(default_factory=list)
+    domain_ids: list[int] = Field(default_factory=list)
     topic_ids: list[int] = Field(default_factory=list)
     keyword_ids: list[int] = Field(default_factory=list)
+    date_from: date | None = None
+    language: str | None = None
+    is_open_access: bool | None = None
+    exclude_favourites: bool = True
+    include_explanations: bool = False
     limit: int = Field(default=20, ge=1, le=100)
     strategy: Literal["profile", "similar_papers", "hybrid"] = "hybrid"
 
