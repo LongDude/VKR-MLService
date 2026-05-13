@@ -161,6 +161,7 @@ class QdrantPayloadBuilder:
             "profile_id": self._first(data, "profile_id", "id"),
             "profile_version": data.get("profile_version"),
             "embedding_model": data.get("embedding_model"),
+            "vector_dimension": data.get("vector_dimension"),
             "source": data.get("source"),
             "source_counts": data.get("source_counts"),
             "tracked_domain_ids": data.get("tracked_domain_ids"),
