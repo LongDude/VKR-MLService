@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import Field
 
 from .common import BaseDTO, PaginationDTO
+from .external import ExternalPaperDTO
 from .papers import CachePolicy, PaperShortDTO
 
 
@@ -38,9 +39,16 @@ class SemanticSearchHitDTO(BaseDTO):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class SemanticSearchMLHitDTO(BaseDTO):
+    paper_id: int | str
+    score: float
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 class SemanticSearchMLResponseDTO(BaseDTO):
     query: str
-    hits: list[SemanticSearchHitDTO] = Field(default_factory=list)
+    hits: list[SemanticSearchMLHitDTO] = Field(default_factory=list)
+    external_candidates: list[ExternalPaperDTO] = Field(default_factory=list)
     embedding_model: str | None = None
     elapsed_ms: int | None = None
 
@@ -56,6 +64,7 @@ class SemanticSearchResponseDTO(BaseDTO):
 __all__ = [
     "SearchFiltersDTO",
     "SemanticSearchHitDTO",
+    "SemanticSearchMLHitDTO",
     "SemanticSearchMLResponseDTO",
     "SemanticSearchRequestDTO",
     "SemanticSearchResponseDTO",
