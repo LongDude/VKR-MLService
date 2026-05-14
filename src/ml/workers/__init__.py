@@ -1,4 +1,6 @@
-from ml.workers.redis_worker import (
+from __future__ import annotations
+
+from .redis_worker import (
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
     DEFAULT_QUEUE_ORDER,
@@ -8,7 +10,7 @@ from ml.workers.redis_worker import (
     RedisMLWorker,
     USER_PROFILE_RECOMPUTE_QUEUE,
 )
-from ml.workers.task_handlers import MLTaskHandler
+from .task_handlers import MLTaskHandler
 
 __all__ = [
     "CLUSTER_DYNAMICS_RECOMPUTE_QUEUE",

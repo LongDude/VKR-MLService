@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import select
 
+from core.exceptions import InvalidRequestError
+from dto.external import ExternalKeywordDTO, ExternalTopicDTO
 from models import (
     Domain,
     Field,
@@ -37,6 +41,46 @@ class TaxonomyRepository(BaseRepository):
     def get_keyword_by_id(self, keyword_id: int) -> Keyword | None:
         """Return a keyword by primary key."""
         return self.session.get(Keyword, keyword_id)
+
+    def upsert(
+        self,
+        data: ExternalKeywordDTO | ExternalTopicDTO,
+    ) -> Keyword | Topic:
+        """Insert or update a taxonomy entity from an external API DTO.
+
+        ``ExternalTopicDTO`` is expanded into its domain/field/subfield hierarchy
+        before the topic is saved. ``ExternalKeywordDTO`` is normalized to the
+        local lowercase keyword value. The transaction is not committed.
+        """
+        if isinstance(data, ExternalKeywordDTO):
+            return self._upsert_keyword(data)
+        if isinstance(data, ExternalTopicDTO):
+            return self._upsert_topic(data)
+        raise InvalidRequestError(
+            "Unsupported external taxonomy DTO",
+            details={"dto_type": data.__class__.__name__},
+        )
+
+    def upsert_bulk(
+        self,
+        items: list[ExternalKeywordDTO | ExternalTopicDTO],
+    ) -> list[Keyword | Topic]:
+        """Insert or update many external taxonomy DTOs and return instances.
+
+        Duplicates are collapsed independently for topics and keywords. The
+        session is flushed before returning so ids can be used for paper links.
+        """
+        deduplicated = list(self._deduplicate_external_taxonomy(items).values())
+        entities = [self.upsert(item) for item in deduplicated]
+        self.session.flush()
+        return entities
+
+    def upsertBulk(
+        self,
+        items: list[ExternalKeywordDTO | ExternalTopicDTO],
+    ) -> list[Keyword | Topic]:
+        """Compatibility wrapper for callers that use camelCase naming."""
+        return self.upsert_bulk(items)
 
     def get_or_create_domain(self, openalex_id: str | None, name: str) -> Domain:
         """Return an existing domain or create one."""
@@ -110,7 +154,11 @@ class TaxonomyRepository(BaseRepository):
         score: float | None,
     ) -> None:
         """Attach a topic to a paper idempotently."""
-        link = self.session.get(PaperTopic, (paper_id, topic_id))
+        link = self._pending_instance(
+            PaperTopic,
+            paper_id=paper_id,
+            topic_id=topic_id,
+        ) or self.session.get(PaperTopic, (paper_id, topic_id))
         normalized_score = self._score_to_decimal(score)
         if link is None:
             self.session.add(
@@ -126,7 +174,11 @@ class TaxonomyRepository(BaseRepository):
         score: float | None,
     ) -> None:
         """Attach a keyword to a paper idempotently."""
-        link = self.session.get(PaperKeyword, (paper_id, keyword_id))
+        link = self._pending_instance(
+            PaperKeyword,
+            paper_id=paper_id,
+            keyword_id=keyword_id,
+        ) or self.session.get(PaperKeyword, (paper_id, keyword_id))
         normalized_score = self._score_to_decimal(score)
         if link is None:
             self.session.add(
@@ -149,6 +201,25 @@ class TaxonomyRepository(BaseRepository):
         )
         return list(self.session.scalars(stmt).all())
 
+    def list_topics_by_papers(self, paper_ids: list[int]) -> dict[int, list[Topic]]:
+        """List topics for many papers keyed by paper id."""
+        if not paper_ids:
+            return {}
+        stmt = (
+            select(PaperTopic.paper_id, Topic)
+            .join(Topic, PaperTopic.topic_id == Topic.id)
+            .where(PaperTopic.paper_id.in_(paper_ids))
+            .order_by(
+                PaperTopic.paper_id.asc(),
+                PaperTopic.score.desc().nullslast(),
+                Topic.name.asc(),
+            )
+        )
+        topics_by_paper: dict[int, list[Topic]] = defaultdict(list)
+        for paper_id, topic in self.session.execute(stmt):
+            topics_by_paper[int(paper_id)].append(topic)
+        return dict(topics_by_paper)
+
     def list_keywords_by_paper(self, paper_id: int) -> list[Keyword]:
         """List keywords attached to a paper."""
         stmt = (
@@ -158,6 +229,25 @@ class TaxonomyRepository(BaseRepository):
             .order_by(PaperKeyword.score.desc().nullslast(), Keyword.value.asc())
         )
         return list(self.session.scalars(stmt).all())
+
+    def list_keywords_by_papers(self, paper_ids: list[int]) -> dict[int, list[Keyword]]:
+        """List keywords for many papers keyed by paper id."""
+        if not paper_ids:
+            return {}
+        stmt = (
+            select(PaperKeyword.paper_id, Keyword)
+            .join(Keyword, PaperKeyword.keyword_id == Keyword.id)
+            .where(PaperKeyword.paper_id.in_(paper_ids))
+            .order_by(
+                PaperKeyword.paper_id.asc(),
+                PaperKeyword.score.desc().nullslast(),
+                Keyword.value.asc(),
+            )
+        )
+        keywords_by_paper: dict[int, list[Keyword]] = defaultdict(list)
+        for paper_id, keyword in self.session.execute(stmt):
+            keywords_by_paper[int(paper_id)].append(keyword)
+        return dict(keywords_by_paper)
 
     def list_paper_ids_by_topic(self, topic_id: int) -> list[int]:
         """List paper ids attached to a topic."""
@@ -206,6 +296,102 @@ class TaxonomyRepository(BaseRepository):
         if score is None:
             return None
         return Decimal(str(score))
+
+    def _upsert_topic(self, data: ExternalTopicDTO) -> Topic:
+        name = data.name.strip()
+        if not name:
+            raise InvalidRequestError("External topic name is required")
+
+        domain = (
+            self.get_or_create_domain(None, data.domain_name)
+            if data.domain_name
+            else None
+        )
+        if domain is not None:
+            self.session.flush()
+        field = (
+            self.get_or_create_field(
+                domain.id if domain is not None else None,
+                None,
+                data.field_name,
+            )
+            if data.field_name
+            else None
+        )
+        if field is not None and domain is not None and field.domain_id != domain.id:
+            field.domain_id = domain.id
+        if field is not None:
+            self.session.flush()
+
+        subfield = (
+            self.get_or_create_subfield(
+                field.id if field is not None else None,
+                None,
+                data.subfield_name,
+            )
+            if data.subfield_name
+            else None
+        )
+        if subfield is not None and field is not None and subfield.field_id != field.id:
+            subfield.field_id = field.id
+        if subfield is not None:
+            self.session.flush()
+
+        topic = self._get_by_openalex_or_name(Topic, data.external_id, name)
+        if topic is None:
+            topic = Topic(
+                subfield_id=subfield.id if subfield is not None else None,
+                openalex_id=data.external_id,
+                name=name,
+            )
+            self.session.add(topic)
+            return topic
+
+        topic.name = name
+        if data.external_id is not None:
+            topic.openalex_id = data.external_id
+        if subfield is not None:
+            topic.subfield_id = subfield.id
+        return topic
+
+    def _upsert_keyword(self, data: ExternalKeywordDTO) -> Keyword:
+        value = data.value.strip().lower()
+        if not value:
+            raise InvalidRequestError("External keyword value is required")
+        keyword = self.session.scalar(select(Keyword).where(Keyword.value == value))
+        if keyword is None:
+            keyword = Keyword(value=value)
+            self.session.add(keyword)
+        return keyword
+
+    def _deduplicate_external_taxonomy(
+        self,
+        items: list[ExternalKeywordDTO | ExternalTopicDTO],
+    ) -> dict[str, ExternalKeywordDTO | ExternalTopicDTO]:
+        deduplicated: dict[str, ExternalKeywordDTO | ExternalTopicDTO] = {}
+        for item in items:
+            if isinstance(item, ExternalKeywordDTO):
+                key = f"keyword:{item.value.strip().lower()}"
+            else:
+                key = "topic:" + (
+                    item.external_id
+                    or "|".join(
+                        self._normalize_optional_text(value)
+                        for value in (
+                            item.domain_name,
+                            item.field_name,
+                            item.subfield_name,
+                            item.name,
+                        )
+                    )
+                )
+            deduplicated[key] = item
+        return deduplicated
+
+    def _normalize_optional_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        return " ".join(str(value).strip().lower().split())
 
 
 __all__ = ["TaxonomyRepository"]

@@ -26,6 +26,7 @@ services:
     volumes:
       - redis_data:/data
     networks:
+      - vkr-outer-network
       - ml_network
     healthcheck:
       test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD:-redis123}\" redis-cli ping | grep -q '^PONG$'"]
@@ -51,6 +52,7 @@ services:
 
   qdrant:
     image: qdrant/qdrant:latest
+    container_name: vkr-qdrant
     ports:
       - "6333:6333"
       - "6334:6334"
@@ -87,12 +89,13 @@ services:
       - 8000:8000  # FastAPI порт
 
 volumes:
-  minio_data:
-    name: "vkr-volume-minio" 
   redis_data:
     name: "vkr-volume-redis"
+  minio_data:
+    name: "vkr-volume-minio" 
   qdrant_data:
     name: "vkr-volume-qdrant"
+
 
 networks:
   ml_network: # Локальная сеть для данного контейнера

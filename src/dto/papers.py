@@ -95,6 +95,11 @@ class PaperIndexingResponseDTO(BaseDTO):
 
 class PaperBatchIndexingRequestDTO(BaseDTO):
     paper_ids: list[int] = Field(default_factory=list)
+    date_from: date | None = None
+    date_to: date | None = None
+    limit: int | None = Field(default=None, ge=1)
+    offset: int = Field(default=0, ge=0)
+    batch_size: int = Field(default=200, ge=1, le=1000)
     force_reindex: bool = False
 
 

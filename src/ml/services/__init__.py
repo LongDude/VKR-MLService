@@ -1,10 +1,12 @@
-from ml.services.chart_builder import ChartBuilderService
-from ml.services.qdrant_collections import QdrantCollectionInitializer
-from ml.services.qdrant_payloads import QdrantPayloadBuilder
-from ml.services.scoring import ScoringService
-from ml.services.text_preparation import TextPreparationService
-from ml.services.trend_status import TrendStatusService
-from ml.services.vector_math import VectorMathService
+from __future__ import annotations
+
+from .chart_builder import ChartBuilderService
+from .qdrant_collections import QdrantCollectionInitializer
+from .qdrant_payloads import QdrantPayloadBuilder
+from .scoring import ScoringService
+from .text_preparation import TextPreparationService
+from .trend_status import TrendStatusService
+from .vector_math import VectorMathService
 
 __all__ = [
     "ChartBuilderService",

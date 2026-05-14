@@ -1,16 +1,20 @@
-from ml.facades.cluster_analytics import ClusterAnalyticsFacade
-from ml.facades.cluster_dynamics import ClusterDynamicsFacade
-from ml.facades.paper_indexing import PaperIndexingFacade
-from ml.facades.recommendations import RecommendationFacade
-from ml.facades.research_entity_indexing import ResearchEntityIndexingFacade
-from ml.facades.semantic_search import SemanticSearchFacade
-from ml.facades.summaries import SummaryFacade
-from ml.facades.user_profile import UserProfileFacade
+from __future__ import annotations
+
+from .cluster_analytics import ClusterAnalyticsFacade
+from .cluster_dynamics import ClusterDynamicsFacade
+from .papers_uploading import PaperUploaderFacade
+from .paper_indexing import PaperIndexingFacade
+from .recommendations import RecommendationFacade
+from .research_entity_indexing import ResearchEntityIndexingFacade
+from .semantic_search import SemanticSearchFacade
+from .summaries import SummaryFacade
+from .user_profile import UserProfileFacade
 
 __all__ = [
     "ClusterAnalyticsFacade",
     "ClusterDynamicsFacade",
     "PaperIndexingFacade",
+    "PaperUploaderFacade",
     "RecommendationFacade",
     "ResearchEntityIndexingFacade",
     "SemanticSearchFacade",

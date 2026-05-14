@@ -71,7 +71,29 @@ class PaperMetaSourceRepository(BaseRepository):
         if existing_external is not None:
             return
 
-        existing_link = self.session.get(PaperMetaSource, (paper_id, source.id))
+        pending_external = self._pending_instance(
+            PaperMetaSource,
+            meta_source_id=source.id,
+            external_id=external_id,
+        )
+        if pending_external is not None and pending_external.paper_id != paper_id:
+            raise DuplicateEntityError(
+                "External id is already attached to another paper",
+                details={
+                    "paper_id": paper_id,
+                    "existing_paper_id": pending_external.paper_id,
+                    "source_name": source_name,
+                    "external_id": external_id,
+                },
+            )
+        if pending_external is not None:
+            return
+
+        existing_link = self._pending_instance(
+            PaperMetaSource,
+            paper_id=paper_id,
+            meta_source_id=source.id,
+        ) or self.session.get(PaperMetaSource, (paper_id, source.id))
         if existing_link is not None:
             existing_link.external_id = external_id
             return
@@ -92,6 +114,23 @@ class PaperMetaSourceRepository(BaseRepository):
             .where(PaperMetaSource.paper_id == paper_id)
         )
         return {name: external_id for name, external_id in self.session.execute(stmt)}
+
+    def list_external_ids_by_papers(
+        self,
+        paper_ids: list[int],
+    ) -> dict[int, dict[str, str]]:
+        """Return external ids for many papers keyed by paper id and source name."""
+        if not paper_ids:
+            return {}
+        stmt = (
+            select(PaperMetaSource.paper_id, MetaSource.name, PaperMetaSource.external_id)
+            .join(MetaSource, PaperMetaSource.meta_source_id == MetaSource.id)
+            .where(PaperMetaSource.paper_id.in_(paper_ids))
+        )
+        result: dict[int, dict[str, str]] = {}
+        for paper_id, source_name, external_id in self.session.execute(stmt):
+            result.setdefault(int(paper_id), {})[source_name] = external_id
+        return result
 
 
 __all__ = ["PaperMetaSourceRepository"]

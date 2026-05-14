@@ -58,6 +58,8 @@ class OpenAlexAdapter:
         filters: OpenAlexSearchFiltersDTO,
         page: int = 1,
         per_page: int = 25,
+        sample: int = -1,
+        seed: int = 42,
     ) -> ExternalSearchResultDTO:
         params: dict[str, Any] = {"page": page, "per-page": per_page}
         search_query = query or filters.query
@@ -66,7 +68,9 @@ class OpenAlexAdapter:
         filter_value = self._build_filter_param(filters)
         if filter_value:
             params["filter"] = filter_value
-
+        if sample >= 0:
+            params["sample"] = sample
+            params["seed"] = seed
         payload = self._get_json("/works", params=params, allow_not_found=False)
         return self._normalize_search_result(payload)
 

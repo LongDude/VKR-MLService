@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from sqlalchemy import update, select
 
 from core.exceptions import EntityNotFoundError
@@ -31,7 +33,11 @@ class LandingRepository(BaseRepository):
 
     def upsert(self, paper_id: int, data: ExternalLandingDTO) -> Landing:
         """Insert or update a landing record by paper and landing URL."""
-        landing = self.session.scalar(
+        landing = self._pending_instance(
+            Landing,
+            paper_id=paper_id,
+            landing_url=data.landing_url,
+        ) or self.session.scalar(
             select(Landing).where(
                 Landing.paper_id == paper_id,
                 Landing.landing_url == data.landing_url,
@@ -56,6 +62,34 @@ class LandingRepository(BaseRepository):
         if data.is_best is True:
             self._set_best_for_instance(paper_id, landing)
         return landing
+
+    def upsert_bulk(
+        self,
+        items: Iterable[tuple[int, ExternalLandingDTO]],
+    ) -> list[Landing]:
+        """Insert or update many landing records for already upserted papers.
+
+        The iterable contains ``(paper_id, ExternalLandingDTO)`` pairs because a
+        landing URL is unique only inside a paper. Duplicate paper/url pairs in
+        the same batch are collapsed. The session is flushed before returning.
+        """
+        deduplicated: dict[tuple[int, str], ExternalLandingDTO] = {}
+        for paper_id, data in items:
+            deduplicated[(paper_id, data.landing_url)] = data
+
+        landings = [
+            self.upsert(paper_id, data)
+            for (paper_id, _), data in deduplicated.items()
+        ]
+        self.session.flush()
+        return landings
+
+    def upsertBulk(
+        self,
+        items: Iterable[tuple[int, ExternalLandingDTO]],
+    ) -> list[Landing]:
+        """Compatibility wrapper for callers that use camelCase naming."""
+        return self.upsert_bulk(items)
 
     def set_best(self, paper_id: int, landing_id: int) -> None:
         """Mark one landing as best and clear the flag from others."""

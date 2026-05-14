@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 from core.exceptions import EntityNotFoundError
 from dto.external import ExternalPaperDTO
 from dto.papers import PaperCreateDTO, PaperUpdateDTO
-from models import Paper
+from models import MetaSource, Paper, PaperMetaSource
 
 from .base import BaseRepository
 
@@ -27,6 +27,23 @@ class PaperRepository(BaseRepository):
     def get_by_doi(self, doi: str) -> Paper | None:
         """Return a paper by DOI."""
         stmt = select(Paper).where(Paper.doi == doi)
+        return self.session.scalar(stmt)
+
+    def get_by_external_id(
+        self,
+        source_name: str,
+        external_id: str,
+    ) -> Paper | None:
+        """Return a paper linked to an external metadata source id."""
+        stmt = (
+            select(Paper)
+            .join(PaperMetaSource, PaperMetaSource.paper_id == Paper.id)
+            .join(MetaSource, MetaSource.id == PaperMetaSource.meta_source_id)
+            .where(
+                MetaSource.name == source_name,
+                PaperMetaSource.external_id == external_id,
+            )
+        )
         return self.session.scalar(stmt)
 
     def get_by_title_normalized(
@@ -63,9 +80,16 @@ class PaperRepository(BaseRepository):
         self,
         data: ExternalPaperDTO,
         created_by_user_id: int | None = None,
+        source_name: str = "openalex",
     ) -> Paper:
         """Create or update a paper from normalized external data."""
-        paper = self.get_by_doi(data.doi) if data.doi else None
+        paper = (
+            self.get_by_external_id(source_name, data.external_id)
+            if data.external_id
+            else None
+        )
+        if paper is None:
+            paper = self.get_by_doi(data.doi) if data.doi else None
         if paper is None:
             paper = self.get_by_title_normalized(data.title, data.publication_year)
 
@@ -96,6 +120,61 @@ class PaperRepository(BaseRepository):
             paper.created_by_user_id = created_by_user_id
         return paper
 
+    def upsert(
+        self,
+        data: ExternalPaperDTO,
+        created_by_user_id: int | None = None,
+        source_name: str = "openalex",
+    ) -> Paper:
+        """Insert or update a paper from an external API paper DTO.
+
+        Matching uses external source id first, DOI second, then normalized title
+        with publication year. Existing rows receive non-null fields from the
+        supplied DTO. The transaction is intentionally not committed here.
+        """
+        return self.upsert_from_external(
+            data,
+            created_by_user_id=created_by_user_id,
+            source_name=source_name,
+        )
+
+    def upsert_bulk(
+        self,
+        items: list[ExternalPaperDTO],
+        created_by_user_id: int | None = None,
+        source_name: str = "openalex",
+    ) -> list[Paper]:
+        """Insert or update many external papers and return ORM instances.
+
+        Duplicates inside the batch are collapsed by DOI, external id, or
+        normalized title/year. The session is flushed so ids are available for
+        relationship repositories.
+        """
+        deduplicated = list(self._deduplicate_external_papers(items).values())
+        papers = [
+            self.upsert(
+                item,
+                created_by_user_id=created_by_user_id,
+                source_name=source_name,
+            )
+            for item in deduplicated
+        ]
+        self.session.flush()
+        return papers
+
+    def upsertBulk(
+        self,
+        items: list[ExternalPaperDTO],
+        created_by_user_id: int | None = None,
+        source_name: str = "openalex",
+    ) -> list[Paper]:
+        """Compatibility wrapper for callers that use camelCase naming."""
+        return self.upsert_bulk(
+            items,
+            created_by_user_id=created_by_user_id,
+            source_name=source_name,
+        )
+
     def list_by_period(
         self,
         date_from: date | None,
@@ -124,6 +203,20 @@ class PaperRepository(BaseRepository):
 
     def _normalize_title(self, title: str) -> str:
         return " ".join(title.strip().lower().split())
+
+    def _deduplicate_external_papers(
+        self,
+        items: list[ExternalPaperDTO],
+    ) -> dict[str, ExternalPaperDTO]:
+        deduplicated: dict[str, ExternalPaperDTO] = {}
+        for item in items:
+            key = (
+                item.doi
+                or item.external_id
+                or f"{self._normalize_title(item.title)}:{item.publication_year or ''}"
+            )
+            deduplicated[key] = item
+        return deduplicated
 
 
 __all__ = ["PaperRepository"]
