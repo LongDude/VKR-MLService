@@ -13,6 +13,11 @@ class BaseRepository:
         """Store the SQLAlchemy session supplied by the caller."""
         self.session = session
 
+    def _is_postgresql(self) -> bool:
+        """Return whether the current session is bound to PostgreSQL."""
+        bind = self.session.get_bind()
+        return bind.dialect.name == "postgresql"
+
     def _pending_instance(self, model: type[T], **values: object) -> T | None:
         """Return a matching pending ORM instance from this session.
 

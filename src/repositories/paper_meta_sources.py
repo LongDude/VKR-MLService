@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.exceptions import DuplicateEntityError
 from models import MetaSource, Paper, PaperMetaSource
@@ -16,6 +17,18 @@ class PaperMetaSourceRepository(BaseRepository):
 
     def get_or_create_source(self, name: str, prefix: str) -> MetaSource:
         """Return an existing metadata source or create it."""
+        if self._is_postgresql():
+            stmt = pg_insert(MetaSource).values(name=name, prefix=prefix)
+            self.session.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[MetaSource.name],
+                    set_={"prefix": stmt.excluded.prefix},
+                )
+            )
+            self.session.flush()
+            source = self.get_source_by_name(name)
+            if source is not None:
+                return source
         source = self.get_source_by_name(name)
         if source is not None:
             return source
@@ -105,6 +118,79 @@ class PaperMetaSourceRepository(BaseRepository):
                 external_id=external_id,
             )
         )
+
+    def attach_external_ids_bulk(
+        self,
+        items: list[tuple[int, str]],
+        source_name: str,
+        prefix: str,
+    ) -> dict[str, object]:
+        """Attach many source external ids without failing on duplicate conflicts."""
+        if not items:
+            return {"attached": 0, "conflicts": []}
+        source = self.get_or_create_source(source_name, prefix)
+        self.session.flush()
+        deduplicated: dict[tuple[int, str], tuple[int, str]] = {
+            (paper_id, external_id): (paper_id, external_id)
+            for paper_id, external_id in items
+            if external_id
+        }
+        if not deduplicated:
+            return {"attached": 0, "conflicts": []}
+
+        external_ids = [external_id for _, external_id in deduplicated.values()]
+        existing_stmt = select(PaperMetaSource.external_id, PaperMetaSource.paper_id).where(
+            PaperMetaSource.meta_source_id == source.id,
+            PaperMetaSource.external_id.in_(set(external_ids)),
+        )
+        existing_by_external_id = {
+            external_id: int(paper_id)
+            for external_id, paper_id in self.session.execute(existing_stmt)
+        }
+
+        values: list[dict[str, object]] = []
+        conflicts: list[dict[str, object]] = []
+        for paper_id, external_id in deduplicated.values():
+            existing_paper_id = existing_by_external_id.get(external_id)
+            if existing_paper_id is not None and existing_paper_id != paper_id:
+                conflicts.append(
+                    {
+                        "paper_id": paper_id,
+                        "existing_paper_id": existing_paper_id,
+                        "source_name": source_name,
+                        "external_id": external_id,
+                    }
+                )
+                continue
+            values.append(
+                {
+                    "paper_id": paper_id,
+                    "meta_source_id": source.id,
+                    "external_id": external_id,
+                }
+            )
+
+        if not values:
+            return {"attached": 0, "conflicts": conflicts}
+
+        if self._is_postgresql():
+            stmt = pg_insert(PaperMetaSource).values(values)
+            result = self.session.execute(stmt.on_conflict_do_nothing())
+            return {
+                "attached": int(result.rowcount or 0),
+                "conflicts": conflicts,
+            }
+
+        attached = 0
+        for value in values:
+            self.attach_external_id(
+                int(value["paper_id"]),
+                source_name,
+                prefix,
+                str(value["external_id"]),
+            )
+            attached += 1
+        return {"attached": attached, "conflicts": conflicts}
 
     def list_external_ids(self, paper_id: int) -> dict[str, str]:
         """Return external ids for a paper keyed by source name."""

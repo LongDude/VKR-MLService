@@ -155,12 +155,12 @@ class OpenAlexBatchImporter:
         existing_papers = [
             paper for paper in papers if self._paper_keys(paper) & existing_keys
         ]
-        result.existing += len(existing_papers)
 
         if skip_existing:
             papers_to_import = [
                 paper for paper in papers if not (self._paper_keys(paper) & existing_keys)
             ]
+            result.existing += len(existing_papers)
         else:
             papers_to_import = papers
 
@@ -172,20 +172,24 @@ class OpenAlexBatchImporter:
             upload_result = uploader.import_batch(papers_to_import)
             result.failed += upload_result.failed
             result.errors.extend(upload_result.errors)
-            success_count = max(0, upload_result.updated)
-            updated_count = (
-                min(success_count, len(existing_papers))
-                if not skip_existing
-                else 0
+            paper_ids = paper_repository.resolve_external_paper_ids(
+                papers_to_import,
+                source_name=self.source_name,
             )
-            result.updated += updated_count
-            result.created += max(0, success_count - updated_count)
-            result.paper_ids.extend(
-                paper_repository.resolve_external_paper_ids(
-                    papers_to_import,
-                    source_name=self.source_name,
+            loaded_count = len(paper_ids)
+            updated_count = 0
+            if not skip_existing:
+                updated_count = min(
+                    loaded_count,
+                    sum(
+                        1
+                        for paper in papers_to_import
+                        if self._paper_keys(paper) & existing_keys
+                    ),
                 )
-            )
+            result.updated += updated_count
+            result.created += max(0, loaded_count - updated_count)
+            result.paper_ids.extend(paper_ids)
             session.commit()
             return result
         except IntegrityError as exc:

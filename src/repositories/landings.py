@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from sqlalchemy import update, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.exceptions import EntityNotFoundError
 from dto.external import ExternalLandingDTO
@@ -77,6 +78,9 @@ class LandingRepository(BaseRepository):
         for paper_id, data in items:
             deduplicated[(paper_id, data.landing_url)] = data
 
+        if self._is_postgresql():
+            return self._upsert_bulk_postgresql(deduplicated)
+
         landings = [
             self.upsert(paper_id, data)
             for (paper_id, _), data in deduplicated.items()
@@ -108,6 +112,60 @@ class LandingRepository(BaseRepository):
             .values(is_best=False)
         )
         landing.is_best = True
+
+    def _upsert_bulk_postgresql(
+        self,
+        deduplicated: dict[tuple[int, str], ExternalLandingDTO],
+    ) -> list[Landing]:
+        if not deduplicated:
+            return []
+        best_paper_ids = [
+            paper_id
+            for (paper_id, _), data in deduplicated.items()
+            if data.is_best is True
+        ]
+        if best_paper_ids:
+            self.session.execute(
+                update(Landing)
+                .where(Landing.paper_id.in_(set(best_paper_ids)))
+                .values(is_best=False)
+            )
+
+        values = [
+            {
+                "paper_id": paper_id,
+                "landing_url": data.landing_url,
+                "pdf_url": data.pdf_url,
+                "license": data.license,
+                "version": data.version,
+                "is_best": data.is_best,
+            }
+            for (paper_id, _), data in deduplicated.items()
+        ]
+        stmt = pg_insert(Landing).values(values)
+        self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[Landing.paper_id, Landing.landing_url],
+                set_={
+                    "pdf_url": stmt.excluded.pdf_url,
+                    "license": stmt.excluded.license,
+                    "version": stmt.excluded.version,
+                    "is_best": stmt.excluded.is_best,
+                },
+            )
+        )
+        self.session.flush()
+        pairs = list(deduplicated.keys())
+        return [
+            landing
+            for landing in self.session.scalars(
+                select(Landing).where(
+                    Landing.paper_id.in_({paper_id for paper_id, _ in pairs}),
+                    Landing.landing_url.in_({url for _, url in pairs}),
+                )
+            )
+            if (landing.paper_id, landing.landing_url) in deduplicated
+        ]
 
 
 __all__ = ["LandingRepository"]

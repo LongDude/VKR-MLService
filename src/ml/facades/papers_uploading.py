@@ -307,27 +307,30 @@ class PaperUploaderFacade:
         authors_by_key: dict[str, Any],
         institutions_by_key: dict[str, Any],
     ) -> None:
+        pairs: list[tuple[int, int]] = []
         for author_key, institution_key in links:
             author = authors_by_key.get(author_key)
             institution = institutions_by_key.get(institution_key)
             if author is not None and institution is not None:
-                self.institution_repository.attach_to_author(author.id, institution.id)
+                pairs.append((author.id, institution.id))
+        self.institution_repository.attach_to_author_bulk(pairs)
 
     def _attach_paper_external_ids(
         self,
         external_ids: dict[str, str],
         papers_by_key: dict[str, Any],
     ) -> None:
+        pairs: list[tuple[int, str]] = []
         for paper_key, external_id in external_ids.items():
             paper = papers_by_key.get(paper_key)
             if paper is None:
                 continue
-            self.paper_meta_source_repository.attach_external_id(
-                paper.id,
-                self.source_name,
-                self.source_prefix,
-                external_id,
-            )
+            pairs.append((paper.id, external_id))
+        self.paper_meta_source_repository.attach_external_ids_bulk(
+            pairs,
+            self.source_name,
+            self.source_prefix,
+        )
 
     def _attach_paper_authors(
         self,
@@ -335,16 +338,13 @@ class PaperUploaderFacade:
         papers_by_key: dict[str, Any],
         authors_by_key: dict[str, Any],
     ) -> None:
+        pairs: list[tuple[int, int, int | None, bool]] = []
         for paper_key, author_key, author_order, is_corresponding in links.values():
             paper = papers_by_key.get(paper_key)
             author = authors_by_key.get(author_key)
             if paper is not None and author is not None:
-                self.author_repository.attach_to_paper(
-                    paper.id,
-                    author.id,
-                    author_order,
-                    is_corresponding=is_corresponding,
-                )
+                pairs.append((paper.id, author.id, author_order, is_corresponding))
+        self.author_repository.attach_to_paper_bulk(pairs)
 
     def _attach_paper_topics(
         self,
@@ -352,15 +352,13 @@ class PaperUploaderFacade:
         papers_by_key: dict[str, Any],
         topics_by_key: dict[str, Any],
     ) -> None:
+        pairs: list[tuple[int, int, float | None]] = []
         for paper_key, topic_key, score in links.values():
             paper = papers_by_key.get(paper_key)
             topic = topics_by_key.get(topic_key)
             if paper is not None and topic is not None:
-                self.taxonomy_repository.attach_topic_to_paper(
-                    paper.id,
-                    topic.id,
-                    score,
-                )
+                pairs.append((paper.id, topic.id, score))
+        self.taxonomy_repository.attach_topics_to_papers_bulk(pairs)
 
     def _attach_paper_keywords(
         self,
@@ -368,15 +366,13 @@ class PaperUploaderFacade:
         papers_by_key: dict[str, Any],
         keywords_by_key: dict[str, Any],
     ) -> None:
+        pairs: list[tuple[int, int, float | None]] = []
         for paper_key, keyword_key, score in links.values():
             paper = papers_by_key.get(paper_key)
             keyword = keywords_by_key.get(keyword_key)
             if paper is not None and keyword is not None:
-                self.taxonomy_repository.attach_keyword_to_paper(
-                    paper.id,
-                    keyword.id,
-                    score,
-                )
+                pairs.append((paper.id, keyword.id, score))
+        self.taxonomy_repository.attach_keywords_to_papers_bulk(pairs)
 
     def _paper_key(self, paper: ExternalPaperDTO) -> str:
         title = self._normalize_text(paper.title)

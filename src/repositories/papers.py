@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import date
+from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from core.exceptions import EntityNotFoundError
+from core.exceptions import EntityNotFoundError, InvalidRequestError
 from dto.external import ExternalPaperDTO
 from dto.papers import PaperCreateDTO, PaperUpdateDTO
 from models import MetaSource, Paper, PaperMetaSource
@@ -227,6 +229,12 @@ class PaperRepository(BaseRepository):
         relationship repositories.
         """
         deduplicated = list(self._deduplicate_external_papers(items).values())
+        if self._is_postgresql():
+            return self._upsert_bulk_postgresql(
+                deduplicated,
+                created_by_user_id=created_by_user_id,
+                source_name=source_name,
+            )
         papers = [
             self.upsert(
                 item,
@@ -312,6 +320,171 @@ class PaperRepository(BaseRepository):
             )
             deduplicated[key] = item
         return deduplicated
+
+    def _upsert_bulk_postgresql(
+        self,
+        items: list[ExternalPaperDTO],
+        *,
+        created_by_user_id: int | None,
+        source_name: str,
+    ) -> list[Paper]:
+        existing_by_external = self._papers_by_external_ids(
+            [item.external_id for item in items if item.external_id],
+            source_name=source_name,
+        )
+        with_doi_values: list[dict[str, Any]] = []
+        fallback_items: list[ExternalPaperDTO] = []
+
+        for item in items:
+            paper = (
+                existing_by_external.get(item.external_id)
+                if item.external_id
+                else None
+            )
+            if paper is not None:
+                self._apply_external_values(paper, item, created_by_user_id)
+                continue
+            if item.doi:
+                with_doi_values.append(
+                    {
+                        **self._external_values(item),
+                        "created_by_user_id": created_by_user_id,
+                    }
+                )
+            else:
+                fallback_items.append(item)
+
+        if with_doi_values:
+            stmt = pg_insert(Paper).values(with_doi_values)
+            self.session.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[Paper.doi],
+                    set_={
+                        "title": stmt.excluded.title,
+                        "publication_year": func.coalesce(
+                            stmt.excluded.publication_year,
+                            Paper.publication_year,
+                        ),
+                        "publication_date": func.coalesce(
+                            stmt.excluded.publication_date,
+                            Paper.publication_date,
+                        ),
+                        "type": func.coalesce(stmt.excluded.type, Paper.type),
+                        "language": func.coalesce(
+                            stmt.excluded.language,
+                            Paper.language,
+                        ),
+                        "abstract": func.coalesce(
+                            stmt.excluded.abstract,
+                            Paper.abstract,
+                        ),
+                        "is_open_access": func.coalesce(
+                            stmt.excluded.is_open_access,
+                            Paper.is_open_access,
+                        ),
+                        "cited_by_count": func.coalesce(
+                            stmt.excluded.cited_by_count,
+                            Paper.cited_by_count,
+                        ),
+                        "created_by_user_id": func.coalesce(
+                            Paper.created_by_user_id,
+                            stmt.excluded.created_by_user_id,
+                        ),
+                    },
+                )
+            )
+
+        for item in fallback_items:
+            self.upsert_from_external(
+                item,
+                created_by_user_id=created_by_user_id,
+                source_name=source_name,
+            )
+
+        self.session.flush()
+        papers: list[Paper] = []
+        for item in items:
+            paper = self._resolve_external_paper(item, source_name)
+            if paper is None:
+                raise InvalidRequestError(
+                    "Paper could not be resolved after conflict-safe upsert",
+                    details={
+                        "external_id": item.external_id,
+                        "doi": item.doi,
+                        "title": item.title,
+                        "publication_year": item.publication_year,
+                    },
+                )
+            papers.append(paper)
+        return papers
+
+    def _papers_by_external_ids(
+        self,
+        external_ids: list[str],
+        *,
+        source_name: str,
+    ) -> dict[str, Paper]:
+        if not external_ids:
+            return {}
+        stmt = (
+            select(PaperMetaSource.external_id, Paper)
+            .join(Paper, Paper.id == PaperMetaSource.paper_id)
+            .join(MetaSource, MetaSource.id == PaperMetaSource.meta_source_id)
+            .where(
+                MetaSource.name == source_name,
+                PaperMetaSource.external_id.in_(set(external_ids)),
+            )
+        )
+        return {external_id: paper for external_id, paper in self.session.execute(stmt)}
+
+    def _resolve_external_paper(
+        self,
+        item: ExternalPaperDTO,
+        source_name: str,
+    ) -> Paper | None:
+        paper = (
+            self.get_by_external_id(source_name, item.external_id)
+            if item.external_id
+            else None
+        )
+        if paper is None and item.doi:
+            paper = self.get_by_doi(item.doi)
+        if paper is None and item.title:
+            paper = self.get_by_title_normalized(item.title, item.publication_year)
+        return paper
+
+    def _external_values(self, item: ExternalPaperDTO) -> dict[str, Any]:
+        return {
+            "title": item.title,
+            "doi": item.doi,
+            "publication_year": item.publication_year,
+            "publication_date": item.publication_date,
+            "type": item.type,
+            "language": item.language,
+            "abstract": item.abstract,
+            "is_open_access": item.is_open_access,
+            "cited_by_count": item.cited_by_count,
+        }
+
+    def _apply_external_values(
+        self,
+        paper: Paper,
+        item: ExternalPaperDTO,
+        created_by_user_id: int | None,
+    ) -> None:
+        for field, value in self._external_values(item).items():
+            if value is not None:
+                if field == "doi" and not self._can_assign_doi(paper, value):
+                    continue
+                setattr(paper, field, value)
+        if paper.created_by_user_id is None and created_by_user_id is not None:
+            paper.created_by_user_id = created_by_user_id
+
+    def _can_assign_doi(self, paper: Paper, doi: str) -> bool:
+        if paper.doi == doi:
+            return True
+        existing = self.get_by_doi(doi)
+        return existing is None or existing.id == paper.id
 
 
 __all__ = ["PaperRepository"]

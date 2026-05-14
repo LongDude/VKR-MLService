@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.exceptions import InvalidRequestError
 from dto.external import ExternalKeywordDTO, ExternalTopicDTO
@@ -71,6 +72,8 @@ class TaxonomyRepository(BaseRepository):
         session is flushed before returning so ids can be used for paper links.
         """
         deduplicated = list(self._deduplicate_external_taxonomy(items).values())
+        if self._is_postgresql():
+            return self._upsert_bulk_postgresql(deduplicated)
         entities = [self.upsert(item) for item in deduplicated]
         self.session.flush()
         return entities
@@ -167,6 +170,37 @@ class TaxonomyRepository(BaseRepository):
             return
         link.score = normalized_score
 
+    def attach_topics_to_papers_bulk(
+        self,
+        items: list[tuple[int, int, float | None]],
+    ) -> None:
+        """Attach topics to papers in a conflict-safe batch."""
+        if not items:
+            return
+        deduplicated: dict[tuple[int, int], tuple[int, int, float | None]] = {}
+        for paper_id, topic_id, score in items:
+            deduplicated[(paper_id, topic_id)] = (paper_id, topic_id, score)
+        if not self._is_postgresql():
+            for paper_id, topic_id, score in deduplicated.values():
+                self.attach_topic_to_paper(paper_id, topic_id, score)
+            self.session.flush()
+            return
+        values = [
+            {
+                "paper_id": paper_id,
+                "topic_id": topic_id,
+                "score": self._score_to_decimal(score),
+            }
+            for paper_id, topic_id, score in deduplicated.values()
+        ]
+        stmt = pg_insert(PaperTopic).values(values)
+        self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[PaperTopic.paper_id, PaperTopic.topic_id],
+                set_={"score": stmt.excluded.score},
+            )
+        )
+
     def attach_keyword_to_paper(
         self,
         paper_id: int,
@@ -190,6 +224,37 @@ class TaxonomyRepository(BaseRepository):
             )
             return
         link.score = normalized_score
+
+    def attach_keywords_to_papers_bulk(
+        self,
+        items: list[tuple[int, int, float | None]],
+    ) -> None:
+        """Attach keywords to papers in a conflict-safe batch."""
+        if not items:
+            return
+        deduplicated: dict[tuple[int, int], tuple[int, int, float | None]] = {}
+        for paper_id, keyword_id, score in items:
+            deduplicated[(paper_id, keyword_id)] = (paper_id, keyword_id, score)
+        if not self._is_postgresql():
+            for paper_id, keyword_id, score in deduplicated.values():
+                self.attach_keyword_to_paper(paper_id, keyword_id, score)
+            self.session.flush()
+            return
+        values = [
+            {
+                "paper_id": paper_id,
+                "keyword_id": keyword_id,
+                "score": self._score_to_decimal(score),
+            }
+            for paper_id, keyword_id, score in deduplicated.values()
+        ]
+        stmt = pg_insert(PaperKeyword).values(values)
+        self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[PaperKeyword.paper_id, PaperKeyword.keyword_id],
+                set_={"score": stmt.excluded.score},
+            )
+        )
 
     def list_topics_by_paper(self, paper_id: int) -> list[Topic]:
         """List topics attached to a paper."""
@@ -415,6 +480,230 @@ class TaxonomyRepository(BaseRepository):
         if value is None:
             return ""
         return " ".join(str(value).strip().lower().split())
+
+    def _upsert_bulk_postgresql(
+        self,
+        items: list[ExternalKeywordDTO | ExternalTopicDTO],
+    ) -> list[Keyword | Topic]:
+        ordered_keys = [self._external_taxonomy_key(item) for item in items]
+        keywords = [item for item in items if isinstance(item, ExternalKeywordDTO)]
+        topics = [item for item in items if isinstance(item, ExternalTopicDTO)]
+        entities_by_key: dict[str, Keyword | Topic] = {}
+        entities_by_key.update(self._upsert_keywords_postgresql(keywords))
+        entities_by_key.update(self._upsert_topics_postgresql(topics))
+        self.session.flush()
+        return [entities_by_key[key] for key in ordered_keys]
+
+    def _upsert_keywords_postgresql(
+        self,
+        items: list[ExternalKeywordDTO],
+    ) -> dict[str, Keyword]:
+        values = sorted({item.value.strip().lower() for item in items if item.value.strip()})
+        if not values:
+            return {}
+        stmt = pg_insert(Keyword).values([{"value": value} for value in values])
+        self.session.execute(
+            stmt.on_conflict_do_nothing(index_elements=[Keyword.value])
+        )
+        self.session.flush()
+        keywords = self.session.scalars(
+            select(Keyword).where(Keyword.value.in_(values))
+        )
+        return {f"keyword:{keyword.value}": keyword for keyword in keywords}
+
+    def _upsert_topics_postgresql(
+        self,
+        items: list[ExternalTopicDTO],
+    ) -> dict[str, Topic]:
+        if not items:
+            return {}
+        domains_by_name = self._ensure_domains_postgresql(
+            sorted({item.domain_name.strip() for item in items if item.domain_name})
+        )
+        fields_by_name = self._ensure_fields_by_name(
+            {
+                item.field_name.strip(): (
+                    domains_by_name[item.domain_name.strip()].id
+                    if item.domain_name and item.domain_name.strip() in domains_by_name
+                    else None
+                )
+                for item in items
+                if item.field_name
+            }
+        )
+        subfields_by_name = self._ensure_subfields_by_name(
+            {
+                item.subfield_name.strip(): (
+                    fields_by_name[item.field_name.strip()].id
+                    if item.field_name and item.field_name.strip() in fields_by_name
+                    else None
+                )
+                for item in items
+                if item.subfield_name
+            }
+        )
+
+        with_external_id: list[dict[str, Any]] = []
+        without_external_id: list[ExternalTopicDTO] = []
+        for item in items:
+            name = item.name.strip()
+            if not name:
+                raise InvalidRequestError("External topic name is required")
+            subfield = (
+                subfields_by_name.get(item.subfield_name.strip())
+                if item.subfield_name
+                else None
+            )
+            if item.external_id:
+                with_external_id.append(
+                    {
+                        "name": name,
+                        "openalex_id": item.external_id,
+                        "subfield_id": subfield.id if subfield is not None else None,
+                    }
+                )
+            else:
+                without_external_id.append(item)
+
+        if with_external_id:
+            stmt = pg_insert(Topic).values(with_external_id)
+            self.session.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[Topic.openalex_id],
+                    set_={
+                        "name": stmt.excluded.name,
+                        "subfield_id": func.coalesce(
+                            stmt.excluded.subfield_id,
+                            Topic.subfield_id,
+                        ),
+                    },
+                )
+            )
+
+        existing_by_name = self._topics_by_names(
+            [item.name.strip() for item in without_external_id]
+        )
+        for item in without_external_id:
+            name = item.name.strip()
+            subfield = (
+                subfields_by_name.get(item.subfield_name.strip())
+                if item.subfield_name
+                else None
+            )
+            topic = existing_by_name.get(name)
+            if topic is None:
+                topic = Topic(
+                    name=name,
+                    subfield_id=subfield.id if subfield is not None else None,
+                )
+                self.session.add(topic)
+                existing_by_name[name] = topic
+                continue
+            if subfield is not None:
+                topic.subfield_id = subfield.id
+
+        self.session.flush()
+        result: dict[str, Topic] = {}
+        external_ids = [item.external_id for item in items if item.external_id]
+        if external_ids:
+            for topic in self.session.scalars(
+                select(Topic).where(Topic.openalex_id.in_(external_ids))
+            ):
+                result[f"topic:{topic.openalex_id}"] = topic
+        for item in items:
+            if item.external_id:
+                continue
+            key = self._external_taxonomy_key(item)
+            topic = existing_by_name.get(item.name.strip())
+            if topic is None:
+                topic = self.session.scalar(select(Topic).where(Topic.name == item.name.strip()))
+            if topic is not None:
+                result[key] = topic
+        return result
+
+    def _ensure_domains_postgresql(self, names: list[str]) -> dict[str, Domain]:
+        if not names:
+            return {}
+        stmt = pg_insert(Domain).values([{"name": name} for name in names])
+        self.session.execute(
+            stmt.on_conflict_do_nothing(index_elements=[Domain.name])
+        )
+        self.session.flush()
+        return {
+            domain.name: domain
+            for domain in self.session.scalars(select(Domain).where(Domain.name.in_(names)))
+        }
+
+    def _ensure_fields_by_name(self, names_to_domain_id: dict[str, int | None]) -> dict[str, Field]:
+        if not names_to_domain_id:
+            return {}
+        existing = {
+            field.name: field
+            for field in self.session.scalars(
+                select(Field).where(Field.name.in_(names_to_domain_id.keys()))
+            )
+        }
+        for name, domain_id in names_to_domain_id.items():
+            field = existing.get(name)
+            if field is None:
+                field = Field(name=name, domain_id=domain_id)
+                self.session.add(field)
+                existing[name] = field
+            elif domain_id is not None:
+                field.domain_id = domain_id
+        self.session.flush()
+        return existing
+
+    def _ensure_subfields_by_name(
+        self,
+        names_to_field_id: dict[str, int | None],
+    ) -> dict[str, Subfield]:
+        if not names_to_field_id:
+            return {}
+        existing = {
+            subfield.name: subfield
+            for subfield in self.session.scalars(
+                select(Subfield).where(Subfield.name.in_(names_to_field_id.keys()))
+            )
+        }
+        for name, field_id in names_to_field_id.items():
+            subfield = existing.get(name)
+            if subfield is None:
+                subfield = Subfield(name=name, field_id=field_id)
+                self.session.add(subfield)
+                existing[name] = subfield
+            elif field_id is not None:
+                subfield.field_id = field_id
+        self.session.flush()
+        return existing
+
+    def _topics_by_names(self, names: list[str]) -> dict[str, Topic]:
+        clean_names = {name for name in names if name}
+        if not clean_names:
+            return {}
+        return {
+            topic.name: topic
+            for topic in self.session.scalars(select(Topic).where(Topic.name.in_(clean_names)))
+        }
+
+    def _external_taxonomy_key(
+        self,
+        item: ExternalKeywordDTO | ExternalTopicDTO,
+    ) -> str:
+        if isinstance(item, ExternalKeywordDTO):
+            return f"keyword:{item.value.strip().lower()}"
+        return "topic:" + (
+            item.external_id
+            or "|".join(
+                self._normalize_optional_text(value)
+                for value in (
+                    item.domain_name,
+                    item.field_name,
+                    item.subfield_name,
+                    item.name,
+                )
+            )
+        )
 
 
 __all__ = ["TaxonomyRepository"]

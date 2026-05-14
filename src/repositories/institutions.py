@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.exceptions import InvalidRequestError
 from dto.external import ExternalInstitutionDTO
@@ -66,6 +67,8 @@ class InstitutionRepository(BaseRepository):
         normalized display name. The session is flushed before returning.
         """
         deduplicated = list(self._deduplicate_external_institutions(items).values())
+        if self._is_postgresql():
+            return self._upsert_bulk_postgresql(deduplicated)
         institutions = [self.upsert(item) for item in deduplicated]
         self.session.flush()
         return institutions
@@ -116,6 +119,34 @@ class InstitutionRepository(BaseRepository):
                 )
             )
 
+    def attach_to_author_bulk(
+        self,
+        items: list[tuple[int, int]],
+    ) -> None:
+        """Attach institutions to authors in a conflict-safe batch."""
+        if not items:
+            return
+        deduplicated = sorted(set(items))
+        if not self._is_postgresql():
+            for author_id, institution_id in deduplicated:
+                self.attach_to_author(author_id, institution_id)
+            self.session.flush()
+            return
+        stmt = pg_insert(AuthorInstitution).values(
+            [
+                {"author_id": author_id, "institution_id": institution_id}
+                for author_id, institution_id in deduplicated
+            ]
+        )
+        self.session.execute(
+            stmt.on_conflict_do_nothing(
+                index_elements=[
+                    AuthorInstitution.author_id,
+                    AuthorInstitution.institution_id,
+                ]
+            )
+        )
+
     def list_by_author(self, author_id: int) -> list[Institution]:
         """List institutions attached to an author."""
         stmt = (
@@ -159,6 +190,92 @@ class InstitutionRepository(BaseRepository):
             key = item.ror or item.external_id or item.display_name.strip().lower()
             deduplicated[key] = item
         return deduplicated
+
+    def _upsert_bulk_postgresql(
+        self,
+        items: list[ExternalInstitutionDTO],
+    ) -> list[Institution]:
+        ordered_keys: list[str] = []
+        with_ror: list[dict[str, str | None]] = []
+        without_ror: list[ExternalInstitutionDTO] = []
+        for item in items:
+            display_name = item.display_name.strip()
+            if not display_name:
+                raise InvalidRequestError("External institution display_name is required")
+            if item.ror:
+                ordered_keys.append(f"ror:{item.ror}")
+                with_ror.append(
+                    {
+                        "display_name": display_name,
+                        "ror": item.ror,
+                        "country_code": item.country_code,
+                        "type": item.type,
+                    }
+                )
+            else:
+                ordered_keys.append(f"name:{display_name}")
+                without_ror.append(item)
+
+        if with_ror:
+            stmt = pg_insert(Institution).values(with_ror)
+            self.session.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[Institution.ror],
+                    set_={
+                        "display_name": stmt.excluded.display_name,
+                        "country_code": func.coalesce(
+                            stmt.excluded.country_code,
+                            Institution.country_code,
+                        ),
+                        "type": func.coalesce(
+                            stmt.excluded.type,
+                            Institution.type,
+                        ),
+                    },
+                )
+            )
+
+        names = [item.display_name.strip() for item in without_ror]
+        existing_by_name = self._institutions_by_display_names(names)
+        for item in without_ror:
+            display_name = item.display_name.strip()
+            institution = existing_by_name.get(display_name)
+            if institution is None:
+                institution = Institution(
+                    display_name=display_name,
+                    ror=None,
+                    country_code=item.country_code,
+                    type=item.type,
+                )
+                self.session.add(institution)
+                existing_by_name[display_name] = institution
+                continue
+            institution.display_name = display_name
+            if item.country_code is not None:
+                institution.country_code = item.country_code
+            if item.type is not None:
+                institution.type = item.type
+
+        self.session.flush()
+        institutions_by_key: dict[str, Institution] = {}
+        rors = [value["ror"] for value in with_ror if value["ror"]]
+        if rors:
+            for institution in self.session.scalars(
+                select(Institution).where(Institution.ror.in_(rors))
+            ):
+                institutions_by_key[f"ror:{institution.ror}"] = institution
+        for name, institution in self._institutions_by_display_names(names).items():
+            institutions_by_key[f"name:{name}"] = institution
+        return [institutions_by_key[key] for key in ordered_keys]
+
+    def _institutions_by_display_names(self, names: list[str]) -> dict[str, Institution]:
+        if not names:
+            return {}
+        stmt = select(Institution).where(Institution.display_name.in_(set(names)))
+        return {
+            institution.display_name: institution
+            for institution in self.session.scalars(stmt)
+        }
 
 
 __all__ = ["InstitutionRepository"]
