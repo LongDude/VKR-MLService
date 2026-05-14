@@ -33,6 +33,8 @@ CLUSTER_CACHE_TTL_SECONDS = 24 * 60 * 60
 
 
 class ClusterAnalyticsFacade:
+    """Facade for recomputing topic-based trend clusters."""
+
     def __init__(
         self,
         *,
@@ -68,15 +70,33 @@ class ClusterAnalyticsFacade:
         date_to: date | None = None,
         limit: int | None = None,
         force_summary: bool = False,
+        batch_size: int = ENTITY_PAGE_SIZE,
     ) -> BatchOperationResultDTO:
+        """Recompute trend clusters for topics selected from PostgreSQL.
+
+        When ``date_from`` and ``date_to`` are supplied, topics are ordered by
+        recent growth in that period. Otherwise topics are read in pages from the
+        taxonomy repository. Each cluster is recomputed through
+        ``recompute_cluster`` and written to ``trend_clusters_v1``.
+        """
         if limit is not None and limit < 0:
             raise InvalidRequestError(
                 "limit must be non-negative",
                 details={"limit": limit},
             )
+        if batch_size <= 0:
+            raise InvalidRequestError(
+                "batch_size must be positive",
+                details={"batch_size": batch_size},
+            )
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise InvalidRequestError(
+                "date_from must be less than or equal to date_to",
+                details={"date_from": date_from, "date_to": date_to},
+            )
 
         result = BatchOperationResultDTO()
-        for topic_id in self._iter_topic_ids(date_from, date_to, limit):
+        for topic_id in self._iter_topic_ids(date_from, date_to, limit, batch_size):
             result.total += 1
             try:
                 self.recompute_cluster(
@@ -101,6 +121,7 @@ class ClusterAnalyticsFacade:
         cluster_id: str,
         force_summary: bool = False,
     ) -> TrendClusterDTO:
+        """Recompute one MVP trend cluster identified as ``topic:{topic_id}``."""
         topic_id = self._parse_topic_cluster_id(cluster_id)
         topic = self.taxonomy_repository.get_topic_by_id(topic_id)
         if topic is None:
@@ -242,12 +263,13 @@ class ClusterAnalyticsFacade:
         date_from: date | None,
         date_to: date | None,
         limit: int | None,
+        batch_size: int,
     ):
         if date_from is not None and date_to is not None:
             for item in self.paper_graph_repository.get_top_topics_by_recent_growth(
                 date_from,
                 date_to,
-                limit or ENTITY_PAGE_SIZE,
+                limit or batch_size,
             ):
                 yield int(item["topic_id"])
             return
@@ -255,7 +277,7 @@ class ClusterAnalyticsFacade:
         emitted = 0
         offset = 0
         while limit is None or emitted < limit:
-            page_limit = ENTITY_PAGE_SIZE
+            page_limit = batch_size
             if limit is not None:
                 page_limit = min(page_limit, limit - emitted)
             if page_limit <= 0:

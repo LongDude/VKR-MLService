@@ -18,6 +18,11 @@ class UserRepository(BaseRepository):
         stmt = select(User).where(User.email == email)
         return self.session.scalar(stmt)
 
+    def list_ids(self, limit: int, offset: int = 0) -> list[int]:
+        """Return user ids ordered by primary key for batch processing."""
+        stmt = select(User.id).order_by(User.id).limit(limit).offset(offset)
+        return list(self.session.scalars(stmt).all())
+
     def exists_by_email(self, email: str) -> bool:
         """Return whether a user with the email exists."""
         stmt = select(exists().where(User.email == email))

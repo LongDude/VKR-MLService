@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from numbers import Real
 from typing import Any
@@ -14,6 +14,7 @@ from core.exceptions import (
     InvalidRequestError,
 )
 from dto.common import BatchOperationResultDTO, OperationResultDTO
+from dto.qdrant import QdrantPointDTO
 from repositories.graph import PaperGraphRepository
 from repositories.taxonomy import TaxonomyRepository
 
@@ -22,12 +23,13 @@ from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.text_preparation import TextPreparationService
 
 
-ENTITY_PAGE_SIZE = 500
 DEFAULT_RECENT_WINDOW_DAYS = 365
 DEFAULT_EMBEDDING_VERSION = "v1"
 
 
 class ResearchEntityIndexingFacade:
+    """Facade for indexing taxonomy and keyword reference entities into Qdrant."""
+
     def __init__(
         self,
         *,
@@ -59,47 +61,78 @@ class ResearchEntityIndexingFacade:
         self,
         force_reindex: bool = False,
         limit: int | None = None,
+        offset: int = 0,
+        entity_type: str = "all",
+        batch_size: int = 128,
     ) -> BatchOperationResultDTO:
+        """Index reference entities into ``research_entities_v1``.
+
+        The method supports all taxonomy levels or one selected entity type.
+        Entities are read from PostgreSQL in pages, embedded through
+        ``LMStudioEmbeddingAdapter.embed_batch``, and written to Qdrant through
+        ``upsert_points``. Existing points are skipped unless ``force_reindex``
+        is true.
+        """
         if limit is not None and limit < 0:
             raise InvalidRequestError(
                 "limit must be non-negative",
                 details={"limit": limit},
             )
+        if offset < 0:
+            raise InvalidRequestError(
+                "offset must be non-negative",
+                details={"offset": offset},
+            )
+        if batch_size <= 0:
+            raise InvalidRequestError(
+                "batch_size must be positive",
+                details={"batch_size": batch_size},
+            )
+        if entity_type not in self._supported_entity_types():
+            raise InvalidRequestError(
+                "Unsupported research entity type",
+                details={
+                    "entity_type": entity_type,
+                    "supported": sorted(self._supported_entity_types()),
+                },
+            )
 
         result = BatchOperationResultDTO()
         remaining = limit
-        for entity_type, iterator_factory in self._entity_iterators():
-            for entity in iterator_factory():
+        offset_remaining = offset
+
+        for current_type, list_method in self._selected_entity_sources(entity_type):
+            source_offset = offset_remaining
+            if entity_type == "all" and offset_remaining:
+                entity_count = self._entity_count(current_type)
+                if entity_count is not None and offset_remaining >= entity_count:
+                    offset_remaining -= entity_count
+                    continue
+                offset_remaining = 0
+            else:
+                offset_remaining = 0
+
+            while True:
                 if remaining is not None and remaining <= 0:
                     return result
+                page_size = batch_size if remaining is None else min(batch_size, remaining)
+                entities = list_method(page_size, source_offset)
+                if not entities:
+                    break
 
-                result.total += 1
-                entity_id = self._entity_id(entity)
-                try:
-                    operation = self._index_entity(
-                        entity_type,
-                        entity,
-                        force_reindex=force_reindex,
-                    )
-                except AppError as exc:
-                    result.failed += 1
-                    result.errors.append(
-                        {
-                            "entity_type": entity_type,
-                            "entity_id": entity_id,
-                            "code": exc.code,
-                            "message": exc.message,
-                            "details": exc.details or {},
-                        }
-                    )
-                else:
-                    if operation.details.get("skipped"):
-                        result.skipped += 1
-                    else:
-                        result.updated += 1
+                batch_result = self._index_entity_batch(
+                    current_type,
+                    entities,
+                    force_reindex=force_reindex,
+                )
+                self._merge_batch_result(result, batch_result)
 
+                loaded_count = len(entities)
+                source_offset += loaded_count
                 if remaining is not None:
-                    remaining -= 1
+                    remaining -= loaded_count
+                if loaded_count < page_size:
+                    break
 
         return result
 
@@ -108,6 +141,7 @@ class ResearchEntityIndexingFacade:
         topic_id: int,
         force_reindex: bool = False,
     ) -> OperationResultDTO:
+        """Index one topic entity by id."""
         topic = self.taxonomy_repository.get_topic_by_id(topic_id)
         if topic is None:
             raise EntityNotFoundError(
@@ -121,6 +155,7 @@ class ResearchEntityIndexingFacade:
         keyword_id: int,
         force_reindex: bool = False,
     ) -> OperationResultDTO:
+        """Index one keyword entity by id."""
         keyword = self.taxonomy_repository.get_keyword_by_id(keyword_id)
         if keyword is None:
             raise EntityNotFoundError(
@@ -129,36 +164,167 @@ class ResearchEntityIndexingFacade:
             )
         return self._index_entity("keyword", keyword, force_reindex=force_reindex)
 
-    def _entity_iterators(
+    def _selected_entity_sources(
         self,
-    ) -> list[tuple[str, Callable[[], Iterator[Any]]]]:
+        entity_type: str,
+    ) -> list[tuple[str, Callable[[int, int], list[Any]]]]:
+        sources = self._entity_sources()
+        if entity_type == "all":
+            return sources
+        return [(name, method) for name, method in sources if name == entity_type]
+
+    def _entity_sources(self) -> list[tuple[str, Callable[[int, int], list[Any]]]]:
         return [
-            ("domain", lambda: self._iter_entities(self.taxonomy_repository.list_domains)),
-            ("field", lambda: self._iter_entities(self.taxonomy_repository.list_fields)),
-            (
-                "subfield",
-                lambda: self._iter_entities(self.taxonomy_repository.list_subfields),
-            ),
-            ("topic", lambda: self._iter_entities(self.taxonomy_repository.list_topics)),
-            (
-                "keyword",
-                lambda: self._iter_entities(self.taxonomy_repository.list_keywords),
-            ),
+            ("domain", self.taxonomy_repository.list_domains),
+            ("field", self.taxonomy_repository.list_fields),
+            ("subfield", self.taxonomy_repository.list_subfields),
+            ("topic", self.taxonomy_repository.list_topics),
+            ("keyword", self.taxonomy_repository.list_keywords),
         ]
 
-    def _iter_entities(
+    def _supported_entity_types(self) -> set[str]:
+        return {"all", "domain", "field", "subfield", "topic", "keyword"}
+
+    def _entity_count(self, entity_type: str) -> int | None:
+        method_name = {
+            "domain": "count_domains",
+            "field": "count_fields",
+            "subfield": "count_subfields",
+            "topic": "count_topics",
+            "keyword": "count_keywords",
+        }[entity_type]
+        method = getattr(self.taxonomy_repository, method_name, None)
+        if not callable(method):
+            return None
+        return int(method())
+
+    def _index_entity_batch(
         self,
-        list_method: Callable[[int, int], list[Any]],
-    ) -> Iterator[Any]:
-        offset = 0
-        while True:
-            entities = list_method(ENTITY_PAGE_SIZE, offset)
-            if not entities:
-                break
-            yield from entities
-            if len(entities) < ENTITY_PAGE_SIZE:
-                break
-            offset += ENTITY_PAGE_SIZE
+        entity_type: str,
+        entities: list[Any],
+        *,
+        force_reindex: bool,
+    ) -> BatchOperationResultDTO:
+        result = BatchOperationResultDTO(total=len(entities))
+        if not entities:
+            return result
+
+        records: list[dict[str, Any]] = []
+        for entity in entities:
+            try:
+                entity_id = self._entity_id(entity)
+                name = self._entity_name(entity)
+                hierarchy = self._build_hierarchy(entity_type, entity)
+                embedding_context = self._embedding_context(entity_type, hierarchy)
+                embedding_text = (
+                    self.text_preparation_service.build_research_entity_embedding_text(
+                        entity_type=entity_type,
+                        name=name,
+                        domain_name=embedding_context.get("domain_name"),
+                        field_name=embedding_context.get("field_name"),
+                        subfield_name=embedding_context.get("subfield_name"),
+                    )
+                )
+                records.append(
+                    {
+                        "entity": entity,
+                        "entity_id": entity_id,
+                        "name": name,
+                        "point_id": self._point_id(entity_type, entity_id),
+                        "hierarchy": hierarchy,
+                        "embedding_text": embedding_text,
+                    }
+                )
+            except AppError as exc:
+                result.failed += 1
+                result.errors.append(
+                    self._error_payload(exc, entity_type, getattr(entity, "id", None))
+                )
+
+        if not records:
+            return result
+
+        existing_point_ids = self._existing_point_ids(
+            [record["point_id"] for record in records],
+            force_reindex=force_reindex,
+        )
+        pending_records = [
+            record for record in records if record["point_id"] not in existing_point_ids
+        ]
+        result.skipped += len(records) - len(pending_records)
+        if not pending_records:
+            return result
+
+        embeddings = self.embedding_adapter.embed_batch(
+            [record["embedding_text"] for record in pending_records],
+            model=self.embedding_model,
+        )
+        if len(embeddings) != len(pending_records):
+            raise EmbeddingGenerationError(
+                "Embedding response length does not match batch size",
+                details={
+                    "expected": len(pending_records),
+                    "actual": len(embeddings),
+                },
+            )
+
+        points: list[QdrantPointDTO] = []
+        for record, embedding in zip(pending_records, embeddings, strict=True):
+            if embedding is None or not embedding.vector:
+                result.failed += 1
+                result.errors.append(
+                    {
+                        "entity_type": entity_type,
+                        "entity_id": record["entity_id"],
+                        "code": EmbeddingGenerationError.code,
+                        "message": "Embedding vector was not generated",
+                        "details": {
+                            "entity_type": entity_type,
+                            "entity_id": record["entity_id"],
+                        },
+                    }
+                )
+                continue
+
+            payload = self.payload_builder.build_research_entity_payload(
+                record["entity"],
+                entity_type=entity_type,
+                entity_id=record["entity_id"],
+                name=record["name"],
+                **record["hierarchy"],
+                **self._build_count_payload(entity_type, record["entity_id"]),
+                embedding_model=embedding.model or self.embedding_model,
+                embedding_version=self.embedding_version,
+                indexed_at=datetime.now(timezone.utc),
+            )
+            points.append(
+                QdrantPointDTO(
+                    id=record["point_id"],
+                    vector=embedding.vector,
+                    payload=payload,
+                )
+            )
+
+        if points:
+            self.qdrant_adapter.upsert_points(self.collection_name, points)
+            result.updated += len(points)
+
+        return result
+
+    def _existing_point_ids(
+        self,
+        point_ids: list[str],
+        *,
+        force_reindex: bool,
+    ) -> set[str]:
+        if force_reindex or not point_ids:
+            return set()
+        points = self.qdrant_adapter.retrieve(
+            self.collection_name,
+            point_ids,
+            with_vectors=False,
+        )
+        return {str(point.id) for point in points}
 
     def _index_entity(
         self,
@@ -350,6 +516,32 @@ class ResearchEntityIndexingFacade:
                 details={"method": method_name, "value": value},
             )
         return None
+
+    def _merge_batch_result(
+        self,
+        target: BatchOperationResultDTO,
+        source: BatchOperationResultDTO,
+    ) -> None:
+        target.total += source.total
+        target.created += source.created
+        target.updated += source.updated
+        target.skipped += source.skipped
+        target.failed += source.failed
+        target.errors.extend(source.errors)
+
+    def _error_payload(
+        self,
+        exc: AppError,
+        entity_type: str,
+        entity_id: Any,
+    ) -> dict[str, Any]:
+        return {
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "code": exc.code,
+            "message": exc.message,
+            "details": exc.details or {},
+        }
 
     def _domain_for_field(self, field: Any | None) -> Any | None:
         if field is None:

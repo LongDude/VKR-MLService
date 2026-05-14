@@ -58,6 +58,82 @@ class PaperRepository(BaseRepository):
             stmt = stmt.where(Paper.publication_year == publication_year)
         return self.session.scalar(stmt.limit(1))
 
+    def count_all(self) -> int:
+        """Return total paper count."""
+        return int(self.session.scalar(select(func.count()).select_from(Paper)) or 0)
+
+    def existing_external_paper_keys(
+        self,
+        items: list[ExternalPaperDTO],
+        source_name: str = "openalex",
+    ) -> set[str]:
+        """Return stable external-paper keys that already exist in PostgreSQL."""
+        external_ids = {item.external_id for item in items if item.external_id}
+        dois = {item.doi for item in items if item.doi}
+        title_years = {
+            (self._normalize_title(item.title), item.publication_year)
+            for item in items
+            if item.title and item.title.strip()
+        }
+        normalized_titles = {title for title, _ in title_years}
+        titles_any_year = {title for title, year in title_years if year is None}
+        existing: set[str] = set()
+
+        if external_ids:
+            stmt = (
+                select(PaperMetaSource.external_id)
+                .join(MetaSource, MetaSource.id == PaperMetaSource.meta_source_id)
+                .where(
+                    MetaSource.name == source_name,
+                    PaperMetaSource.external_id.in_(external_ids),
+                )
+            )
+            existing.update(
+                f"external:{external_id}"
+                for external_id in self.session.scalars(stmt).all()
+            )
+
+        if dois:
+            stmt = select(Paper.doi).where(Paper.doi.in_(dois))
+            existing.update(f"doi:{doi}" for doi in self.session.scalars(stmt).all())
+
+        if normalized_titles:
+            stmt = select(Paper.title, Paper.publication_year).where(
+                func.lower(func.trim(Paper.title)).in_(normalized_titles)
+            )
+            for title, publication_year in self.session.execute(stmt):
+                key = (self._normalize_title(title), publication_year)
+                if key in title_years:
+                    existing.add(f"title:{key[0]}:{key[1] or ''}")
+                if key[0] in titles_any_year:
+                    existing.add(f"title:{key[0]}:")
+
+        return existing
+
+    def resolve_external_paper_ids(
+        self,
+        items: list[ExternalPaperDTO],
+        source_name: str = "openalex",
+    ) -> list[int]:
+        """Resolve database paper ids for imported external papers."""
+        paper_ids: list[int] = []
+        seen: set[int] = set()
+        for item in items:
+            paper = (
+                self.get_by_external_id(source_name, item.external_id)
+                if item.external_id
+                else None
+            )
+            if paper is None and item.doi:
+                paper = self.get_by_doi(item.doi)
+            if paper is None and item.title:
+                paper = self.get_by_title_normalized(item.title, item.publication_year)
+            if paper is None or paper.id in seen:
+                continue
+            paper_ids.append(int(paper.id))
+            seen.add(int(paper.id))
+        return paper_ids
+
     def create(self, data: PaperCreateDTO) -> Paper:
         """Create a paper without committing the transaction."""
         paper = Paper(**data.model_dump(exclude_unset=True))
@@ -184,6 +260,25 @@ class PaperRepository(BaseRepository):
     ) -> list[Paper]:
         """List papers whose publication_date falls within the optional period."""
         stmt = select(Paper).order_by(Paper.publication_date.desc().nullslast(), Paper.id.desc())
+        if date_from is not None:
+            stmt = stmt.where(Paper.publication_date >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(Paper.publication_date <= date_to)
+        stmt = stmt.limit(limit).offset(offset)
+        return list(self.session.scalars(stmt).all())
+
+    def list_ids_by_period(
+        self,
+        date_from: date | None,
+        date_to: date | None,
+        limit: int,
+        offset: int,
+    ) -> list[int]:
+        """List paper ids whose publication_date falls within the optional period."""
+        stmt = select(Paper.id).order_by(
+            Paper.publication_date.desc().nullslast(),
+            Paper.id.desc(),
+        )
         if date_from is not None:
             stmt = stmt.where(Paper.publication_date >= date_from)
         if date_to is not None:

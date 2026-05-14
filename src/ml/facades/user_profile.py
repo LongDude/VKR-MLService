@@ -29,6 +29,8 @@ PROFILE_VERSION = "v1"
 
 
 class UserProfileFacade:
+    """Build and read user vector profiles from favourites and tracked entities."""
+
     def __init__(
         self,
         *,
@@ -56,6 +58,7 @@ class UserProfileFacade:
         self,
         user_id: int,
     ) -> UserProfileDTO:
+        """Recompute a user profile vector and upsert it into Qdrant."""
         sources = self._load_source_ids(user_id)
         if not self._has_any_source(sources):
             raise InsufficientUserProfileDataError(
@@ -117,6 +120,7 @@ class UserProfileFacade:
         user_id: int,
         recompute_if_missing: bool = True,
     ) -> list[float]:
+        """Return a stored user profile vector, recomputing it when requested."""
         points = self.qdrant_adapter.retrieve(
             self.user_profiles_collection,
             [self._profile_point_id(user_id)],
@@ -146,6 +150,7 @@ class UserProfileFacade:
         self,
         user_id: int,
     ) -> bool:
+        """Return whether a user has at least one configured profile source."""
         return self._has_any_source(self._load_source_ids(user_id))
 
     def _load_source_ids(self, user_id: int) -> dict[str, list[int]]:

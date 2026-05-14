@@ -4,7 +4,7 @@ from collections import defaultdict
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from core.exceptions import InvalidRequestError
 from dto.external import ExternalKeywordDTO, ExternalTopicDTO
@@ -274,6 +274,26 @@ class TaxonomyRepository(BaseRepository):
         """List keywords ordered by value."""
         return self._list_entities(Keyword, Keyword.value, limit, offset)
 
+    def count_domains(self) -> int:
+        """Count domain entities."""
+        return self._count_entities(Domain)
+
+    def count_fields(self) -> int:
+        """Count field entities."""
+        return self._count_entities(Field)
+
+    def count_subfields(self) -> int:
+        """Count subfield entities."""
+        return self._count_entities(Subfield)
+
+    def count_topics(self) -> int:
+        """Count topic entities."""
+        return self._count_entities(Topic)
+
+    def count_keywords(self) -> int:
+        """Count keyword entities."""
+        return self._count_entities(Keyword)
+
     def _get_by_openalex_or_name(
         self,
         model: type[Domain] | type[Field] | type[Subfield] | type[Topic],
@@ -291,6 +311,9 @@ class TaxonomyRepository(BaseRepository):
     def _list_entities(self, model, order_column, limit: int, offset: int):
         stmt = select(model).order_by(order_column.asc()).limit(limit).offset(offset)
         return list(self.session.scalars(stmt).all())
+
+    def _count_entities(self, model) -> int:
+        return int(self.session.scalar(select(func.count()).select_from(model)) or 0)
 
     def _score_to_decimal(self, score: float | None) -> Decimal | None:
         if score is None:
