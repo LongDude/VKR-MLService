@@ -22,7 +22,7 @@ from adapters import QdrantAdapter, RedisAdapter
 from core.config import Settings
 from core.exceptions import AppError
 from ml.constants import PAPERS_COLLECTION
-from ml.workers.redis_worker import PAPER_INDEXING_QUEUE
+from ml.workers.redis_worker import FAILED_TASKS_QUEUE, PAPER_INDEXING_QUEUE
 from models.session import create_db_engine, create_session_factory
 from repositories import PaperRepository
 
@@ -197,6 +197,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_redis_args(enqueue_parser)
     add_qdrant_args(enqueue_parser)
 
+    restore_parser = subparsers.add_parser(
+        "restore-failed",
+        help="Move failed worker messages back from queue:failed_tasks to their source queues.",
+    )
+    restore_parser.add_argument(
+        "--failed-queue",
+        default=FAILED_TASKS_QUEUE,
+        help=f"Queue with failed task wrappers. Defaults to {FAILED_TASKS_QUEUE}.",
+    )
+    restore_parser.add_argument(
+        "--target-queue",
+        default=None,
+        help="Override target queue for all restored messages. Defaults to wrapper source_queue.",
+    )
+    restore_parser.add_argument(
+        "--task-type",
+        default=None,
+        help="Restore only failed messages whose inner message.task_type matches this value.",
+    )
+    restore_parser.add_argument(
+        "--limit",
+        type=int,
+        default=1000,
+        help="Maximum failed wrappers to inspect/process. Defaults to 1000.",
+    )
+    restore_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview what would be restored without modifying Redis.",
+    )
+    add_database_args(restore_parser)
+    add_redis_args(restore_parser)
+
     return parser.parse_args(argv)
 
 
@@ -208,6 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "enqueue-indexing":
             payload = run_enqueue_indexing(args)
+        elif args.command == "restore-failed":
+            payload = run_restore_failed(args)
         else:
             raise AssertionError(f"Unhandled command: {args.command}")
     except AppError as exc:
@@ -272,6 +307,179 @@ def run_enqueue_indexing(args: argparse.Namespace) -> dict[str, Any]:
         "date_from": args.date_from,
         "date_to": args.date_to,
         "paper_ids_file": args.paper_ids,
+        "result": result,
+    }
+
+
+class FailedTaskRestorer:
+    """Restore failed worker task wrappers to executable Redis queues."""
+
+    def __init__(
+        self,
+        redis_adapter: RedisAdapter,
+        *,
+        failed_queue: str = FAILED_TASKS_QUEUE,
+    ) -> None:
+        self.redis_adapter = redis_adapter
+        self.failed_queue = failed_queue
+
+    def restore(
+        self,
+        *,
+        limit: int,
+        target_queue: str | None = None,
+        task_type: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Restore failed tasks and return operation counters."""
+        if limit <= 0:
+            raise ValueError("--limit must be a positive integer.")
+
+        if dry_run:
+            wrappers = self.redis_adapter.peek_queue(self.failed_queue, limit)
+            return self._preview(
+                wrappers,
+                target_queue=target_queue,
+                task_type=task_type,
+            )
+
+        restored = 0
+        skipped = 0
+        invalid = 0
+        restored_by_queue: dict[str, int] = {}
+        skipped_samples: list[dict[str, Any]] = []
+        invalid_samples: list[dict[str, Any]] = []
+
+        for _ in range(limit):
+            wrapper = self.redis_adapter.dequeue_nowait(self.failed_queue)
+            if wrapper is None:
+                break
+
+            extracted = self._extract_restore_target(
+                wrapper,
+                target_queue=target_queue,
+            )
+            if extracted is None:
+                invalid += 1
+                invalid_samples.append(self._sample(wrapper))
+                continue
+
+            queue_name, message = extracted
+            if task_type and message.get("task_type") != task_type:
+                skipped += 1
+                skipped_samples.append(self._sample(wrapper))
+                self.redis_adapter.enqueue(self.failed_queue, wrapper)
+                continue
+
+            try:
+                self.redis_adapter.enqueue(queue_name, message)
+            except Exception:
+                self.redis_adapter.enqueue(self.failed_queue, wrapper)
+                raise
+
+            restored += 1
+            restored_by_queue[queue_name] = restored_by_queue.get(queue_name, 0) + 1
+
+        return {
+            "failed_queue": self.failed_queue,
+            "dry_run": False,
+            "limit": limit,
+            "restored": restored,
+            "skipped": skipped,
+            "invalid": invalid,
+            "restored_by_queue": restored_by_queue,
+            "skipped_samples": skipped_samples[:20],
+            "invalid_samples": invalid_samples[:20],
+        }
+
+    def _preview(
+        self,
+        wrappers: list[dict[str, Any]],
+        *,
+        target_queue: str | None,
+        task_type: str | None,
+    ) -> dict[str, Any]:
+        restorable = 0
+        skipped = 0
+        invalid = 0
+        by_queue: dict[str, int] = {}
+        samples: list[dict[str, Any]] = []
+
+        for wrapper in wrappers:
+            extracted = self._extract_restore_target(
+                wrapper,
+                target_queue=target_queue,
+            )
+            if extracted is None:
+                invalid += 1
+                continue
+            queue_name, message = extracted
+            if task_type and message.get("task_type") != task_type:
+                skipped += 1
+                continue
+            restorable += 1
+            by_queue[queue_name] = by_queue.get(queue_name, 0) + 1
+            samples.append(
+                {
+                    "target_queue": queue_name,
+                    "task_type": message.get("task_type"),
+                    "message": message,
+                }
+            )
+
+        return {
+            "failed_queue": self.failed_queue,
+            "dry_run": True,
+            "inspected": len(wrappers),
+            "restorable": restorable,
+            "skipped": skipped,
+            "invalid": invalid,
+            "restorable_by_queue": by_queue,
+            "samples": samples[:20],
+        }
+
+    def _extract_restore_target(
+        self,
+        wrapper: dict[str, Any],
+        *,
+        target_queue: str | None,
+    ) -> tuple[str, dict[str, Any]] | None:
+        message = wrapper.get("message")
+        if not isinstance(message, dict):
+            return None
+
+        queue_name = target_queue or wrapper.get("source_queue")
+        if not isinstance(queue_name, str) or not queue_name.startswith("queue:"):
+            return None
+        return queue_name, message
+
+    def _sample(self, wrapper: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "source_queue": wrapper.get("source_queue"),
+            "task_type": (
+                wrapper.get("message", {}).get("task_type")
+                if isinstance(wrapper.get("message"), dict)
+                else None
+            ),
+            "error": wrapper.get("error"),
+        }
+
+
+def run_restore_failed(args: argparse.Namespace) -> dict[str, Any]:
+    """Restore failed ML task wrappers back to Redis work queues."""
+    redis_adapter = RedisAdapter(build_redis_client(args))
+    result = FailedTaskRestorer(
+        redis_adapter,
+        failed_queue=args.failed_queue,
+    ).restore(
+        limit=args.limit,
+        target_queue=args.target_queue,
+        task_type=args.task_type,
+        dry_run=args.dry_run,
+    )
+
+    return {
+        "command": "restore-failed",
         "result": result,
     }
 

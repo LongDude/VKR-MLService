@@ -186,17 +186,25 @@ def main(argv: list[str] | None = None) -> int:
                 or os.getenv("EMBEDDING_MODEL")
                 or DEFAULT_EMBEDDING_MODEL,
             )
-            response = facade.index_batch(
-                PaperBatchIndexingRequestDTO(
-                    paper_ids=paper_ids,
-                    date_from=args.date_from,
-                    date_to=args.date_to,
-                    limit=args.limit,
-                    offset=args.offset,
-                    batch_size=args.batch_size,
-                    force_reindex=args.force_reindex,
+            try:
+                response = facade.index_batch(
+                    PaperBatchIndexingRequestDTO(
+                        paper_ids=paper_ids,
+                        date_from=args.date_from,
+                        date_to=args.date_to,
+                        limit=args.limit,
+                        offset=args.offset,
+                        batch_size=args.batch_size,
+                        force_reindex=args.force_reindex,
+                    )
                 )
-            )
+                session.commit()
+            except AppError:
+                session.commit()
+                raise
+            except Exception:
+                session.rollback()
+                raise
         print_json(response.model_dump(mode="json"))
         return 0
     except AppError as exc:

@@ -18,6 +18,7 @@ from repositories.authors import AuthorRepository
 from repositories.institutions import InstitutionRepository
 from repositories.landings import LandingRepository
 from repositories.paper_meta_sources import PaperMetaSourceRepository
+from repositories.paper_processing_states import PaperProcessingStateRepository
 from repositories.papers import PaperRepository
 from repositories.taxonomy import TaxonomyRepository
 
@@ -45,6 +46,7 @@ class PaperUploaderFacade:
         taxonomy_repository: TaxonomyRepository,
         landing_repository: LandingRepository,
         paper_meta_source_repository: PaperMetaSourceRepository,
+        processing_state_repository: PaperProcessingStateRepository | None = None,
         paper_batch_size: int = 100,
         author_batch_size: int = 300,
         institution_batch_size: int = 300,
@@ -59,6 +61,10 @@ class PaperUploaderFacade:
         self.taxonomy_repository = taxonomy_repository
         self.landing_repository = landing_repository
         self.paper_meta_source_repository = paper_meta_source_repository
+        self.processing_state_repository = (
+            processing_state_repository
+            or PaperProcessingStateRepository(self.paper_repository.session)
+        )
         self.paper_batch_size = self._validate_batch_size(
             paper_batch_size,
             "paper_batch_size",
@@ -199,6 +205,11 @@ class PaperUploaderFacade:
             buffers["paper_keyword_links"],
             papers_by_key,
             keywords_by_key,
+        )
+        self.processing_state_repository.mark_loaded(
+            paper.id
+            for paper in papers_by_key.values()
+            if getattr(paper, "id", None) is not None
         )
         self.paper_repository.session.flush()
         return len(buffers["papers"])

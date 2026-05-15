@@ -104,6 +104,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Seconds to sleep when no tasks are available. Defaults to 2.",
     )
     run_parser.add_argument(
+        "--paper-indexing-batch-size",
+        type=int,
+        default=500,
+        help=(
+            "Maximum queue:paper_indexing messages to combine into one "
+            "PaperIndexingPipeline.run_many call. Defaults to 500."
+        ),
+    )
+    run_parser.add_argument(
+        "--cluster-recompute-batch-size",
+        type=int,
+        default=50,
+        help=(
+            "Maximum queue:cluster_recompute topic messages to combine into one "
+            "cluster recompute batch. Defaults to 50."
+        ),
+    )
+    run_parser.add_argument(
         "--env-file",
         default=str(PROJECT_DIR / ".env"),
         help="Path to .env file. Defaults to project .env.",
@@ -169,6 +187,10 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--max-tasks must be a positive integer.")
     if args.idle_sleep < 0:
         raise ValueError("--idle-sleep must be non-negative.")
+    if args.paper_indexing_batch_size <= 0:
+        raise ValueError("--paper-indexing-batch-size must be a positive integer.")
+    if args.cluster_recompute_batch_size <= 0:
+        raise ValueError("--cluster-recompute-batch-size must be a positive integer.")
 
     queue_names = parse_queues(args.queues)
     database_url = args.database_url or Settings.from_env().database_url
@@ -205,6 +227,10 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 redis_adapter=redis_adapter,
                 task_handler=handler,
                 queues=queue_names,
+                batch_sizes={
+                    PAPER_INDEXING_QUEUE: args.paper_indexing_batch_size,
+                    CLUSTER_RECOMPUTE_QUEUE: args.cluster_recompute_batch_size,
+                },
                 idle_sleep_seconds=args.idle_sleep,
             )
 
@@ -221,6 +247,10 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
             "command": "run",
             "queues": queue_names,
             "max_tasks": args.max_tasks,
+            "batch_sizes": {
+                PAPER_INDEXING_QUEUE: args.paper_indexing_batch_size,
+                CLUSTER_RECOMPUTE_QUEUE: args.cluster_recompute_batch_size,
+            },
             "processed": processed,
         }
     finally:
@@ -291,6 +321,7 @@ def build_task_handler(
     )
 
     return MLTaskHandler(
+        session=session,
         paper_indexing_pipeline=paper_indexing_pipeline,
         research_entities_pipeline=research_entities_pipeline,
         trend_recompute_pipeline=trend_recompute_pipeline,
@@ -308,9 +339,9 @@ def run_limited_worker(
     """Run worker until max_tasks messages have been handled."""
     processed = 0
     while processed < max_tasks:
-        handled = worker.run_once()
+        handled = worker.run_once(max_messages=max_tasks - processed)
         if handled:
-            processed += 1
+            processed += worker.last_processed_message_count
         else:
             time.sleep(idle_sleep_seconds)
     return processed

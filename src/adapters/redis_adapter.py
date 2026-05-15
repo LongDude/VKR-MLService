@@ -66,15 +66,50 @@ class RedisAdapter:
             if result is None:
                 return None
             _, value = result
-            if isinstance(value, bytes):
-                value = value.decode("utf-8")
-            parsed = json.loads(value)
-            if not isinstance(parsed, dict):
-                raise ValueError("Redis queue message is not a JSON object")
-            return parsed
+            return self._decode_queue_message(value)
         except Exception as exc:
             raise RedisOperationError(
                 f"Failed to dequeue Redis message from {queue_name!r}",
+                details={"queue_name": queue_name, "reason": str(exc)},
+            ) from exc
+
+    def dequeue_nowait(self, queue_name: str) -> dict[str, Any] | None:
+        """Return one queue message without blocking, or ``None`` when empty."""
+        try:
+            value = self._client.lpop(queue_name)
+            if value is None:
+                return None
+            return self._decode_queue_message(value)
+        except Exception as exc:
+            raise RedisOperationError(
+                f"Failed to dequeue Redis message from {queue_name!r}",
+                details={"queue_name": queue_name, "reason": str(exc)},
+            ) from exc
+
+    def peek_queue(
+        self,
+        queue_name: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return up to ``limit`` queue messages without removing them."""
+        try:
+            if limit <= 0:
+                return []
+            values = self._client.lrange(queue_name, 0, limit - 1)
+            return [self._decode_queue_message(value) for value in values]
+        except Exception as exc:
+            raise RedisOperationError(
+                f"Failed to peek Redis messages from {queue_name!r}",
+                details={"queue_name": queue_name, "reason": str(exc)},
+            ) from exc
+
+    def queue_length(self, queue_name: str) -> int:
+        """Return Redis list length for a queue."""
+        try:
+            return int(self._client.llen(queue_name))
+        except Exception as exc:
+            raise RedisOperationError(
+                f"Failed to read Redis queue length for {queue_name!r}",
                 details={"queue_name": queue_name, "reason": str(exc)},
             ) from exc
 
@@ -89,6 +124,14 @@ class RedisAdapter:
 
     def release_lock(self, key: str) -> None:
         self.delete(key)
+
+    def _decode_queue_message(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            raise ValueError("Redis queue message is not a JSON object")
+        return parsed
 
 
 __all__ = ["RedisAdapter"]

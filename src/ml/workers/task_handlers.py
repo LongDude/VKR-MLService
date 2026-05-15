@@ -19,12 +19,14 @@ class MLTaskHandler:
     def __init__(
         self,
         *,
+        session: Any | None = None,
         paper_indexing_pipeline: PaperIndexingPipeline | None = None,
         research_entities_pipeline: ResearchEntitiesPipeline | None = None,
         trend_recompute_pipeline: TrendRecomputePipeline | None = None,
         cluster_dynamics_pipeline: ClusterDynamicsPipeline | None = None,
         user_profile_pipeline: UserProfilePipeline | None = None,
     ) -> None:
+        self.session = session
         self.paper_indexing_pipeline = paper_indexing_pipeline
         self.research_entities_pipeline = research_entities_pipeline
         self.trend_recompute_pipeline = trend_recompute_pipeline
@@ -32,6 +34,17 @@ class MLTaskHandler:
         self.user_profile_pipeline = user_profile_pipeline
 
     def handle(self, message: dict) -> OperationResultDTO:
+        try:
+            result = self._handle(message)
+        except Exception:
+            if self.session is not None:
+                self.session.rollback()
+            raise
+        if self.session is not None:
+            self.session.commit()
+        return result
+
+    def _handle(self, message: dict) -> OperationResultDTO:
         if not isinstance(message, dict):
             raise InvalidRequestError("Task message must be a JSON object")
 

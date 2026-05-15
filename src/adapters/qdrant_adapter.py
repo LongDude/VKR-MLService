@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from core.exceptions import QdrantIndexError
 from dto.qdrant import QdrantPayloadIndexDTO, QdrantPointDTO, QdrantSearchHitDTO
@@ -10,6 +12,10 @@ try:
 except ImportError:
     QdrantClient = None
     qdrant_models = None
+
+
+ORIGINAL_POINT_ID_PAYLOAD_KEY = "_ml_original_point_id"
+POINT_ID_NAMESPACE_PREFIX = "vkr-mlservice:qdrant-point:"
 
 
 class QdrantAdapter:
@@ -156,7 +162,7 @@ class QdrantAdapter:
         try:
             result = self._client.retrieve(
                 collection_name=collection_name,
-                ids=point_ids,
+                ids=[self._qdrant_point_id(point_id) for point_id in point_ids],
                 with_vectors=with_vectors,
             )
             return [self._to_point(point) for point in result]
@@ -192,12 +198,18 @@ class QdrantAdapter:
         return qdrant_models.VectorParams(size=vector_size, distance=distance_value)
 
     def _point_struct(self, point: QdrantPointDTO) -> Any:
+        point_id = self._qdrant_point_id(point.id)
+        payload = self._payload_with_original_id(point.payload, point.id)
         if qdrant_models is None:
-            return point.model_dump()
+            return {
+                "id": point_id,
+                "vector": point.vector,
+                "payload": payload,
+            }
         return qdrant_models.PointStruct(
-            id=point.id,
+            id=point_id,
             vector=point.vector,
-            payload=point.payload,
+            payload=payload,
         )
 
     def _payload_schema(self, field_schema: str) -> Any:
@@ -220,19 +232,74 @@ class QdrantAdapter:
             raise ValueError(f"Unsupported Qdrant payload schema: {field_schema!r}") from exc
 
     def _to_search_hit(self, point: Any) -> QdrantSearchHitDTO:
+        raw_payload = self._get_attr(point, "payload", {}) or {}
         return QdrantSearchHitDTO(
-            id=self._get_attr(point, "id"),
+            id=self._public_point_id(self._get_attr(point, "id"), raw_payload),
             score=float(self._get_attr(point, "score", 0.0)),
-            payload=self._get_attr(point, "payload", {}) or {},
+            payload=self._public_payload(raw_payload),
             vector=self._get_attr(point, "vector", None),
         )
 
     def _to_point(self, point: Any) -> QdrantPointDTO:
+        raw_payload = self._get_attr(point, "payload", {}) or {}
         return QdrantPointDTO(
-            id=self._get_attr(point, "id"),
+            id=self._public_point_id(self._get_attr(point, "id"), raw_payload),
             vector=self._get_attr(point, "vector", None) or [],
-            payload=self._get_attr(point, "payload", {}) or {},
+            payload=self._public_payload(raw_payload),
         )
+
+    def _qdrant_point_id(self, point_id: int | str) -> int | str:
+        """Convert application point ids to Qdrant-compatible ids.
+
+        Qdrant REST accepts only unsigned integers and UUID strings as point ids.
+        ML-layer ids such as ``topic:120`` are therefore mapped to deterministic
+        UUIDv5 values. The original id is still stored in payload and restored in
+        adapter DTOs.
+        """
+        if isinstance(point_id, int):
+            if point_id >= 0:
+                return point_id
+            return str(uuid5(NAMESPACE_URL, f"{POINT_ID_NAMESPACE_PREFIX}{point_id}"))
+
+        value = str(point_id)
+        if value.isdecimal():
+            return int(value)
+        try:
+            return str(UUID(value))
+        except ValueError:
+            return str(uuid5(NAMESPACE_URL, f"{POINT_ID_NAMESPACE_PREFIX}{value}"))
+
+    def _payload_with_original_id(
+        self,
+        payload: dict[str, Any],
+        point_id: int | str,
+    ) -> dict[str, Any]:
+        qdrant_point_id = self._qdrant_point_id(point_id)
+        if qdrant_point_id == point_id or str(qdrant_point_id) == str(point_id):
+            return payload
+
+        result = deepcopy(payload)
+        result.setdefault(ORIGINAL_POINT_ID_PAYLOAD_KEY, str(point_id))
+        return result
+
+    def _public_point_id(
+        self,
+        raw_point_id: Any,
+        payload: dict[str, Any],
+    ) -> int | str:
+        original = payload.get(ORIGINAL_POINT_ID_PAYLOAD_KEY)
+        if original is not None:
+            return str(original)
+        if isinstance(raw_point_id, int):
+            return raw_point_id
+        return str(raw_point_id)
+
+    def _public_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if ORIGINAL_POINT_ID_PAYLOAD_KEY not in payload:
+            return payload
+        result = dict(payload)
+        result.pop(ORIGINAL_POINT_ID_PAYLOAD_KEY, None)
+        return result
 
     def _get_attr(self, value: Any, key: str, default: Any = None) -> Any:
         if isinstance(value, dict):

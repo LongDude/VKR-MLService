@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import date
 from typing import Any
 
@@ -22,6 +23,7 @@ from dto.qdrant import QdrantPointDTO
 from repositories.authors import AuthorRepository
 from repositories.institutions import InstitutionRepository
 from repositories.paper_meta_sources import PaperMetaSourceRepository
+from repositories.paper_processing_states import PaperProcessingStateRepository
 from repositories.papers import PaperRepository
 from repositories.taxonomy import TaxonomyRepository
 from utils.hashing import calculate_text_hash
@@ -54,6 +56,7 @@ class PaperIndexingFacade:
         embedding_adapter: LMStudioEmbeddingAdapter,
         qdrant_adapter: QdrantAdapter,
         redis_adapter: RedisAdapter,
+        processing_state_repository: PaperProcessingStateRepository | None = None,
         text_preparation_service: TextPreparationService | None = None,
         payload_builder: QdrantPayloadBuilder | None = None,
         collection_name: str = PAPERS_COLLECTION,
@@ -64,6 +67,10 @@ class PaperIndexingFacade:
         self.author_repository = author_repository
         self.institution_repository = institution_repository
         self.paper_meta_source_repository = paper_meta_source_repository
+        self.processing_state_repository = (
+            processing_state_repository
+            or PaperProcessingStateRepository(self.paper_repository.session)
+        )
         self.embedding_adapter = embedding_adapter
         self.qdrant_adapter = qdrant_adapter
         self.redis_adapter = redis_adapter
@@ -86,93 +93,103 @@ class PaperIndexingFacade:
                 details={"paper_id": request.paper_id},
             )
 
-        title = self._require_title(getattr(paper, "title", None), request.paper_id)
-        topics = self.taxonomy_repository.list_topics_by_paper(request.paper_id)
-        keywords = self.taxonomy_repository.list_keywords_by_paper(request.paper_id)
+        qdrant_indexed = False
+        try:
+            title = self._require_title(getattr(paper, "title", None), request.paper_id)
+            topics = self.taxonomy_repository.list_topics_by_paper(request.paper_id)
+            keywords = self.taxonomy_repository.list_keywords_by_paper(request.paper_id)
 
-        topic_names = [topic.name for topic in topics if getattr(topic, "name", None)]
-        keyword_values = [
-            keyword.value for keyword in keywords if getattr(keyword, "value", None)
-        ]
+            topic_names = [topic.name for topic in topics if getattr(topic, "name", None)]
+            keyword_values = [
+                keyword.value for keyword in keywords if getattr(keyword, "value", None)
+            ]
 
-        embedding_text = self.text_preparation_service.build_paper_embedding_text(
-            title=title,
-            abstract=getattr(paper, "abstract", None),
-            topics=topic_names,
-            keywords=keyword_values,
-        )
-        text_hash = calculate_text_hash(embedding_text)
+            embedding_text = self.text_preparation_service.build_paper_embedding_text(
+                title=title,
+                abstract=getattr(paper, "abstract", None),
+                topics=topic_names,
+                keywords=keyword_values,
+            )
+            text_hash = calculate_text_hash(embedding_text)
 
-        if self._is_current_point_indexed(
-            request.paper_id,
-            text_hash,
-            request.force_reindex,
-        ):
-            return PaperIndexingResponseDTO(
+            if self._is_current_point_indexed(
+                request.paper_id,
+                text_hash,
+                request.force_reindex,
+            ):
+                self._mark_processing_indexed({request.paper_id: text_hash})
+                return PaperIndexingResponseDTO(
+                    paper_id=request.paper_id,
+                    status="indexed",
+                    message="Paper is already indexed; skipped",
+                )
+
+            self._mark_processing_started([request.paper_id])
+            embedding = self.embedding_adapter.embed_text(
+                embedding_text,
+                model=self.embedding_model,
+            )
+            if embedding is None or not embedding.vector:
+                raise EmbeddingGenerationError(
+                    "Embedding vector was not generated",
+                    details={"paper_id": request.paper_id},
+                )
+
+            authors = self.author_repository.list_by_paper(request.paper_id)
+            institution_payload = self._build_institution_payload(authors)
+            external_ids = self.paper_meta_source_repository.list_external_ids(
+                request.paper_id
+            )
+
+            payload = self.payload_builder.build_paper_payload(
+                paper,
+                text_hash=text_hash,
+                embedding_model=embedding.model or self.embedding_model,
+                topic_ids=[
+                    topic.id
+                    for topic in topics
+                    if getattr(topic, "id", None) is not None
+                ],
+                topic_names=topic_names,
+                keyword_ids=[
+                    keyword.id
+                    for keyword in keywords
+                    if getattr(keyword, "id", None) is not None
+                ],
+                keyword_values=keyword_values,
+                author_ids=[
+                    author.id
+                    for author in authors
+                    if getattr(author, "id", None) is not None
+                ],
+                author_names=[
+                    author.display_name
+                    for author in authors
+                    if getattr(author, "display_name", None)
+                ],
+                institution_ids=institution_payload["institution_ids"],
+                institution_names=institution_payload["institution_names"],
+                external_ids=external_ids,
+            )
+
+            self.qdrant_adapter.upsert_point(
+                self.collection_name,
+                request.paper_id,
+                embedding.vector,
+                payload,
+            )
+            self._mark_processing_indexed({request.paper_id: text_hash})
+            qdrant_indexed = True
+            self._enqueue_cluster_recompute(
                 paper_id=request.paper_id,
-                status="indexed",
-                message="Paper is already indexed; skipped",
+                topic_ids=payload.get("topic_ids", []),
+                keyword_ids=payload.get("keyword_ids", []),
+                text_hash=text_hash,
             )
-
-        embedding = self.embedding_adapter.embed_text(
-            embedding_text,
-            model=self.embedding_model,
-        )
-        if embedding is None or not embedding.vector:
-            raise EmbeddingGenerationError(
-                "Embedding vector was not generated",
-                details={"paper_id": request.paper_id},
-            )
-
-        authors = self.author_repository.list_by_paper(request.paper_id)
-        institution_payload = self._build_institution_payload(authors)
-        external_ids = self.paper_meta_source_repository.list_external_ids(
-            request.paper_id
-        )
-
-        payload = self.payload_builder.build_paper_payload(
-            paper,
-            text_hash=text_hash,
-            embedding_model=embedding.model or self.embedding_model,
-            topic_ids=[
-                topic.id
-                for topic in topics
-                if getattr(topic, "id", None) is not None
-            ],
-            topic_names=topic_names,
-            keyword_ids=[
-                keyword.id
-                for keyword in keywords
-                if getattr(keyword, "id", None) is not None
-            ],
-            keyword_values=keyword_values,
-            author_ids=[
-                author.id
-                for author in authors
-                if getattr(author, "id", None) is not None
-            ],
-            author_names=[
-                author.display_name
-                for author in authors
-                if getattr(author, "display_name", None)
-            ],
-            institution_ids=institution_payload["institution_ids"],
-            institution_names=institution_payload["institution_names"],
-            external_ids=external_ids,
-        )
-
-        self.qdrant_adapter.upsert_point(
-            self.collection_name,
-            request.paper_id,
-            embedding.vector,
-            payload,
-        )
-        self._enqueue_cluster_recompute(
-            paper_id=request.paper_id,
-            topic_ids=payload.get("topic_ids", []),
-            keyword_ids=payload.get("keyword_ids", []),
-            text_hash=text_hash,
-        )
+        except AppError as exc:
+            if not qdrant_indexed:
+                self._mark_processing_failed([request.paper_id], exc.message)
+            raise
 
         return PaperIndexingResponseDTO(
             paper_id=request.paper_id,
@@ -224,8 +241,8 @@ class PaperIndexingFacade:
         """Index all papers whose publication date falls within a period.
 
         Papers are loaded from PostgreSQL in pages and each page is processed
-        with batch embedding generation and Qdrant batch upsert. The method does
-        not mutate PostgreSQL data and does not commit the session.
+        with batch embedding generation and Qdrant batch upsert. The method also
+        updates paper processing state, but leaves commit boundaries to callers.
         """
         return self.index_batch(
             PaperBatchIndexingRequestDTO(
@@ -342,12 +359,14 @@ class PaperIndexingFacade:
         indexed_topic_ids: set[int] = set()
         indexed_keyword_ids: set[int] = set()
         indexed_text_hashes: dict[int, str] = {}
+        skipped_text_hashes: dict[int, str] = {}
 
         for paper in papers:
             paper_id = int(paper.id)
             try:
                 title = self._require_title(getattr(paper, "title", None), paper_id)
             except InvalidRequestError as exc:
+                self._mark_processing_failed([paper_id], exc.message)
                 result.failed += 1
                 result.errors.append(self._error_payload(exc, paper_id))
                 continue
@@ -371,6 +390,7 @@ class PaperIndexingFacade:
             text_hash = calculate_text_hash(embedding_text)
 
             if not force_reindex and existing_hashes.get(paper_id) == text_hash:
+                skipped_text_hashes[paper_id] = text_hash
                 result.skipped += 1
                 continue
 
@@ -391,13 +411,26 @@ class PaperIndexingFacade:
             )
 
         if not pending_records:
+            self._mark_processing_indexed(skipped_text_hashes)
             return result
 
-        embeddings = self.embedding_adapter.embed_batch(
-            [record["embedding_text"] for record in pending_records],
-            model=self.embedding_model,
-        )
+        self._mark_processing_started(record["paper_id"] for record in pending_records)
+        try:
+            embeddings = self.embedding_adapter.embed_batch(
+                [record["embedding_text"] for record in pending_records],
+                model=self.embedding_model,
+            )
+        except AppError as exc:
+            self._mark_processing_failed(
+                (record["paper_id"] for record in pending_records),
+                exc.message,
+            )
+            raise
         if len(embeddings) != len(pending_records):
+            self._mark_processing_failed(
+                (record["paper_id"] for record in pending_records),
+                "Embedding response length does not match batch size",
+            )
             raise EmbeddingGenerationError(
                 "Embedding response length does not match batch size",
                 details={
@@ -410,6 +443,10 @@ class PaperIndexingFacade:
         for record, embedding in zip(pending_records, embeddings, strict=True):
             paper_id = record["paper_id"]
             if embedding is None or not embedding.vector:
+                self._mark_processing_failed(
+                    [paper_id],
+                    "Embedding vector was not generated",
+                )
                 result.failed += 1
                 result.errors.append(
                     {
@@ -474,7 +511,15 @@ class PaperIndexingFacade:
             )
 
         if points:
-            self.qdrant_adapter.upsert_points(self.collection_name, points)
+            try:
+                self.qdrant_adapter.upsert_points(self.collection_name, points)
+            except AppError as exc:
+                self._mark_processing_failed(
+                    (int(point.id) for point in points),
+                    exc.message,
+                )
+                raise
+            self._mark_processing_indexed(indexed_text_hashes)
             result.updated += len(points)
             self._enqueue_cluster_recompute_batch(
                 paper_ids=[int(point.id) for point in points],
@@ -483,6 +528,7 @@ class PaperIndexingFacade:
                 text_hashes=indexed_text_hashes,
             )
 
+        self._mark_processing_indexed(skipped_text_hashes)
         return result
 
     def _existing_text_hashes(
@@ -492,12 +538,16 @@ class PaperIndexingFacade:
     ) -> dict[int, str]:
         if force_reindex or not paper_ids:
             return {}
+        result = self.processing_state_repository.get_indexed_text_hashes(paper_ids)
+        missing_ids = [paper_id for paper_id in paper_ids if paper_id not in result]
+        if not missing_ids:
+            return result
+
         points = self.qdrant_adapter.retrieve(
             self.collection_name,
-            paper_ids,
+            missing_ids,
             with_vectors=False,
         )
-        result: dict[int, str] = {}
         for point in points:
             try:
                 paper_id = int(point.id)
@@ -514,8 +564,16 @@ class PaperIndexingFacade:
         text_hash: str,
         force_reindex: bool,
     ) -> bool:
+        if force_reindex:
+            return False
+        indexed_hashes = self.processing_state_repository.get_indexed_text_hashes(
+            [paper_id]
+        )
+        if indexed_hashes.get(paper_id) == text_hash:
+            return True
+
         point_exists = self.qdrant_adapter.exists(self.collection_name, paper_id)
-        if force_reindex or not point_exists:
+        if not point_exists:
             return False
 
         points = self.qdrant_adapter.retrieve(
@@ -526,6 +584,19 @@ class PaperIndexingFacade:
         if not points:
             return False
         return points[0].payload.get("text_hash") == text_hash
+
+    def _mark_processing_started(self, paper_ids: Iterable[int]) -> None:
+        self.processing_state_repository.mark_indexing_started(paper_ids)
+
+    def _mark_processing_indexed(self, text_hashes_by_paper_id: dict[int, str]) -> None:
+        self.processing_state_repository.mark_indexed(text_hashes_by_paper_id)
+
+    def _mark_processing_failed(
+        self,
+        paper_ids: Iterable[int],
+        error_message: str,
+    ) -> None:
+        self.processing_state_repository.mark_failed(paper_ids, error_message)
 
     def _enqueue_cluster_recompute(
         self,

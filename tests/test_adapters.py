@@ -61,6 +61,19 @@ class FakeRedisClient:
             return None
         return queue_name, queue.pop(0)
 
+    def lpop(self, queue_name: str) -> str | None:
+        queue = self.queues.setdefault(queue_name, [])
+        if not queue:
+            return None
+        return queue.pop(0)
+
+    def lrange(self, queue_name: str, start: int, end: int) -> list[str]:
+        queue = self.queues.setdefault(queue_name, [])
+        return queue[start : end + 1]
+
+    def llen(self, queue_name: str) -> int:
+        return len(self.queues.setdefault(queue_name, []))
+
 
 def test_redis_adapter_json_queue_and_lock() -> None:
     client = FakeRedisClient()
@@ -70,6 +83,8 @@ def test_redis_adapter_json_queue_and_lock() -> None:
     adapter.enqueue("jobs", {"paper_id": 1})
 
     assert adapter.get_json("paper:1") == {"title": "A"}
+    assert adapter.peek_queue("jobs", limit=1) == [{"paper_id": 1}]
+    assert adapter.queue_length("jobs") == 1
     assert adapter.dequeue("jobs") == {"paper_id": 1}
     assert adapter.dequeue("jobs") is None
     assert adapter.acquire_lock("lock:1", ttl_seconds=10) is True
@@ -180,6 +195,26 @@ def test_qdrant_adapter_uses_client_without_hardcoded_collection() -> None:
     assert adapter.exists("papers", 1) is True
     assert adapter.retrieve("papers", [1], with_vectors=True)[0].vector == [0.1, 0.2, 0.3]
     assert adapter.search("papers", [0.1, 0.2, 0.3], top_k=1)[0].payload == {"paper_id": 1}
+
+
+def test_qdrant_adapter_maps_application_string_ids_to_uuid_points() -> None:
+    client = FakeQdrantClient()
+    adapter = QdrantAdapter(client)
+
+    adapter.upsert_point(
+        "trends",
+        "topic:10001",
+        [0.1, 0.2, 0.3],
+        {"cluster_id": "topic:10001"},
+    )
+
+    assert "topic:10001" not in client.points
+    retrieved = adapter.retrieve("trends", ["topic:10001"], with_vectors=True)
+    hits = adapter.search("trends", [0.1, 0.2, 0.3], top_k=1)
+
+    assert retrieved[0].id == "topic:10001"
+    assert retrieved[0].payload == {"cluster_id": "topic:10001"}
+    assert hits[0].id == "topic:10001"
 
 
 def test_qdrant_adapter_works_with_official_in_memory_client() -> None:
