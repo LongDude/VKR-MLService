@@ -13,6 +13,7 @@ from dto.common import BatchOperationResultDTO
 from dto.qdrant import QdrantPointDTO
 from dto.trends import ClusterChartsResponseDTO, TrendClusterDTO, TrendMetricsDTO
 from repositories.graph import PaperGraphRepository
+from repositories.research_clusters import ResearchClusterRepository
 from repositories.taxonomy import TaxonomyRepository
 
 from ml.constants import PAPERS_COLLECTION, TREND_CLUSTER_PERIODS_COLLECTION
@@ -43,6 +44,7 @@ class ClusterDynamicsFacade:
         taxonomy_repository: TaxonomyRepository,
         paper_graph_repository: PaperGraphRepository,
         qdrant_adapter: QdrantAdapter,
+        research_cluster_repository: ResearchClusterRepository | None = None,
         vector_math_service: VectorMathService | None = None,
         scoring_service: ScoringService | None = None,
         chart_builder_service: ChartBuilderService | None = None,
@@ -54,6 +56,7 @@ class ClusterDynamicsFacade:
         self.taxonomy_repository = taxonomy_repository
         self.paper_graph_repository = paper_graph_repository
         self.qdrant_adapter = qdrant_adapter
+        self.research_cluster_repository = research_cluster_repository
         self.vector_math_service = vector_math_service or VectorMathService()
         self.scoring_service = scoring_service or ScoringService()
         self.chart_builder_service = chart_builder_service or ChartBuilderService()
@@ -216,6 +219,35 @@ class ClusterDynamicsFacade:
                 centroid,
                 payload,
             )
+            if self.research_cluster_repository is not None:
+                self._emit(
+                    "db_cluster_period_upsert_started",
+                    entity_id=period_id,
+                    stage="db_upsert",
+                    message="Upserting cluster period row",
+                    payload={"cluster_id": cluster_id},
+                )
+                try:
+                    self.research_cluster_repository.upsert_period_from_payload(payload)
+                except Exception as exc:
+                    self._emit(
+                        "db_cluster_period_upsert_failed",
+                        entity_id=period_id,
+                        stage="db_upsert",
+                        message=str(exc),
+                        payload={
+                            "cluster_id": cluster_id,
+                            "error_type": exc.__class__.__name__,
+                        },
+                    )
+                    raise
+                self._emit(
+                    "db_cluster_period_upsert_completed",
+                    entity_id=period_id,
+                    stage="db_upsert",
+                    message="Cluster period row upserted",
+                    payload={"cluster_id": cluster_id},
+                )
             result.updated += 1
             self._emit(
                 "cluster_dynamics_progress",

@@ -154,6 +154,8 @@ class TqdmEventSink:
             "cluster_failed",
             "cluster_dynamics_completed",
             "cluster_dynamics_failed",
+            "cluster_db_sync_completed",
+            "cluster_db_sync_failed",
             "entity_indexing_completed",
             "entity_indexing_failed",
             "paper_batch_completed",

@@ -30,6 +30,7 @@ from core.exceptions import AppError
 from ml.constants import DEFAULT_EMBEDDING_MODEL
 from ml.facades import (
     ClusterAnalyticsFacade,
+    ClusterDbSyncFacade,
     ClusterDynamicsFacade,
     ResearchEntityIndexingFacade,
     SummaryFacade,
@@ -55,6 +56,7 @@ from repositories import (
     FavouriteRepository,
     PaperGraphRepository,
     PaperRepository,
+    ResearchClusterRepository,
     TaxonomyRepository,
     TrackedAreaRepository,
     UserRepository,
@@ -214,6 +216,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_common_connection_args(user_profile_parser)
     add_redis_connection_args(user_profile_parser)
 
+    sync_parser = subparsers.add_parser(
+        "sync-clusters-db",
+        help="Synchronize research cluster DB rows from Qdrant collections.",
+    )
+    sync_parser.add_argument(
+        "--scope",
+        choices=["all", "clusters", "periods"],
+        default="all",
+        help="Qdrant data to synchronize. Defaults to all.",
+    )
+    sync_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=256,
+        help="Qdrant scroll batch size. Defaults to 256.",
+    )
+    sync_parser.add_argument(
+        "--cluster-id",
+        default=None,
+        help="Limit sync to one cluster id, for example topic:120.",
+    )
+    sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate Qdrant payloads without writing to PostgreSQL or pruning.",
+    )
+    sync_parser.add_argument(
+        "--no-prune-missing",
+        action="store_true",
+        help="Do not delete DB rows missing from Qdrant.",
+    )
+    add_runtime_args(sync_parser, include_enqueue=False)
+    add_common_connection_args(sync_parser)
+    add_redis_connection_args(sync_parser)
+
     return parser.parse_args(argv)
 
 
@@ -232,6 +269,8 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_recompute_cluster_dynamics(args)
         elif args.command == "recompute-user-profile":
             payload = run_recompute_user_profile(args)
+        elif args.command == "sync-clusters-db":
+            payload = run_sync_clusters_db(args)
         else:
             raise AssertionError(f"Unhandled command: {args.command}")
     except AppError as exc:
@@ -344,6 +383,7 @@ def run_recompute_trends(args: argparse.Namespace) -> dict[str, Any]:
                 qdrant_adapter=qdrant_adapter,
                 redis_adapter=redis_adapter,
                 summary_facade=summary_facade,
+                research_cluster_repository=ResearchClusterRepository(session),
                 event_sink=event_sink,
             )
             result = facade.recompute_all_clusters(
@@ -353,6 +393,7 @@ def run_recompute_trends(args: argparse.Namespace) -> dict[str, Any]:
                 force_summary=args.force_summary,
                 batch_size=args.batch_size,
             )
+            session.commit()
         return {
             "command": "recompute-trends",
             "date_from": args.date_from,
@@ -399,6 +440,7 @@ def run_recompute_cluster_dynamics(args: argparse.Namespace) -> dict[str, Any]:
                 taxonomy_repository=TaxonomyRepository(session),
                 paper_graph_repository=PaperGraphRepository(session),
                 qdrant_adapter=qdrant_adapter,
+                research_cluster_repository=ResearchClusterRepository(session),
                 event_sink=event_sink,
             )
             cluster_ids = resolve_cluster_ids_for_dynamics(
@@ -415,6 +457,7 @@ def run_recompute_cluster_dynamics(args: argparse.Namespace) -> dict[str, Any]:
                 date_to=args.date_to,
                 granularity=args.granularity,
             )
+            session.commit()
         return {
             "command": "recompute-cluster-dynamics",
             "cluster_ids": cluster_ids,
@@ -493,6 +536,57 @@ def run_recompute_user_profile(args: argparse.Namespace) -> dict[str, Any]:
             "all_users": bool(args.all_users),
             "force": bool(args.force),
             "result": result,
+        }
+    finally:
+        engine.dispose()
+
+
+def run_sync_clusters_db(args: argparse.Namespace) -> dict[str, Any]:
+    """Synchronize research cluster read-model tables from Qdrant."""
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be a positive integer.")
+
+    database_url = args.database_url or Settings.from_env().database_url
+    engine = create_db_engine(database_url, echo=False)
+    SessionLocal = create_session_factory(engine, expire_on_commit=False)
+
+    try:
+        redis_adapter = (
+            RedisAdapter(build_redis_client(args)) if args.event_redis else None
+        )
+        event_sink = build_event_sink(args, redis_adapter=redis_adapter)
+        qdrant_adapter = build_qdrant_adapter(args)
+
+        with SessionLocal() as session:
+            facade = ClusterDbSyncFacade(
+                qdrant_adapter=qdrant_adapter,
+                research_cluster_repository=ResearchClusterRepository(session),
+                event_sink=event_sink,
+            )
+            common_kwargs = {
+                "batch_size": args.batch_size,
+                "cluster_id": args.cluster_id,
+                "prune_missing": not args.no_prune_missing,
+                "dry_run": bool(args.dry_run),
+            }
+            if args.scope == "clusters":
+                result = facade.sync_clusters_from_qdrant(**common_kwargs)
+            elif args.scope == "periods":
+                result = facade.sync_periods_from_qdrant(**common_kwargs)
+            else:
+                result = facade.sync_all(**common_kwargs)
+            if args.dry_run:
+                session.rollback()
+            else:
+                session.commit()
+
+        return {
+            "command": "sync-clusters-db",
+            "scope": args.scope,
+            "cluster_id": args.cluster_id,
+            "dry_run": bool(args.dry_run),
+            "prune_missing": not args.no_prune_missing,
+            "result": result.model_dump(mode="json"),
         }
     finally:
         engine.dispose()
@@ -754,13 +848,18 @@ def add_common_connection_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_runtime_args(parser: argparse.ArgumentParser) -> None:
+def add_runtime_args(
+    parser: argparse.ArgumentParser,
+    *,
+    include_enqueue: bool = True,
+) -> None:
     """Add shared execution mode, progress, and event arguments."""
-    parser.add_argument(
-        "--enqueue",
-        action="store_true",
-        help="Enqueue Redis task(s) for worker instead of running heavy ML work now.",
-    )
+    if include_enqueue:
+        parser.add_argument(
+            "--enqueue",
+            action="store_true",
+            help="Enqueue Redis task(s) for worker instead of running heavy ML work now.",
+        )
     parser.add_argument(
         "-v",
         "--verbose",

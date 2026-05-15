@@ -35,6 +35,7 @@ from ingestion.openalex_bootstrap.monthly_counts import MonthlyCount, MonthlyCou
 from cli.openalex import default_stats_redis_key, resolve_target_count
 from ml.constants import PAPERS_COLLECTION, TREND_CLUSTERS_COLLECTION
 from ml.facades.cluster_analytics import ClusterAnalyticsFacade
+from ml.facades.cluster_db_sync import ClusterDbSyncFacade
 from ml.services.events import CompositeEventSink, MLEvent, RedisEventSink
 from ml.workers.redis_worker import (
     CLUSTER_RECOMPUTE_QUEUE,
@@ -509,6 +510,31 @@ class FakeQdrantClient:
             )
         return result
 
+    def scroll(
+        self,
+        collection_name: str,
+        scroll_filter: dict[str, Any] | None = None,
+        limit: int = 10,
+        offset: int | None = None,
+        with_payload: bool = True,
+        with_vectors: bool = False,
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        items = list(self.points.items())
+        start = int(offset or 0)
+        page_items = items[start : start + limit]
+        next_offset = start + limit if start + limit < len(items) else None
+        return (
+            [
+                {
+                    "id": point_id,
+                    "payload": point["payload"] if with_payload else {},
+                    "vector": point["vector"] if with_vectors else None,
+                }
+                for point_id, point in page_items
+            ],
+            next_offset,
+        )
+
     def _get_value(self, value: Any, key: str) -> Any:
         if isinstance(value, dict):
             return value[key]
@@ -559,6 +585,19 @@ def test_qdrant_adapter_maps_application_string_ids_to_uuid_points() -> None:
     assert hits[0].id == "topic:10001"
 
 
+def test_qdrant_adapter_scroll_points_with_fake_client() -> None:
+    client = FakeQdrantClient()
+    adapter = QdrantAdapter(client)
+
+    adapter.upsert_point("trends", "topic:1", [0.1, 0.2, 0.3], {"cluster_key": "topic:1"})
+    adapter.upsert_point("trends", "topic:2", [0.2, 0.3, 0.4], {"cluster_key": "topic:2"})
+
+    points = adapter.scroll_points("trends", batch_size=1, with_vectors=False)
+
+    assert [point.id for point in points] == ["topic:1", "topic:2"]
+    assert points[0].payload == {"cluster_key": "topic:1"}
+
+
 def test_qdrant_adapter_works_with_official_in_memory_client() -> None:
     qdrant_client = pytest.importorskip("qdrant_client")
     client = qdrant_client.QdrantClient(":memory:")
@@ -579,6 +618,31 @@ def test_qdrant_adapter_works_with_official_in_memory_client() -> None:
     assert retrieved[0].payload == {"paper_id": 1}
     assert hits[0].id == 1
     assert hits[0].payload == {"paper_id": 1}
+
+
+def test_qdrant_adapter_scroll_points_restores_original_ids() -> None:
+    qdrant_client = pytest.importorskip("qdrant_client")
+    client = qdrant_client.QdrantClient(":memory:")
+    adapter = QdrantAdapter(client)
+
+    adapter.ensure_collection("clusters", vector_size=3)
+    adapter.upsert_point(
+        "clusters",
+        "topic:1",
+        [0.1, 0.2, 0.3],
+        {"cluster_key": "topic:1"},
+    )
+    adapter.upsert_point(
+        "clusters",
+        "topic:2",
+        [0.2, 0.3, 0.4],
+        {"cluster_key": "topic:2"},
+    )
+
+    points = adapter.scroll_points("clusters", batch_size=1, with_vectors=False)
+
+    assert {point.id for point in points} == {"topic:1", "topic:2"}
+    assert {point.payload["cluster_key"] for point in points} == {"topic:1", "topic:2"}
 
 
 class FakeClusterTaxonomyRepository:
@@ -667,9 +731,19 @@ class FakeSummaryFacade:
         return ClusterSummaryDTO(title=cluster_name, summary="summary")
 
 
+class FakeResearchClusterRepository:
+    def __init__(self) -> None:
+        self.cluster_payloads: list[dict[str, Any]] = []
+
+    def upsert_cluster_from_payload(self, payload: dict[str, Any]) -> tuple[Any, bool]:
+        self.cluster_payloads.append(payload)
+        return SimpleNamespace(id=1, cluster_key=payload["cluster_key"]), True
+
+
 def test_cluster_analytics_retrieves_qdrant_vectors_in_chunks() -> None:
     paper_ids = list(range(1, 452))
     qdrant_adapter = FakeClusterQdrantAdapter()
+    cluster_repository = FakeResearchClusterRepository()
     facade = ClusterAnalyticsFacade(
         taxonomy_repository=FakeClusterTaxonomyRepository(paper_ids),  # type: ignore[arg-type]
         paper_repository=FakeClusterPaperRepository(),  # type: ignore[arg-type]
@@ -677,6 +751,7 @@ def test_cluster_analytics_retrieves_qdrant_vectors_in_chunks() -> None:
         qdrant_adapter=qdrant_adapter,  # type: ignore[arg-type]
         redis_adapter=FakeClusterRedisAdapter(),  # type: ignore[arg-type]
         summary_facade=FakeSummaryFacade(),  # type: ignore[arg-type]
+        research_cluster_repository=cluster_repository,  # type: ignore[arg-type]
     )
 
     cluster = facade.recompute_cluster("topic:1")
@@ -690,6 +765,101 @@ def test_cluster_analytics_retrieves_qdrant_vectors_in_chunks() -> None:
     assert len(paper_retrieve_sizes) > 1
     assert max(paper_retrieve_sizes) <= 256
     assert qdrant_adapter.upserts[0][3]["indexed_paper_count"] == len(paper_ids)
+    assert cluster_repository.cluster_payloads[0]["cluster_key"] == "topic:1"
+
+
+class FakeSyncQdrantAdapter:
+    def __init__(self) -> None:
+        self.cluster_points = [
+            QdrantPointDTO(
+                id="topic:1",
+                vector=[],
+                payload={
+                    "cluster_key": "topic:1",
+                    "cluster_type": "topic",
+                    "name": "Topic 1",
+                    "trend_score": 0.5,
+                },
+            )
+        ]
+        self.period_points = [
+            QdrantPointDTO(
+                id="topic:1:month:2026-01-01",
+                vector=[],
+                payload={
+                    "cluster_id": "topic:1",
+                    "cluster_key": "topic:1",
+                    "cluster_name": "Topic 1",
+                    "period_start": "2026-01-01",
+                    "period_end": "2026-01-31",
+                    "paper_count": 10,
+                },
+            )
+        ]
+
+    def scroll_points(
+        self,
+        collection_name: str,
+        *,
+        batch_size: int = 256,
+        with_vectors: bool = False,
+        filters: dict[str, Any] | None = None,
+    ) -> list[QdrantPointDTO]:
+        if collection_name == TREND_CLUSTERS_COLLECTION:
+            return self.cluster_points
+        return self.period_points
+
+    def retrieve(
+        self,
+        collection_name: str,
+        point_ids: list[int | str],
+        with_vectors: bool = False,
+    ) -> list[QdrantPointDTO]:
+        return [point for point in self.cluster_points if point.id in point_ids]
+
+
+class FakeSyncClusterRepository:
+    def __init__(self) -> None:
+        self.clusters: set[str] = set()
+        self.periods: set[tuple[str, str, str]] = set()
+
+    def upsert_cluster_from_payload(self, payload: dict[str, Any]) -> tuple[Any, bool]:
+        cluster_key = str(payload["cluster_key"])
+        created = cluster_key not in self.clusters
+        self.clusters.add(cluster_key)
+        return SimpleNamespace(id=1, cluster_key=cluster_key), created
+
+    def upsert_period_from_payload(self, payload: dict[str, Any]) -> tuple[Any, bool]:
+        key = (
+            str(payload["cluster_key"]),
+            str(payload["period_start"]),
+            str(payload["period_end"]),
+        )
+        created = key not in self.periods
+        self.periods.add(key)
+        return SimpleNamespace(id=1), created
+
+    def delete_clusters_not_in_keys(self, cluster_keys: set[str]) -> int:
+        return 0
+
+    def delete_period_stats_not_in_keys(
+        self,
+        period_keys: set[tuple[str, date, date]],
+        *,
+        cluster_key: str | None = None,
+    ) -> int:
+        return 0
+
+
+def test_cluster_db_sync_facade_syncs_qdrant_payloads() -> None:
+    result = ClusterDbSyncFacade(
+        qdrant_adapter=FakeSyncQdrantAdapter(),  # type: ignore[arg-type]
+        research_cluster_repository=FakeSyncClusterRepository(),  # type: ignore[arg-type]
+    ).sync_all(batch_size=1, prune_missing=True)
+
+    assert result.success is True
+    assert result.details["created"] == 2
+    assert result.details["failed"] == 0
 
 
 def test_lmstudio_embedding_adapter_validates_response() -> None:

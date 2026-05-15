@@ -173,6 +173,45 @@ class QdrantAdapter:
                 collection_name=collection_name,
             ) from exc
 
+    def scroll_points(
+        self,
+        collection_name: str,
+        *,
+        batch_size: int = 256,
+        with_vectors: bool = False,
+        filters: dict[str, Any] | None = None,
+    ) -> list[QdrantPointDTO]:
+        """Read all points from a collection in pages without mutating Qdrant."""
+        if batch_size <= 0:
+            raise QdrantIndexError(
+                "Qdrant scroll batch size must be positive",
+                details={"collection_name": collection_name, "batch_size": batch_size},
+            )
+        try:
+            points: list[QdrantPointDTO] = []
+            offset: Any = None
+            while True:
+                result = self._client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=filters,
+                    limit=batch_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=with_vectors,
+                )
+                page, next_offset = self._scroll_result(result)
+                points.extend(self._to_point(point) for point in page)
+                if next_offset is None:
+                    break
+                offset = next_offset
+            return points
+        except Exception as exc:
+            raise self._error(
+                f"Failed to scroll Qdrant points from {collection_name!r}",
+                exc,
+                collection_name=collection_name,
+            ) from exc
+
     def exists(
         self,
         collection_name: str,
@@ -247,6 +286,17 @@ class QdrantAdapter:
             vector=self._get_attr(point, "vector", None) or [],
             payload=self._public_payload(raw_payload),
         )
+
+    def _scroll_result(self, result: Any) -> tuple[list[Any], Any]:
+        if isinstance(result, tuple) and len(result) == 2:
+            return list(result[0]), result[1]
+        points = getattr(result, "points", None)
+        next_offset = getattr(result, "next_page_offset", None)
+        if points is not None:
+            return list(points), next_offset
+        if isinstance(result, dict):
+            return list(result.get("points", [])), result.get("next_page_offset")
+        return list(result), None
 
     def _qdrant_point_id(self, point_id: int | str) -> int | str:
         """Convert application point ids to Qdrant-compatible ids.

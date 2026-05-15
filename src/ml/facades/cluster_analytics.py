@@ -14,6 +14,7 @@ from dto.qdrant import QdrantPointDTO
 from dto.trends import TrendClusterDTO, TrendMetricsDTO
 from repositories.graph import PaperGraphRepository
 from repositories.papers import PaperRepository
+from repositories.research_clusters import ResearchClusterRepository
 from repositories.taxonomy import TaxonomyRepository
 
 from ml.constants import PAPERS_COLLECTION, TREND_CLUSTERS_COLLECTION
@@ -26,7 +27,7 @@ from ml.services.events import EventSink, MLEvent, NoopEventSink
 
 
 ENTITY_PAGE_SIZE = 500
-QDRANT_VECTOR_RETRIEVE_BATCH_SIZE = 512
+QDRANT_VECTOR_RETRIEVE_BATCH_SIZE = 256
 PAPER_METADATA_BATCH_SIZE = 1000
 MIN_INDEXED_PAPERS_FOR_CLUSTER = 2
 REPRESENTATIVE_PAPER_LIMIT = 5
@@ -65,6 +66,7 @@ class ClusterAnalyticsFacade:
         qdrant_adapter: QdrantAdapter,
         redis_adapter: RedisAdapter,
         summary_facade: SummaryFacade,
+        research_cluster_repository: ResearchClusterRepository | None = None,
         vector_math_service: VectorMathService | None = None,
         scoring_service: ScoringService | None = None,
         trend_status_service: TrendStatusService | None = None,
@@ -79,6 +81,7 @@ class ClusterAnalyticsFacade:
         self.qdrant_adapter = qdrant_adapter
         self.redis_adapter = redis_adapter
         self.summary_facade = summary_facade
+        self.research_cluster_repository = research_cluster_repository
         self.vector_math_service = vector_math_service or VectorMathService()
         self.scoring_service = scoring_service or ScoringService()
         self.trend_status_service = trend_status_service or TrendStatusService()
@@ -324,6 +327,32 @@ class ClusterAnalyticsFacade:
                 message="Cluster point upserted",
                 payload={"collection": self.trend_clusters_collection},
             )
+            if self.research_cluster_repository is not None:
+                self._emit(
+                    "db_cluster_upsert_started",
+                    entity_id=cluster_id,
+                    stage="db_upsert",
+                    message="Upserting cluster row",
+                )
+                try:
+                    self.research_cluster_repository.upsert_cluster_from_payload(
+                        payload
+                    )
+                except Exception as exc:
+                    self._emit(
+                        "db_cluster_upsert_failed",
+                        entity_id=cluster_id,
+                        stage="db_upsert",
+                        message=str(exc),
+                        payload={"error_type": exc.__class__.__name__},
+                    )
+                    raise
+                self._emit(
+                    "db_cluster_upsert_completed",
+                    entity_id=cluster_id,
+                    stage="db_upsert",
+                    message="Cluster row upserted",
+                )
             self._cache_cluster(trend_cluster)
             self._emit(
                 "cluster_completed",

@@ -9,6 +9,7 @@ from .landings import LandingRepository
 from .paper_meta_sources import PaperMetaSourceRepository
 from .paper_processing_states import PaperProcessingStateRepository
 from .papers import PaperRepository
+from .research_clusters import ResearchClusterRepository
 from .taxonomy import TaxonomyRepository
 from .tracked_areas import TrackedAreaRepository
 from .users import UserRepository
@@ -23,6 +24,7 @@ __all__ = [
     "PaperMetaSourceRepository",
     "PaperProcessingStateRepository",
     "PaperRepository",
+    "ResearchClusterRepository",
     "TaxonomyRepository",
     "TrackedAreaRepository",
     "UserRepository",

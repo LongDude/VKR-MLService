@@ -67,6 +67,7 @@ from repositories import (
     PaperGraphRepository,
     PaperMetaSourceRepository,
     PaperRepository,
+    ResearchClusterRepository,
     TaxonomyRepository,
     TrackedAreaRepository,
 )
@@ -355,6 +356,7 @@ def build_task_handler(
     taxonomy_repository = TaxonomyRepository(session)
     paper_repository = PaperRepository(session)
     paper_graph_repository = PaperGraphRepository(session)
+    research_cluster_repository = ResearchClusterRepository(session)
     summary_facade = SummaryFacade(chat_adapter=chat_adapter)
 
     paper_indexing_pipeline = PaperIndexingPipeline(
@@ -389,6 +391,7 @@ def build_task_handler(
             qdrant_adapter=qdrant_adapter,
             redis_adapter=redis_adapter,
             summary_facade=summary_facade,
+            research_cluster_repository=research_cluster_repository,
             event_sink=event_sink,
         )
     )
@@ -397,6 +400,7 @@ def build_task_handler(
             taxonomy_repository=taxonomy_repository,
             paper_graph_repository=paper_graph_repository,
             qdrant_adapter=qdrant_adapter,
+            research_cluster_repository=research_cluster_repository,
             event_sink=event_sink,
         )
     )
