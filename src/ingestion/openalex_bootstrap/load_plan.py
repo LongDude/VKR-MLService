@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from math import ceil, floor
 
 from core.exceptions import InvalidRequestError
+from adapters.redis_adapter import RedisAdapter
 from ingestion.openalex_bootstrap.dto import (
     NormalizeMode,
     OpenAlexBootstrapRequestDTO,
@@ -32,9 +33,11 @@ class OpenAlexLoadPlanBuilder:
         self,
         *,
         monthly_counts_loader: MonthlyCountsLoader | None = None,
+        redis_adapter: RedisAdapter | None = None,
         max_sample_size: int = OPENALEX_MAX_SAMPLE,
     ) -> None:
         self.monthly_counts_loader = monthly_counts_loader or MonthlyCountsLoader()
+        self.redis_adapter = redis_adapter
         self.max_sample_size = max_sample_size
 
     def build(
@@ -100,23 +103,49 @@ class OpenAlexLoadPlanBuilder:
                 )
             ]
 
-        if not request.monthly_counts_csv:
-            raise InvalidRequestError(
-                "monthly_counts_csv is required for normalized OpenAlex bootstrap",
-                details={"normalize": request.normalize},
+        months: list[MonthlyCount]
+        if request.monthly_stats_source == "redis":
+            if self.redis_adapter is None:
+                raise InvalidRequestError(
+                    "Redis connection is required for normalized OpenAlex bootstrap",
+                    details={"normalize": request.normalize},
+                )
+            if not request.monthly_counts_redis_key:
+                raise InvalidRequestError(
+                    "monthly_counts_redis_key is required for Redis monthly stats",
+                    details={"normalize": request.normalize},
+                )
+            months = self.monthly_counts_loader.load_from_redis(
+                self.redis_adapter,
+                request.monthly_counts_redis_key,
+                date_from=request.date_from,
+                date_to=request.date_to,
             )
-        months = self.monthly_counts_loader.load(
-            request.monthly_counts_csv,
-            date_from=request.date_from,
-            date_to=request.date_to,
-        )
+        elif request.monthly_stats_source == "csv":
+            if not request.monthly_counts_csv:
+                raise InvalidRequestError(
+                    "monthly_counts_csv is required for normalized OpenAlex bootstrap",
+                    details={"normalize": request.normalize},
+                )
+            months = self.monthly_counts_loader.load(
+                request.monthly_counts_csv,
+                date_from=request.date_from,
+                date_to=request.date_to,
+            )
+        else:
+            raise InvalidRequestError(
+                "Unsupported monthly stats source",
+                details={"source": request.monthly_stats_source},
+            )
         if not months:
             raise InvalidRequestError(
                 "No monthly count rows overlap the requested date range",
                 details={
                     "date_from": request.date_from,
                     "date_to": request.date_to,
+                    "monthly_stats_source": request.monthly_stats_source,
                     "monthly_counts_csv": request.monthly_counts_csv,
+                    "monthly_counts_redis_key": request.monthly_counts_redis_key,
                 },
             )
         if request.normalize == "month":

@@ -22,7 +22,11 @@ from adapters import QdrantAdapter, RedisAdapter
 from core.config import Settings
 from core.exceptions import AppError
 from ml.constants import PAPERS_COLLECTION
-from ml.workers.redis_worker import FAILED_TASKS_QUEUE, PAPER_INDEXING_QUEUE
+from ml.workers.redis_worker import (
+    CLUSTER_RECOMPUTE_QUEUE,
+    FAILED_TASKS_QUEUE,
+    PAPER_INDEXING_QUEUE,
+)
 from models.session import create_db_engine, create_session_factory
 from repositories import PaperRepository
 
@@ -223,6 +227,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Maximum failed wrappers to inspect/process. Defaults to 1000.",
     )
     restore_parser.add_argument(
+        "--split-paper-indexing-batch-size",
+        "--split-batch-size",
+        dest="split_paper_indexing_batch_size",
+        type=int,
+        default=128,
+        help=(
+            "Maximum paper_ids per restored paper_indexing task. "
+            "Defaults to 128."
+        ),
+    )
+    restore_parser.add_argument(
+        "--no-split-paper-indexing",
+        action="store_true",
+        help="Restore paper_indexing messages exactly as stored in failed queue.",
+    )
+    restore_parser.add_argument(
+        "--split-cluster-recompute-batch-size",
+        "--split-cluster-batch-size",
+        dest="split_cluster_recompute_batch_size",
+        type=int,
+        default=50,
+        help=(
+            "Maximum topic_ids per restored cluster recompute task. "
+            "Defaults to 50."
+        ),
+    )
+    restore_parser.add_argument(
+        "--no-split-cluster-recompute",
+        action="store_true",
+        help="Restore cluster recompute messages exactly as stored in failed queue.",
+    )
+    restore_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Preview what would be restored without modifying Redis.",
@@ -330,10 +366,18 @@ class FailedTaskRestorer:
         target_queue: str | None = None,
         task_type: str | None = None,
         dry_run: bool = False,
+        split_paper_indexing: bool = True,
+        split_paper_indexing_batch_size: int = 128,
+        split_cluster_recompute: bool = True,
+        split_cluster_recompute_batch_size: int = 50,
     ) -> dict[str, Any]:
         """Restore failed tasks and return operation counters."""
         if limit <= 0:
             raise ValueError("--limit must be a positive integer.")
+        if split_paper_indexing and split_paper_indexing_batch_size <= 0:
+            raise ValueError("--split-paper-indexing-batch-size must be positive.")
+        if split_cluster_recompute and split_cluster_recompute_batch_size <= 0:
+            raise ValueError("--split-cluster-recompute-batch-size must be positive.")
 
         if dry_run:
             wrappers = self.redis_adapter.peek_queue(self.failed_queue, limit)
@@ -341,12 +385,18 @@ class FailedTaskRestorer:
                 wrappers,
                 target_queue=target_queue,
                 task_type=task_type,
+                split_paper_indexing=split_paper_indexing,
+                split_paper_indexing_batch_size=split_paper_indexing_batch_size,
+                split_cluster_recompute=split_cluster_recompute,
+                split_cluster_recompute_batch_size=split_cluster_recompute_batch_size,
             )
 
         restored = 0
+        processed_failed_wrappers = 0
         skipped = 0
         invalid = 0
         restored_by_queue: dict[str, int] = {}
+        restored_chunk_sizes: list[int] = []
         skipped_samples: list[dict[str, Any]] = []
         invalid_samples: list[dict[str, Any]] = []
 
@@ -371,23 +421,50 @@ class FailedTaskRestorer:
                 self.redis_adapter.enqueue(self.failed_queue, wrapper)
                 continue
 
+            messages = self._restore_messages(
+                message,
+                split_paper_indexing=split_paper_indexing,
+                split_paper_indexing_batch_size=split_paper_indexing_batch_size,
+                split_cluster_recompute=split_cluster_recompute,
+                split_cluster_recompute_batch_size=split_cluster_recompute_batch_size,
+            )
             try:
-                self.redis_adapter.enqueue(queue_name, message)
+                for restore_message in messages:
+                    self.redis_adapter.enqueue(queue_name, restore_message)
             except Exception:
                 self.redis_adapter.enqueue(self.failed_queue, wrapper)
                 raise
 
-            restored += 1
-            restored_by_queue[queue_name] = restored_by_queue.get(queue_name, 0) + 1
+            processed_failed_wrappers += 1
+            restored += len(messages)
+            restored_by_queue[queue_name] = (
+                restored_by_queue.get(queue_name, 0) + len(messages)
+            )
+            restored_chunk_sizes.extend(
+                self._message_chunk_size(restore_message)
+                for restore_message in messages
+            )
 
         return {
             "failed_queue": self.failed_queue,
             "dry_run": False,
             "limit": limit,
+            "processed_failed_wrappers": processed_failed_wrappers,
             "restored": restored,
             "skipped": skipped,
             "invalid": invalid,
             "restored_by_queue": restored_by_queue,
+            "sample_chunk_sizes": restored_chunk_sizes[:20],
+            "split_paper_indexing": split_paper_indexing,
+            "split_paper_indexing_batch_size": (
+                split_paper_indexing_batch_size if split_paper_indexing else None
+            ),
+            "split_cluster_recompute": split_cluster_recompute,
+            "split_cluster_recompute_batch_size": (
+                split_cluster_recompute_batch_size
+                if split_cluster_recompute
+                else None
+            ),
             "skipped_samples": skipped_samples[:20],
             "invalid_samples": invalid_samples[:20],
         }
@@ -398,11 +475,17 @@ class FailedTaskRestorer:
         *,
         target_queue: str | None,
         task_type: str | None,
+        split_paper_indexing: bool,
+        split_paper_indexing_batch_size: int,
+        split_cluster_recompute: bool,
+        split_cluster_recompute_batch_size: int,
     ) -> dict[str, Any]:
         restorable = 0
+        output_messages = 0
         skipped = 0
         invalid = 0
         by_queue: dict[str, int] = {}
+        chunk_sizes: list[int] = []
         samples: list[dict[str, Any]] = []
 
         for wrapper in wrappers:
@@ -418,12 +501,29 @@ class FailedTaskRestorer:
                 skipped += 1
                 continue
             restorable += 1
-            by_queue[queue_name] = by_queue.get(queue_name, 0) + 1
+            messages = self._restore_messages(
+                message,
+                split_paper_indexing=split_paper_indexing,
+                split_paper_indexing_batch_size=split_paper_indexing_batch_size,
+                split_cluster_recompute=split_cluster_recompute,
+                split_cluster_recompute_batch_size=split_cluster_recompute_batch_size,
+            )
+            output_messages += len(messages)
+            by_queue[queue_name] = by_queue.get(queue_name, 0) + len(messages)
+            chunk_sizes.extend(
+                self._message_chunk_size(restore_message)
+                for restore_message in messages
+            )
             samples.append(
                 {
                     "target_queue": queue_name,
                     "task_type": message.get("task_type"),
-                    "message": message,
+                    "output_messages": len(messages),
+                    "chunk_sizes": [
+                        self._message_chunk_size(restore_message)
+                        for restore_message in messages[:20]
+                    ],
+                    "message": messages[0] if len(messages) == 1 else None,
                 }
             )
 
@@ -432,9 +532,21 @@ class FailedTaskRestorer:
             "dry_run": True,
             "inspected": len(wrappers),
             "restorable": restorable,
+            "output_messages": output_messages,
             "skipped": skipped,
             "invalid": invalid,
             "restorable_by_queue": by_queue,
+            "sample_chunk_sizes": chunk_sizes[:20],
+            "split_paper_indexing": split_paper_indexing,
+            "split_paper_indexing_batch_size": (
+                split_paper_indexing_batch_size if split_paper_indexing else None
+            ),
+            "split_cluster_recompute": split_cluster_recompute,
+            "split_cluster_recompute_batch_size": (
+                split_cluster_recompute_batch_size
+                if split_cluster_recompute
+                else None
+            ),
             "samples": samples[:20],
         }
 
@@ -452,6 +564,61 @@ class FailedTaskRestorer:
         if not isinstance(queue_name, str) or not queue_name.startswith("queue:"):
             return None
         return queue_name, message
+
+    def _restore_messages(
+        self,
+        message: dict[str, Any],
+        *,
+        split_paper_indexing: bool,
+        split_paper_indexing_batch_size: int,
+        split_cluster_recompute: bool,
+        split_cluster_recompute_batch_size: int,
+    ) -> list[dict[str, Any]]:
+        if split_paper_indexing and message.get("task_type") == "paper_indexing":
+            paper_ids = message.get("paper_ids")
+            if (
+                isinstance(paper_ids, list)
+                and len(paper_ids) > split_paper_indexing_batch_size
+            ):
+                force_reindex = bool(message.get("force_reindex", False))
+                return [
+                    {
+                        "task_type": "paper_indexing",
+                        "paper_ids": chunk,
+                        "force_reindex": force_reindex,
+                    }
+                    for chunk in chunked(paper_ids, split_paper_indexing_batch_size)
+                ]
+
+        if (
+            split_cluster_recompute
+            and message.get("task_type") in {"cluster_recompute", "recompute_topic_clusters"}
+        ):
+            topic_ids = message.get("topic_ids")
+            if (
+                isinstance(topic_ids, list)
+                and len(topic_ids) > split_cluster_recompute_batch_size
+            ):
+                force_summary = bool(message.get("force_summary", False))
+                return [
+                    {
+                        "task_type": "recompute_topic_clusters",
+                        "topic_ids": chunk,
+                        "force_summary": force_summary,
+                    }
+                    for chunk in chunked(topic_ids, split_cluster_recompute_batch_size)
+                ]
+
+        return [message]
+
+    def _message_chunk_size(self, message: dict[str, Any]) -> int:
+        paper_ids = message.get("paper_ids")
+        if isinstance(paper_ids, list):
+            return len(paper_ids)
+        topic_ids = message.get("topic_ids")
+        if isinstance(topic_ids, list):
+            return len(topic_ids)
+        return 1
 
     def _sample(self, wrapper: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -476,6 +643,10 @@ def run_restore_failed(args: argparse.Namespace) -> dict[str, Any]:
         target_queue=args.target_queue,
         task_type=args.task_type,
         dry_run=args.dry_run,
+        split_paper_indexing=not args.no_split_paper_indexing,
+        split_paper_indexing_batch_size=args.split_paper_indexing_batch_size,
+        split_cluster_recompute=not args.no_split_cluster_recompute,
+        split_cluster_recompute_batch_size=args.split_cluster_recompute_batch_size,
     )
 
     return {

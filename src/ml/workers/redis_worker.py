@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import nullcontext
 import logging
 import time
 from typing import Any, Sequence
+
+from tqdm.auto import tqdm
 
 from adapters.redis_adapter import RedisAdapter
 from core.exceptions import AppError
@@ -34,9 +37,11 @@ class RedisMLWorker:
         task_handler: MLTaskHandler,
         queues: Sequence[str] = DEFAULT_QUEUE_ORDER,
         batch_sizes: dict[str, int] | None = None,
+        max_task_sizes: dict[str, int] | None = None,
         failed_queue: str = FAILED_TASKS_QUEUE,
         dequeue_timeout_seconds: int = 1,
         idle_sleep_seconds: float = 1.0,
+        show_progress: bool = False,
         logger: logging.Logger | None = None,
     ) -> None:
         self.redis_adapter = redis_adapter
@@ -46,9 +51,14 @@ class RedisMLWorker:
             queue_name: max(1, int(batch_size))
             for queue_name, batch_size in (batch_sizes or {}).items()
         }
+        self.max_task_sizes = {
+            queue_name: max(1, int(task_size))
+            for queue_name, task_size in (max_task_sizes or {}).items()
+        }
         self.failed_queue = failed_queue
         self.dequeue_timeout_seconds = dequeue_timeout_seconds
         self.idle_sleep_seconds = idle_sleep_seconds
+        self.show_progress = show_progress
         self.logger = logger or logging.getLogger(__name__)
         self._stop_requested = False
         self.last_processed_message_count = 0
@@ -88,7 +98,11 @@ class RedisMLWorker:
             )
             self.last_processed_message_count = len(messages)
             for task_message in self._coalesce_messages(queue_name, messages):
-                self._handle_task_message(queue_name, task_message)
+                for executable_message in self._split_oversized_message(
+                    queue_name,
+                    task_message,
+                ):
+                    self._handle_task_message(queue_name, executable_message)
             return True
 
         return False
@@ -201,10 +215,98 @@ class RedisMLWorker:
         queue_name: str,
         message: dict[str, Any],
     ) -> None:
+        task_summary = self._task_summary(queue_name, message)
+        self.logger.info(
+            "Starting ML task queue=%s task_type=%s item_count=%s item_field=%s",
+            task_summary["queue_name"],
+            task_summary["task_type"],
+            task_summary["item_count"],
+            task_summary["item_field"],
+            extra=task_summary,
+        )
+        started_at = time.monotonic()
+        progress_context = self._progress_context(task_summary)
         try:
-            self.task_handler.handle(message)
+            with progress_context as progress:
+                self.task_handler.handle(message)
+                if progress is not None:
+                    progress.update(task_summary["item_count"])
         except Exception as exc:
             self._handle_task_error(queue_name, message, exc)
+        else:
+            self.logger.info(
+                "ML task completed queue=%s task_type=%s item_count=%s elapsed_seconds=%s",
+                task_summary["queue_name"],
+                task_summary["task_type"],
+                task_summary["item_count"],
+                round(time.monotonic() - started_at, 3),
+                extra={
+                    **task_summary,
+                    "elapsed_seconds": round(time.monotonic() - started_at, 3),
+                },
+            )
+
+    def _split_oversized_message(
+        self,
+        queue_name: str,
+        message: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if queue_name == PAPER_INDEXING_QUEUE:
+            return self._split_oversized_paper_indexing_message(queue_name, message)
+        if queue_name == CLUSTER_RECOMPUTE_QUEUE:
+            return self._split_oversized_cluster_recompute_message(queue_name, message)
+        return [message]
+
+    def _split_oversized_paper_indexing_message(
+        self,
+        queue_name: str,
+        message: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if message.get("task_type") != "paper_indexing":
+            return [message]
+        max_task_size = self.max_task_sizes.get(queue_name)
+        if max_task_size is None:
+            return [message]
+
+        paper_ids = self._paper_ids_from_message(message)
+        if len(paper_ids) <= max_task_size:
+            return [message]
+
+        force_reindex = bool(message.get("force_reindex", False))
+        return [
+            {
+                "task_type": "paper_indexing",
+                "paper_ids": paper_ids[index : index + max_task_size],
+                "force_reindex": force_reindex,
+            }
+            for index in range(0, len(paper_ids), max_task_size)
+        ]
+
+    def _split_oversized_cluster_recompute_message(
+        self,
+        queue_name: str,
+        message: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if message.get("task_type") not in {"cluster_recompute", "recompute_topic_clusters"}:
+            return [message]
+
+        max_task_size = self.max_task_sizes.get(queue_name)
+        if max_task_size is None:
+            return [message]
+
+        topic_ids = self._topic_ids_from_message(message)
+        if len(topic_ids) <= max_task_size:
+            return [message]
+
+        force_summary = bool(message.get("force_summary", False))
+        return [
+            {
+                "task_type": "recompute_topic_clusters",
+                "topic_ids": topic_ids[index : index + max_task_size],
+                "force_summary": force_summary,
+            }
+            for index in range(0, len(topic_ids), max_task_size)
+        ]
 
     def _is_simple_paper_indexing_message(self, message: dict[str, Any]) -> bool:
         if message.get("task_type") != "paper_indexing":
@@ -267,6 +369,62 @@ class RedisMLWorker:
             except (TypeError, ValueError):
                 return []
         return topic_ids
+
+    def _task_summary(
+        self,
+        queue_name: str,
+        message: dict[str, Any],
+    ) -> dict[str, Any]:
+        task_type = str(message.get("task_type") or "unknown")
+        item_field = None
+        item_count = 1
+
+        paper_ids = self._paper_ids_from_message(message)
+        if paper_ids:
+            item_field = "paper_ids"
+            item_count = len(paper_ids)
+
+        topic_ids = self._topic_ids_from_message(message)
+        if topic_ids:
+            item_field = "topic_ids"
+            item_count = len(topic_ids)
+
+        if "cluster_id" in message:
+            item_field = "cluster_id"
+        elif "user_id" in message:
+            item_field = "user_id"
+        elif "limit" in message and item_field is None:
+            item_field = "limit"
+
+        return {
+            "queue_name": queue_name,
+            "task_type": task_type,
+            "item_field": item_field,
+            "item_count": item_count,
+            "task_message": self._safe_message_summary(message),
+        }
+
+    def _progress_context(self, task_summary: dict[str, Any]):
+        if not self.show_progress:
+            return nullcontext(None)
+        return tqdm(
+            total=int(task_summary["item_count"]),
+            desc=f"{task_summary['task_type']} [{task_summary['queue_name']}]",
+            unit="item",
+            leave=False,
+        )
+
+    def _safe_message_summary(self, message: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        for key, value in message.items():
+            if isinstance(value, list):
+                summary[key] = {
+                    "count": len(value),
+                    "sample": value[:5],
+                }
+            else:
+                summary[key] = value
+        return summary
 
     def _handle_task_error(
         self,

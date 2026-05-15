@@ -27,10 +27,18 @@ class RedisAdapter:
                 details={"key": key, "reason": str(exc)},
             ) from exc
 
-    def set_json(self, key: str, value: dict[str, Any], ttl_seconds: int) -> None:
+    def set_json(
+        self,
+        key: str,
+        value: dict[str, Any],
+        ttl_seconds: int | None = None,
+    ) -> None:
         try:
             payload = json.dumps(value, ensure_ascii=False)
-            self._client.set(key, payload, ex=ttl_seconds)
+            if ttl_seconds is None:
+                self._client.set(key, payload)
+            else:
+                self._client.set(key, payload, ex=ttl_seconds)
         except Exception as exc:
             raise RedisOperationError(
                 f"Failed to write JSON value to Redis key {key!r}",

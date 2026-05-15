@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -24,12 +25,31 @@ from ml.services.vector_math import VectorMathService
 
 
 ENTITY_PAGE_SIZE = 500
+QDRANT_VECTOR_RETRIEVE_BATCH_SIZE = 256
+PAPER_METADATA_BATCH_SIZE = 1000
 MIN_INDEXED_PAPERS_FOR_CLUSTER = 2
 REPRESENTATIVE_PAPER_LIMIT = 5
+REPRESENTATIVE_CANDIDATE_LIMIT = 2000
 TOP_KEYWORD_LIMIT = 10
 CLUSTER_CACHE_INDEX_KEY = "ml:trend_clusters:index"
 CLUSTER_CACHE_KEY_PREFIX = "ml:trend_cluster:"
 CLUSTER_CACHE_TTL_SECONDS = 24 * 60 * 60
+
+
+@dataclass
+class _ClusterVectorData:
+    centroid: list[float]
+    indexed_paper_count: int
+    representative_candidates: list[QdrantPointDTO]
+    top_keywords: list[str]
+
+
+@dataclass
+class _PaperMetadata:
+    paper_dates: list[date]
+    citation_count_sum: int
+    avg_cited_by_count: Decimal | None
+    representative_paper_by_id: dict[int, Any]
 
 
 class ClusterAnalyticsFacade:
@@ -131,39 +151,34 @@ class ClusterAnalyticsFacade:
             )
 
         paper_ids = self.taxonomy_repository.list_paper_ids_by_topic(topic_id)
-        points = self.qdrant_adapter.retrieve(
-            self.papers_collection,
-            paper_ids,
-            with_vectors=True,
-        )
-        indexed_points = self._indexed_points(points)
-        if len(indexed_points) < MIN_INDEXED_PAPERS_FOR_CLUSTER:
+        vector_data = self._cluster_vector_data(paper_ids)
+        if vector_data.indexed_paper_count < MIN_INDEXED_PAPERS_FOR_CLUSTER:
             raise InvalidRequestError(
                 "Topic has fewer than two indexed papers",
                 details={
                     "cluster_id": cluster_id,
                     "topic_id": topic_id,
-                    "indexed_paper_count": len(indexed_points),
+                    "indexed_paper_count": vector_data.indexed_paper_count,
                     "reason": "insufficient_indexed_papers",
                 },
             )
 
-        vectors = [point.vector for point in indexed_points]
-        centroid = self.vector_math_service.mean_vector(vectors)
-        papers = self.paper_repository.get_by_ids(paper_ids)
-        paper_by_id = {int(getattr(paper, "id")): paper for paper in papers}
-        paper_dates = self._paper_dates(papers)
-
-        metrics_payload = self._calculate_metrics(paper_dates)
+        centroid = vector_data.centroid
         representative_paper_ids = self._representative_paper_ids(
-            indexed_points,
+            vector_data.representative_candidates,
             centroid,
         )
-        top_keywords = self._top_keywords(indexed_points)
-        representative_titles = self._paper_titles(representative_paper_ids, paper_by_id)
+        paper_metadata = self._paper_metadata(paper_ids, representative_paper_ids)
+
+        metrics_payload = self._calculate_metrics(paper_metadata.paper_dates)
+        top_keywords = vector_data.top_keywords
+        representative_titles = self._paper_titles(
+            representative_paper_ids,
+            paper_metadata.representative_paper_by_id,
+        )
         representative_abstracts = self._paper_abstracts(
             representative_paper_ids,
-            paper_by_id,
+            paper_metadata.representative_paper_by_id,
         )
 
         existing_cluster = self.get_cluster(cluster_id)
@@ -192,8 +207,8 @@ class ClusterAnalyticsFacade:
                 previous_paper_count=metrics_payload["previous_90d_count"],
                 growth_rate=self._decimal(metrics_payload["growth_rate_90d"]),
                 trend_score=self._decimal(metrics_payload["trend_score"]),
-                citation_count_sum=self._citation_count_sum(papers),
-                avg_cited_by_count=self._avg_cited_by_count(papers),
+                citation_count_sum=paper_metadata.citation_count_sum,
+                avg_cited_by_count=paper_metadata.avg_cited_by_count,
             ),
             top_keywords=top_keywords,
             representative_paper_ids=representative_paper_ids,
@@ -203,6 +218,9 @@ class ClusterAnalyticsFacade:
             trend_cluster,
             cluster_id=cluster_id,
             **metrics_payload,
+            indexed_paper_count=vector_data.indexed_paper_count,
+            vector_retrieve_batch_size=QDRANT_VECTOR_RETRIEVE_BATCH_SIZE,
+            representative_candidate_count=len(vector_data.representative_candidates),
             summary_degraded=summary_degraded,
             indexed_at=datetime.now(timezone.utc),
         )
@@ -294,6 +312,72 @@ class ClusterAnalyticsFacade:
                 break
             offset += page_limit
 
+    def _cluster_vector_data(self, paper_ids: list[int]) -> _ClusterVectorData:
+        mean_vector: list[float] | None = None
+        indexed_paper_count = 0
+        representative_candidates: list[QdrantPointDTO] = []
+        keyword_counter: Counter[str] = Counter()
+
+        for chunk in self._chunks(paper_ids, QDRANT_VECTOR_RETRIEVE_BATCH_SIZE):
+            points = self.qdrant_adapter.retrieve(
+                self.papers_collection,
+                chunk,
+                with_vectors=True,
+            )
+            for point in self._indexed_points(points):
+                mean_vector, indexed_paper_count = (
+                    self.vector_math_service.update_mean_vector(
+                        mean_vector,
+                        indexed_paper_count,
+                        point.vector,
+                    )
+                )
+                if len(representative_candidates) < REPRESENTATIVE_CANDIDATE_LIMIT:
+                    representative_candidates.append(point)
+                self._add_payload_keywords(keyword_counter, point)
+
+        return _ClusterVectorData(
+            centroid=mean_vector or [],
+            indexed_paper_count=indexed_paper_count,
+            representative_candidates=representative_candidates,
+            top_keywords=[
+                keyword
+                for keyword, _ in keyword_counter.most_common(TOP_KEYWORD_LIMIT)
+            ],
+        )
+
+    def _paper_metadata(
+        self,
+        paper_ids: list[int],
+        representative_paper_ids: list[int],
+    ) -> _PaperMetadata:
+        paper_dates: list[date] = []
+        citation_count_sum = 0
+        paper_count = 0
+        representative_id_set = set(representative_paper_ids)
+        representative_paper_by_id: dict[int, Any] = {}
+
+        for chunk in self._chunks(paper_ids, PAPER_METADATA_BATCH_SIZE):
+            for paper in self.paper_repository.get_by_ids(chunk):
+                paper_count += 1
+                paper_id = getattr(paper, "id", None)
+                if paper_id in representative_id_set:
+                    representative_paper_by_id[int(paper_id)] = paper
+                citation_count_sum += int(getattr(paper, "cited_by_count", 0) or 0)
+                paper_dates.extend(self._paper_dates([paper]))
+
+        avg_cited_by_count = (
+            self._decimal(citation_count_sum / paper_count)
+            if paper_count
+            else None
+        )
+        return _PaperMetadata(
+            paper_dates=paper_dates,
+            citation_count_sum=citation_count_sum,
+            avg_cited_by_count=avg_cited_by_count,
+            representative_paper_by_id=representative_paper_by_id,
+        )
+
     def _calculate_metrics(self, paper_dates: list[date]) -> dict[str, Any]:
         today = date.today()
         paper_count_total = len(paper_dates)
@@ -375,6 +459,11 @@ class ClusterAnalyticsFacade:
     def _top_keywords(self, points: list[QdrantPointDTO]) -> list[str]:
         counter: Counter[str] = Counter()
         for point in points:
+            self._add_payload_keywords(counter, point)
+        if counter:
+            return [keyword for keyword, _ in counter.most_common(TOP_KEYWORD_LIMIT)]
+
+        for point in points:
             paper_id = self._paper_id_from_point(point)
             if paper_id is not None:
                 try:
@@ -385,11 +474,19 @@ class ClusterAnalyticsFacade:
                     value = getattr(keyword, "value", None)
                     if value:
                         counter[str(value)] += 1
-            if not counter:
-                for value in point.payload.get("keywords", []):
-                    if value:
-                        counter[str(value)] += 1
         return [keyword for keyword, _ in counter.most_common(TOP_KEYWORD_LIMIT)]
+
+    def _add_payload_keywords(
+        self,
+        counter: Counter[str],
+        point: QdrantPointDTO,
+    ) -> None:
+        keywords = point.payload.get("keywords", [])
+        if not isinstance(keywords, list):
+            return
+        for value in keywords:
+            if value:
+                counter[str(value)] += 1
 
     def _cluster_from_payload(
         self,
@@ -493,6 +590,10 @@ class ClusterAnalyticsFacade:
         if not papers:
             return None
         return self._decimal(self._citation_count_sum(papers) / len(papers))
+
+    def _chunks(self, values: list[int], size: int):
+        for index in range(0, len(values), size):
+            yield values[index : index + size]
 
     def _paper_id_from_point(self, point: QdrantPointDTO) -> int | None:
         paper_id = point.payload.get("paper_id") or point.id

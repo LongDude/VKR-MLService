@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sys
+from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -15,6 +17,7 @@ from adapters.lmstudio_embedding_adapter import LMStudioEmbeddingAdapter
 from adapters.openalex_adapter import OpenAlexAdapter
 from adapters.qdrant_adapter import QdrantAdapter
 from adapters.redis_adapter import RedisAdapter
+from cli.tasks import FailedTaskRestorer
 from core.exceptions import (
     EmbeddingGenerationError,
     ExternalServiceRateLimitError,
@@ -27,6 +30,17 @@ from dto.external import OpenAlexSearchFiltersDTO
 from dto.papers import PaperBatchIndexingRequestDTO, PaperIndexingRequestDTO
 from dto.qdrant import QdrantPayloadIndexDTO, QdrantPointDTO
 from dto.search import SemanticSearchRequestDTO
+from dto.trends import ClusterSummaryDTO
+from ingestion.openalex_bootstrap.monthly_counts import MonthlyCount, MonthlyCountsLoader
+from cli.openalex import default_stats_redis_key, resolve_target_count
+from ml.constants import PAPERS_COLLECTION, TREND_CLUSTERS_COLLECTION
+from ml.facades.cluster_analytics import ClusterAnalyticsFacade
+from ml.workers.redis_worker import (
+    CLUSTER_RECOMPUTE_QUEUE,
+    PAPER_INDEXING_QUEUE,
+    RedisMLWorker,
+)
+from ml.workers.task_handlers import MLTaskHandler
 
 
 class FakeRedisClient:
@@ -99,6 +113,282 @@ def test_redis_adapter_wraps_decode_errors() -> None:
 
     with pytest.raises(RedisOperationError):
         RedisAdapter(client).get_json("bad")
+
+
+def test_monthly_counts_loader_reads_and_detects_missing_redis_periods() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    loader = MonthlyCountsLoader()
+    redis_key = default_stats_redis_key(["ru", "en"], ["article"])
+    loader.merge_into_redis(
+        adapter,
+        redis_key,
+        [
+            MonthlyCount(
+                period="2024-01",
+                date_from=date(2024, 1, 1),
+                date_to=date(2024, 1, 31),
+                count=10,
+            )
+        ],
+    )
+
+    loaded = loader.load_from_redis(
+        adapter,
+        redis_key,
+        date_from=date(2024, 1, 15),
+        date_to=date(2024, 2, 15),
+    )
+    missing = loader.missing_redis_months(
+        adapter,
+        redis_key,
+        date_from=date(2024, 1, 15),
+        date_to=date(2024, 2, 15),
+    )
+
+    assert redis_key.endswith("languages=en,ru:types=article")
+    assert loaded[0].period == "2024-01"
+    assert loaded[0].date_from == date(2024, 1, 15)
+    assert loaded[0].date_to == date(2024, 1, 31)
+    assert [item.period for item in missing] == ["2024-02"]
+
+
+def test_resolve_target_count_supports_period_scope() -> None:
+    assert resolve_target_count(None, 100) == (100, "period")
+    assert resolve_target_count(200, None) == (200, "total")
+    with pytest.raises(ValueError):
+        resolve_target_count(200, 100)
+
+
+def test_failed_task_restorer_splits_large_paper_indexing_batches() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    paper_ids = list(range(1000))
+    adapter.enqueue(
+        "queue:failed_tasks",
+        {
+            "source_queue": PAPER_INDEXING_QUEUE,
+            "message": {
+                "task_type": "paper_indexing",
+                "paper_ids": paper_ids,
+                "force_reindex": True,
+            },
+            "error": {"code": "timeout"},
+        },
+    )
+
+    restorer = FailedTaskRestorer(adapter)
+    preview = restorer.restore(
+        limit=10,
+        dry_run=True,
+        split_paper_indexing_batch_size=128,
+    )
+    result = restorer.restore(
+        limit=10,
+        split_paper_indexing_batch_size=128,
+    )
+    restored_messages = [
+        adapter.dequeue_nowait(PAPER_INDEXING_QUEUE)
+        for _ in range(adapter.queue_length(PAPER_INDEXING_QUEUE))
+    ]
+
+    assert preview["restorable"] == 1
+    assert preview["output_messages"] == 8
+    assert preview["sample_chunk_sizes"][:2] == [128, 128]
+    assert result["processed_failed_wrappers"] == 1
+    assert result["restored"] == 8
+    assert adapter.queue_length("queue:failed_tasks") == 0
+    assert [len(message["paper_ids"]) for message in restored_messages] == [
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+        104,
+    ]
+    assert all(message["force_reindex"] is True for message in restored_messages)
+
+
+def test_failed_task_restorer_can_disable_paper_indexing_split() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    paper_ids = list(range(5))
+    adapter.enqueue(
+        "queue:failed_tasks",
+        {
+            "source_queue": PAPER_INDEXING_QUEUE,
+            "message": {
+                "task_type": "paper_indexing",
+                "paper_ids": paper_ids,
+                "force_reindex": False,
+            },
+            "error": {"code": "timeout"},
+        },
+    )
+
+    result = FailedTaskRestorer(adapter).restore(
+        limit=10,
+        split_paper_indexing=False,
+        split_paper_indexing_batch_size=2,
+    )
+    restored = adapter.dequeue_nowait(PAPER_INDEXING_QUEUE)
+
+    assert result["restored"] == 1
+    assert restored["paper_ids"] == paper_ids
+
+
+def test_failed_task_restorer_splits_large_cluster_recompute_batches() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    topic_ids = list(range(121))
+    adapter.enqueue(
+        "queue:failed_tasks",
+        {
+            "source_queue": CLUSTER_RECOMPUTE_QUEUE,
+            "message": {
+                "task_type": "recompute_topic_clusters",
+                "topic_ids": topic_ids,
+                "force_summary": True,
+            },
+            "error": {"code": "timeout"},
+        },
+    )
+
+    restorer = FailedTaskRestorer(adapter)
+    preview = restorer.restore(
+        limit=10,
+        dry_run=True,
+        split_cluster_recompute_batch_size=50,
+    )
+    result = restorer.restore(
+        limit=10,
+        split_cluster_recompute_batch_size=50,
+    )
+    restored_messages = [
+        adapter.dequeue_nowait(CLUSTER_RECOMPUTE_QUEUE)
+        for _ in range(adapter.queue_length(CLUSTER_RECOMPUTE_QUEUE))
+    ]
+
+    assert preview["restorable"] == 1
+    assert preview["output_messages"] == 3
+    assert preview["sample_chunk_sizes"] == [50, 50, 21]
+    assert result["processed_failed_wrappers"] == 1
+    assert result["restored"] == 3
+    assert [len(message["topic_ids"]) for message in restored_messages] == [50, 50, 21]
+    assert all(message["force_summary"] is True for message in restored_messages)
+
+
+def test_failed_task_restorer_can_disable_cluster_recompute_split() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    topic_ids = list(range(5))
+    adapter.enqueue(
+        "queue:failed_tasks",
+        {
+            "source_queue": CLUSTER_RECOMPUTE_QUEUE,
+            "message": {
+                "task_type": "recompute_topic_clusters",
+                "topic_ids": topic_ids,
+                "force_summary": False,
+            },
+            "error": {"code": "timeout"},
+        },
+    )
+
+    result = FailedTaskRestorer(adapter).restore(
+        limit=10,
+        split_cluster_recompute=False,
+        split_cluster_recompute_batch_size=2,
+    )
+    restored = adapter.dequeue_nowait(CLUSTER_RECOMPUTE_QUEUE)
+
+    assert result["restored"] == 1
+    assert restored["topic_ids"] == topic_ids
+
+
+class CapturingTaskHandler:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = []
+
+    def handle(self, message: dict[str, Any]) -> None:
+        self.messages.append(message)
+
+
+def test_redis_worker_splits_oversized_paper_indexing_messages_before_handling() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    handler = CapturingTaskHandler()
+    adapter.enqueue(
+        PAPER_INDEXING_QUEUE,
+        {
+            "task_type": "paper_indexing",
+            "paper_ids": list(range(10)),
+            "force_reindex": False,
+        },
+    )
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=handler,  # type: ignore[arg-type]
+        queues=(PAPER_INDEXING_QUEUE,),
+        batch_sizes={PAPER_INDEXING_QUEUE: 1},
+        max_task_sizes={PAPER_INDEXING_QUEUE: 4},
+    )
+
+    assert worker.run_once() is True
+    assert [len(message["paper_ids"]) for message in handler.messages] == [4, 4, 2]
+
+
+def test_redis_worker_splits_oversized_cluster_recompute_messages_before_handling() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    handler = CapturingTaskHandler()
+    adapter.enqueue(
+        CLUSTER_RECOMPUTE_QUEUE,
+        {
+            "task_type": "recompute_topic_clusters",
+            "topic_ids": list(range(10)),
+            "force_summary": True,
+        },
+    )
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=handler,  # type: ignore[arg-type]
+        queues=(CLUSTER_RECOMPUTE_QUEUE,),
+        batch_sizes={CLUSTER_RECOMPUTE_QUEUE: 1},
+        max_task_sizes={CLUSTER_RECOMPUTE_QUEUE: 4},
+    )
+
+    assert worker.run_once() is True
+    assert [len(message["topic_ids"]) for message in handler.messages] == [4, 4, 2]
+    assert all(message["force_summary"] is True for message in handler.messages)
+
+
+class PartiallyFailingTrendPipeline:
+    def recompute_cluster(self, cluster_id: str, force_summary: bool = False) -> dict[str, Any]:
+        if cluster_id == "topic:2":
+            raise InvalidRequestError("broken cluster", details={"cluster_id": cluster_id})
+        return {"cluster_id": cluster_id, "force_summary": force_summary}
+
+
+def test_task_handler_continues_cluster_batch_after_topic_error() -> None:
+    handler = MLTaskHandler(
+        trend_recompute_pipeline=PartiallyFailingTrendPipeline(),  # type: ignore[arg-type]
+    )
+
+    result = handler.handle(
+        {
+            "task_type": "recompute_topic_clusters",
+            "topic_ids": [1, 2, 3],
+            "force_summary": True,
+        }
+    )
+
+    assert result.success is False
+    assert result.details["updated"] == 2
+    assert result.details["failed"] == 1
+    assert result.details["errors"][0]["task_id"] == "topic:2"
 
 
 class FakeQdrantClient:
@@ -237,6 +527,117 @@ def test_qdrant_adapter_works_with_official_in_memory_client() -> None:
     assert retrieved[0].payload == {"paper_id": 1}
     assert hits[0].id == 1
     assert hits[0].payload == {"paper_id": 1}
+
+
+class FakeClusterTaxonomyRepository:
+    def __init__(self, paper_ids: list[int]) -> None:
+        self.paper_ids = paper_ids
+
+    def get_topic_by_id(self, topic_id: int) -> Any:
+        return SimpleNamespace(id=topic_id, name=f"Topic {topic_id}")
+
+    def list_paper_ids_by_topic(self, topic_id: int) -> list[int]:
+        return self.paper_ids
+
+
+class FakeClusterPaperRepository:
+    def get_by_ids(self, paper_ids: list[int]) -> list[Any]:
+        return [
+            SimpleNamespace(
+                id=paper_id,
+                title=f"Paper {paper_id}",
+                abstract=f"Abstract {paper_id}",
+                publication_date=date(2025, 1, 1),
+                cited_by_count=1,
+            )
+            for paper_id in paper_ids
+        ]
+
+
+class FakeClusterQdrantAdapter:
+    def __init__(self) -> None:
+        self.retrieve_calls: list[tuple[str, list[int | str], bool]] = []
+        self.upserts: list[tuple[str, int | str, list[float], dict[str, Any]]] = []
+
+    def retrieve(
+        self,
+        collection_name: str,
+        point_ids: list[int | str],
+        with_vectors: bool = False,
+    ) -> list[QdrantPointDTO]:
+        self.retrieve_calls.append((collection_name, point_ids, with_vectors))
+        if collection_name == TREND_CLUSTERS_COLLECTION:
+            return []
+        return [
+            QdrantPointDTO(
+                id=point_id,
+                vector=[float(point_id), 1.0, 0.5],
+                payload={"paper_id": point_id, "keywords": ["chunked"]},
+            )
+            for point_id in point_ids
+            if isinstance(point_id, int)
+        ]
+
+    def upsert_point(
+        self,
+        collection_name: str,
+        point_id: int | str,
+        vector: list[float],
+        payload: dict[str, Any],
+    ) -> None:
+        self.upserts.append((collection_name, point_id, vector, payload))
+
+
+class FakeClusterRedisAdapter:
+    def __init__(self) -> None:
+        self.values: dict[str, Any] = {}
+
+    def get_json(self, key: str) -> Any:
+        return self.values.get(key)
+
+    def set_json(
+        self,
+        key: str,
+        value: dict[str, Any],
+        ttl_seconds: int | None = None,
+    ) -> None:
+        self.values[key] = value
+
+
+class FakeSummaryFacade:
+    def summarize_cluster(
+        self,
+        cluster_name: str,
+        paper_titles: list[str],
+        abstracts: list[str],
+        top_keywords: list[str],
+    ) -> ClusterSummaryDTO:
+        return ClusterSummaryDTO(title=cluster_name, summary="summary")
+
+
+def test_cluster_analytics_retrieves_qdrant_vectors_in_chunks() -> None:
+    paper_ids = list(range(1, 452))
+    qdrant_adapter = FakeClusterQdrantAdapter()
+    facade = ClusterAnalyticsFacade(
+        taxonomy_repository=FakeClusterTaxonomyRepository(paper_ids),  # type: ignore[arg-type]
+        paper_repository=FakeClusterPaperRepository(),  # type: ignore[arg-type]
+        paper_graph_repository=SimpleNamespace(),
+        qdrant_adapter=qdrant_adapter,  # type: ignore[arg-type]
+        redis_adapter=FakeClusterRedisAdapter(),  # type: ignore[arg-type]
+        summary_facade=FakeSummaryFacade(),  # type: ignore[arg-type]
+    )
+
+    cluster = facade.recompute_cluster("topic:1")
+    paper_retrieve_sizes = [
+        len(point_ids)
+        for collection_name, point_ids, with_vectors in qdrant_adapter.retrieve_calls
+        if collection_name == PAPERS_COLLECTION and with_vectors
+    ]
+
+    assert cluster.cluster_key == "topic:1"
+    assert len(paper_retrieve_sizes) > 1
+    assert max(paper_retrieve_sizes) <= 256
+    assert qdrant_adapter.upserts[0][3]["indexed_paper_count"] == len(paper_ids)
 
 
 def test_lmstudio_embedding_adapter_validates_response() -> None:

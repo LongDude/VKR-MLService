@@ -115,6 +115,9 @@ class QdrantPayloadBuilder:
             "avg_cited_by_count": self._first(data, "avg_cited_by_count", source=metrics),
             "top_keywords": data.get("top_keywords"),
             "representative_paper_ids": data.get("representative_paper_ids"),
+            "indexed_paper_count": data.get("indexed_paper_count"),
+            "vector_retrieve_batch_size": data.get("vector_retrieve_batch_size"),
+            "representative_candidate_count": data.get("representative_candidate_count"),
             "summary_degraded": data.get("summary_degraded"),
             "indexed_at": data.get("indexed_at"),
         }

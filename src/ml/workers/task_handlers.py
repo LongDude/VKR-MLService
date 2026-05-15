@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Literal
 
-from core.exceptions import InvalidRequestError
+from core.exceptions import AppError, InvalidRequestError
 from dto.common import BatchOperationResultDTO, OperationResultDTO
 from ml.pipelines.cluster_dynamics_pipeline import ClusterDynamicsPipeline
 from ml.pipelines.paper_indexing_pipeline import PaperIndexingPipeline
@@ -109,7 +109,7 @@ class MLTaskHandler:
         )
 
     def _handle_cluster_recompute(self, message: dict[str, Any]) -> OperationResultDTO:
-        pipeline = self._required_pipeline(
+        pipeline: TrendRecomputePipeline = self._required_pipeline(
             self.trend_recompute_pipeline,
             "trend_recompute_pipeline",
         )
@@ -131,11 +131,21 @@ class MLTaskHandler:
         if topic_ids:
             result = BatchOperationResultDTO(total=len(topic_ids))
             for topic_id in topic_ids:
-                pipeline.recompute_cluster(
-                    f"topic:{topic_id}",
-                    force_summary=force_summary,
-                )
-                result.updated += 1
+                cluster_id = f"topic:{topic_id}"
+                try:
+                    pipeline.recompute_cluster(
+                        cluster_id,
+                        force_summary=force_summary,
+                    )
+                except Exception as exc:
+                    if self.session is not None:
+                        self.session.rollback()
+                    result.failed += 1
+                    result.errors.append(
+                        self._task_error_payload(cluster_id, exc)
+                    )
+                else:
+                    result.updated += 1
             return self._batch_result(
                 result,
                 "Topic cluster recompute completed",
@@ -315,6 +325,21 @@ class MLTaskHandler:
         if isinstance(value, dict):
             return value
         return {"value": value}
+
+    def _task_error_payload(self, task_id: str, exc: Exception) -> dict[str, Any]:
+        if isinstance(exc, AppError):
+            return {
+                "task_id": task_id,
+                "code": exc.code,
+                "message": exc.message,
+                "details": exc.details or {},
+            }
+        return {
+            "task_id": task_id,
+            "code": exc.__class__.__name__,
+            "message": str(exc),
+            "details": {},
+        }
 
 
 __all__ = ["MLTaskHandler"]

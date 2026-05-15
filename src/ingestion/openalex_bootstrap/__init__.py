@@ -13,6 +13,7 @@ from .load_plan import OpenAlexLoadPlanBuilder
 from .monthly_counts import MonthlyCount, MonthlyCountsLoader
 from .rate_limiter import AsyncRateLimiter
 from .runner import OpenAlexBootstrapRunner
+from .stats import OpenAlexMonthlyStatsCollector, OpenAlexStatsCollectionResult
 
 __all__ = [
     "AsyncRateLimiter",
@@ -28,4 +29,6 @@ __all__ = [
     "OpenAlexLoadPlanBuilder",
     "OpenAlexLoadPlanDTO",
     "OpenAlexLoadPlanItemDTO",
+    "OpenAlexMonthlyStatsCollector",
+    "OpenAlexStatsCollectionResult",
 ]

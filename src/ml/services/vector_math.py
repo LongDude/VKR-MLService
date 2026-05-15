@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from math import sqrt
 from numbers import Real
 
@@ -40,6 +41,57 @@ class VectorMathService:
             sum(vector[index] for vector in validated_vectors) / len(validated_vectors)
             for index in range(dimension)
         ]
+
+    def streaming_mean_vector(
+        self,
+        vectors: Iterable[list[float]],
+    ) -> list[float]:
+        mean_vector: list[float] | None = None
+        vector_count = 0
+        for vector in vectors:
+            mean_vector, vector_count = self.update_mean_vector(
+                mean_vector,
+                vector_count,
+                vector,
+            )
+        if mean_vector is None:
+            raise InvalidRequestError("Cannot calculate mean vector for an empty list")
+        return mean_vector
+
+    def update_mean_vector(
+        self,
+        current_mean: list[float] | None,
+        current_count: int,
+        vector: list[float],
+    ) -> tuple[list[float], int]:
+        if current_count < 0:
+            raise InvalidRequestError(
+                "current_count must be non-negative",
+                details={"current_count": current_count},
+            )
+
+        validated_vector = self._validate_vector(vector, "vector")
+        if current_mean is None:
+            if current_count != 0:
+                raise InvalidRequestError(
+                    "current_count must be zero when current_mean is empty",
+                    details={"current_count": current_count},
+                )
+            return validated_vector, 1
+
+        if current_count == 0:
+            raise InvalidRequestError(
+                "current_count must be positive when current_mean is provided",
+                details={"current_count": current_count},
+            )
+
+        validated_mean = self._validate_vector(current_mean, "current_mean")
+        self._validate_same_dimension([validated_mean, validated_vector])
+        next_count = current_count + 1
+        return [
+            mean_value + (vector_value - mean_value) / next_count
+            for mean_value, vector_value in zip(validated_mean, validated_vector)
+        ], next_count
 
     def weighted_mean_vector(
         self,
@@ -124,4 +176,3 @@ class VectorMathService:
 
 
 __all__ = ["VectorMathService"]
-

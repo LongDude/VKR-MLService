@@ -12,6 +12,8 @@ from ingestion.openalex_bootstrap.dto import (
 )
 from ingestion.openalex_bootstrap.importer import OpenAlexBatchImporter
 from ingestion.openalex_bootstrap.load_plan import OpenAlexLoadPlanBuilder
+from ingestion.openalex_bootstrap.monthly_counts import MonthlyCountsLoader
+from ingestion.openalex_bootstrap.stats import OpenAlexMonthlyStatsCollector
 from ml.workers.redis_worker import PAPER_INDEXING_QUEUE
 from repositories.papers import PaperRepository
 
@@ -28,6 +30,8 @@ class OpenAlexBootstrapRunner:
         downloader: OpenAlexBootstrapDownloader,
         importer: OpenAlexBatchImporter,
         redis_adapter: RedisAdapter | None = None,
+        stats_collector: OpenAlexMonthlyStatsCollector | None = None,
+        monthly_counts_loader: MonthlyCountsLoader | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.request = request
@@ -36,17 +40,24 @@ class OpenAlexBootstrapRunner:
         self.downloader = downloader
         self.importer = importer
         self.redis_adapter = redis_adapter
+        self.stats_collector = stats_collector
+        self.monthly_counts_loader = monthly_counts_loader or MonthlyCountsLoader()
         self.logger = logger or logging.getLogger(__name__)
 
     async def run(self) -> OpenAlexBootstrapReportDTO:
         """Run bootstrap until target_count is reached or max_rounds is exhausted."""
         started_at = time.monotonic()
-        initial_count = self._paper_count()
+        await self._ensure_monthly_stats()
+        initial_count = self._target_scope_paper_count()
+        initial_total_count = self._paper_count()
         required_new_count = max(0, self.request.target_count - initial_count)
         report = OpenAlexBootstrapReportDTO(
             target_count=self.request.target_count,
+            target_count_scope=self.request.target_count_scope,
             initial_count=initial_count,
             final_count=initial_count,
+            initial_total_count=initial_total_count,
+            final_total_count=initial_total_count,
             required_new_count=required_new_count,
         )
 
@@ -60,7 +71,7 @@ class OpenAlexBootstrapRunner:
             return report
 
         for round_index in range(self.request.max_rounds):
-            current_count = self._paper_count()
+            current_count = self._target_scope_paper_count()
             missing_count = max(0, self.request.target_count - current_count)
             if missing_count <= 0:
                 break
@@ -99,6 +110,7 @@ class OpenAlexBootstrapRunner:
                 plan,
                 sample=self.request.sample,
                 per_page=self.request.per_page,
+                show_progress=self.request.show_progress,
             )
             report.fetched += download.fetched
             report.normalized += download.normalized
@@ -111,6 +123,7 @@ class OpenAlexBootstrapRunner:
                 download.papers,
                 db_workers=self.request.db_workers,
                 skip_existing=self.request.skip_existing,
+                show_progress=self.request.show_progress,
             )
             report.created += imported.created
             report.updated += imported.updated
@@ -124,8 +137,9 @@ class OpenAlexBootstrapRunner:
             if self.request.enqueue_indexing:
                 enqueued = self._enqueue_indexing(imported.paper_ids)
 
-            final_count = self._paper_count()
+            final_count = self._target_scope_paper_count()
             report.final_count = final_count
+            report.final_total_count = self._paper_count()
             round_payload.update(
                 {
                     "fetched": download.fetched,
@@ -140,6 +154,7 @@ class OpenAlexBootstrapRunner:
                     "failed": download.failed + imported.failed,
                     "openalex_requests": download.openalex_requests,
                     "final_count": final_count,
+                    "final_total_count": report.final_total_count,
                     "enqueued_indexing": enqueued,
                 }
             )
@@ -153,13 +168,72 @@ class OpenAlexBootstrapRunner:
                 imported.updated,
             )
 
-        report.final_count = self._paper_count() if not self.request.dry_run else initial_count
+        report.final_count = (
+            self._target_scope_paper_count()
+            if not self.request.dry_run
+            else initial_count
+        )
+        report.final_total_count = (
+            self._paper_count()
+            if not self.request.dry_run
+            else initial_total_count
+        )
         report.elapsed_seconds = time.monotonic() - started_at
         return report
 
     def _paper_count(self) -> int:
         with self.session_factory() as session:
             return PaperRepository(session).count_all()
+
+    def _target_scope_paper_count(self) -> int:
+        with self.session_factory() as session:
+            repository = PaperRepository(session)
+            if self.request.target_count_scope == "period":
+                return repository.count_by_period(
+                    self.request.date_from,
+                    self.request.date_to,
+                )
+            return repository.count_all()
+
+    async def _ensure_monthly_stats(self) -> None:
+        if self.request.normalize == "none":
+            return
+        if self.request.monthly_stats_source != "redis":
+            return
+        if self.redis_adapter is None:
+            raise ValueError("Redis adapter is required for Redis monthly stats.")
+        if not self.request.monthly_counts_redis_key:
+            raise ValueError("monthly_counts_redis_key is required for Redis monthly stats.")
+
+        missing_months = self.monthly_counts_loader.missing_redis_months(
+            self.redis_adapter,
+            self.request.monthly_counts_redis_key,
+            date_from=self.request.date_from,
+            date_to=self.request.date_to,
+        )
+        if not missing_months:
+            return
+        if self.request.missing_stats_policy == "error":
+            missing_periods = [item.period for item in missing_months]
+            raise ValueError(
+                "OpenAlex monthly stats are missing in Redis for periods: "
+                + ", ".join(missing_periods[:20])
+            )
+        if self.request.dry_run:
+            raise ValueError(
+                "--dry-run cannot fetch missing OpenAlex stats; run collect-stats first."
+            )
+        if self.stats_collector is None:
+            raise ValueError("Stats collector is required when missing_stats_policy=fetch.")
+
+        await self.stats_collector.collect_and_store(
+            date_from=min(item.date_from for item in missing_months),
+            date_to=max(item.date_to for item in missing_months),
+            languages=self.request.languages,
+            types=self.request.types,
+            missing_only=True,
+            show_progress=self.request.show_progress,
+        )
 
     def _enqueue_indexing(self, paper_ids: list[int]) -> int:
         if self.redis_adapter is None:

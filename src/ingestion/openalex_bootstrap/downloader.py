@@ -8,6 +8,7 @@ from math import ceil
 from typing import Any
 
 import httpx
+from tqdm.auto import tqdm
 
 from adapters.openalex_adapter import OpenAlexAdapter
 from dto.external import ExternalPaperDTO
@@ -80,30 +81,41 @@ class OpenAlexBootstrapDownloader:
         *,
         sample: bool,
         per_page: int = 100,
+        show_progress: bool = False,
     ) -> OpenAlexDownloadResult:
         """Fetch all plan items with one shared AsyncClient."""
         result = OpenAlexDownloadResult()
         semaphore = asyncio.Semaphore(self.request_workers)
         per_page = max(1, min(100, per_page))
+        progress_bar = (
+            tqdm(total=plan.estimated_requests, desc="OpenAlex download", unit="req")
+            if show_progress and plan.estimated_requests > 0
+            else None
+        )
 
         async with httpx.AsyncClient(
             base_url=self.base_url,
             timeout=self.timeout_seconds,
             transport=self.transport,
         ) as client:
-            item_results = await asyncio.gather(
-                *[
-                    self._fetch_item(
-                        client,
-                        item,
-                        sample=sample,
-                        per_page=per_page,
-                        semaphore=semaphore,
-                    )
-                    for item in plan.items
-                    if item.sample_size > 0
-                ]
-            )
+            try:
+                item_results = await asyncio.gather(
+                    *[
+                        self._fetch_item(
+                            client,
+                            item,
+                            sample=sample,
+                            per_page=per_page,
+                            semaphore=semaphore,
+                            progress_bar=progress_bar,
+                        )
+                        for item in plan.items
+                        if item.sample_size > 0
+                    ]
+                )
+            finally:
+                if progress_bar is not None:
+                    progress_bar.close()
 
         for item_result in item_results:
             result.papers.extend(item_result.papers)
@@ -123,21 +135,26 @@ class OpenAlexBootstrapDownloader:
         sample: bool,
         per_page: int,
         semaphore: asyncio.Semaphore,
+        progress_bar: Any,
     ) -> OpenAlexDownloadResult:
         pages = ceil(item.sample_size / per_page)
-        page_results = await asyncio.gather(
-            *[
-                self._fetch_page(
-                    client,
-                    item,
-                    page=page,
-                    per_page=per_page,
-                    sample=sample,
-                    semaphore=semaphore,
-                )
-                for page in range(1, pages + 1)
-            ]
-        )
+        tasks = [
+            self._fetch_page(
+                client,
+                item,
+                page=page,
+                per_page=per_page,
+                sample=sample,
+                semaphore=semaphore,
+            )
+            for page in range(1, pages + 1)
+        ]
+        page_results = []
+        for task in asyncio.as_completed(tasks):
+            page_result = await task
+            page_results.append(page_result)
+            if progress_bar is not None:
+                progress_bar.update(int(page_result["requests"]))
 
         result = OpenAlexDownloadResult()
         raw_items: list[dict[str, Any]] = []

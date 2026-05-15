@@ -104,12 +104,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Seconds to sleep when no tasks are available. Defaults to 2.",
     )
     run_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help=(
+            "Increase logging verbosity. Default logs task starts/completions; "
+            "-v also shows HTTP request logs; -vv enables verbose dependency logs."
+        ),
+    )
+    run_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars for worker tasks.",
+    )
+    run_parser.add_argument(
         "--paper-indexing-batch-size",
         type=int,
-        default=500,
+        default=128,
         help=(
             "Maximum queue:paper_indexing messages to combine into one "
-            "PaperIndexingPipeline.run_many call. Defaults to 500."
+            "PaperIndexingPipeline.run_many call. Defaults to 128."
+        ),
+    )
+    run_parser.add_argument(
+        "--max-paper-task-size",
+        type=int,
+        default=None,
+        help=(
+            "Maximum paper_ids per paper_indexing handler call. Defaults to "
+            "--paper-indexing-batch-size."
         ),
     )
     run_parser.add_argument(
@@ -119,6 +143,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Maximum queue:cluster_recompute topic messages to combine into one "
             "cluster recompute batch. Defaults to 50."
+        ),
+    )
+    run_parser.add_argument(
+        "--max-cluster-task-size",
+        type=int,
+        default=None,
+        help=(
+            "Maximum topic_ids per cluster recompute handler call. Defaults to "
+            "--cluster-recompute-batch-size."
         ),
     )
     run_parser.add_argument(
@@ -151,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run the requested worker command."""
     args = parse_args(argv)
     load_dotenv(args.env_file)
-    configure_logging()
+    configure_logging(getattr(args, "verbose", 0))
 
     try:
         if args.command == "run":
@@ -189,8 +222,16 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--idle-sleep must be non-negative.")
     if args.paper_indexing_batch_size <= 0:
         raise ValueError("--paper-indexing-batch-size must be a positive integer.")
+    if args.max_paper_task_size is not None and args.max_paper_task_size <= 0:
+        raise ValueError("--max-paper-task-size must be a positive integer.")
     if args.cluster_recompute_batch_size <= 0:
         raise ValueError("--cluster-recompute-batch-size must be a positive integer.")
+    if args.max_cluster_task_size is not None and args.max_cluster_task_size <= 0:
+        raise ValueError("--max-cluster-task-size must be a positive integer.")
+    max_paper_task_size = args.max_paper_task_size or args.paper_indexing_batch_size
+    max_cluster_task_size = (
+        args.max_cluster_task_size or args.cluster_recompute_batch_size
+    )
 
     queue_names = parse_queues(args.queues)
     database_url = args.database_url or Settings.from_env().database_url
@@ -231,7 +272,19 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                     PAPER_INDEXING_QUEUE: args.paper_indexing_batch_size,
                     CLUSTER_RECOMPUTE_QUEUE: args.cluster_recompute_batch_size,
                 },
+                max_task_sizes={
+                    PAPER_INDEXING_QUEUE: max_paper_task_size,
+                    CLUSTER_RECOMPUTE_QUEUE: max_cluster_task_size,
+                },
                 idle_sleep_seconds=args.idle_sleep,
+                show_progress=not args.no_progress,
+            )
+            logging.getLogger(__name__).info(
+                "Starting Redis ML worker queues=%s max_tasks=%s progress=%s verbosity=%s",
+                ",".join(queue_names),
+                args.max_tasks,
+                not args.no_progress,
+                args.verbose,
             )
 
             if args.max_tasks is None:
@@ -251,6 +304,12 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 PAPER_INDEXING_QUEUE: args.paper_indexing_batch_size,
                 CLUSTER_RECOMPUTE_QUEUE: args.cluster_recompute_batch_size,
             },
+            "max_task_sizes": {
+                PAPER_INDEXING_QUEUE: max_paper_task_size,
+                CLUSTER_RECOMPUTE_QUEUE: max_cluster_task_size,
+            },
+            "progress": not args.no_progress,
+            "verbosity": args.verbose,
             "processed": processed,
         }
     finally:
@@ -463,12 +522,26 @@ def _optional_int_env(name: str) -> int | None:
     return int(value)
 
 
-def configure_logging() -> None:
+def configure_logging(verbosity: int = 0) -> None:
     """Configure basic worker logging."""
+    env_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = logging.DEBUG if verbosity > 0 else getattr(logging, env_level, logging.INFO)
     logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
+        level=level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    if verbosity <= 0:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("qdrant_client").setLevel(logging.WARNING)
+    elif verbosity == 1:
+        logging.getLogger("httpx").setLevel(logging.INFO)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("qdrant_client").setLevel(logging.INFO)
+    else:
+        logging.getLogger("httpx").setLevel(logging.DEBUG)
+        logging.getLogger("httpcore").setLevel(logging.DEBUG)
+        logging.getLogger("qdrant_client").setLevel(logging.DEBUG)
 
 
 def print_json(payload: dict[str, Any], *, stream: Any = sys.stdout) -> None:

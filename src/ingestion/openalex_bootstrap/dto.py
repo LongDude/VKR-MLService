@@ -9,15 +9,22 @@ from dto.common import BaseDTO
 
 
 NormalizeMode = Literal["none", "year", "month"]
+MissingStatsPolicy = Literal["error", "fetch"]
+MonthlyStatsSource = Literal["redis", "csv"]
+TargetCountScope = Literal["total", "period"]
 
 
 class OpenAlexBootstrapRequestDTO(BaseDTO):
     target_count: int = Field(ge=0)
+    target_count_scope: TargetCountScope = "total"
     date_from: date
     date_to: date
     sample: bool = False
     normalize: NormalizeMode = "month"
+    monthly_stats_source: MonthlyStatsSource = "redis"
+    monthly_counts_redis_key: str | None = None
     monthly_counts_csv: str | None = None
+    missing_stats_policy: MissingStatsPolicy = "error"
     languages: list[str] = Field(default_factory=lambda: ["en", "ru"])
     types: list[str] = Field(default_factory=lambda: ["article"])
     batch_size: int = Field(default=500, ge=1, le=500)
@@ -31,6 +38,7 @@ class OpenAlexBootstrapRequestDTO(BaseDTO):
     skip_existing: bool = False
     enqueue_indexing: bool = False
     dry_run: bool = False
+    show_progress: bool = True
 
 
 class OpenAlexLoadPlanItemDTO(BaseDTO):
@@ -69,8 +77,11 @@ class BatchImportResultDTO(BaseDTO):
 
 class OpenAlexBootstrapReportDTO(BaseDTO):
     target_count: int
+    target_count_scope: TargetCountScope = "total"
     initial_count: int
     final_count: int
+    initial_total_count: int | None = None
+    final_total_count: int | None = None
     required_new_count: int
     planned_sample_count: int = 0
     fetched: int = 0
@@ -89,9 +100,12 @@ class OpenAlexBootstrapReportDTO(BaseDTO):
 
 __all__ = [
     "BatchImportResultDTO",
+    "MissingStatsPolicy",
+    "MonthlyStatsSource",
     "NormalizeMode",
     "OpenAlexBootstrapReportDTO",
     "OpenAlexBootstrapRequestDTO",
     "OpenAlexLoadPlanDTO",
     "OpenAlexLoadPlanItemDTO",
+    "TargetCountScope",
 ]

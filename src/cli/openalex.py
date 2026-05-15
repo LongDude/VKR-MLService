@@ -30,6 +30,7 @@ from ingestion.openalex_bootstrap import (
     OpenAlexBootstrapRequestDTO,
     OpenAlexBootstrapRunner,
     OpenAlexLoadPlanBuilder,
+    OpenAlexMonthlyStatsCollector,
     MonthlyCountsLoader,
 )
 from ingestion.openalex_bootstrap.report import report_to_dict, write_report
@@ -37,6 +38,7 @@ from models.session import create_db_engine, create_session_factory
 
 
 DEFAULT_MONTHLY_COUNTS_CSV = BASE_DIR / "openalex_monthly_counts_2015_2025.csv"
+DEFAULT_STATS_REDIS_KEY_PREFIX = "openalex:monthly_counts:v1"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -53,6 +55,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Target number of papers in local DB after bootstrap.",
+    )
+    bootstrap_parser.add_argument(
+        "--target-period-count",
+        type=int,
+        default=None,
+        help=(
+            "Target number of papers inside --date-from/--date-to after bootstrap. "
+            "Mutually exclusive with --target-count."
+        ),
     )
     bootstrap_parser.add_argument(
         "--date-from",
@@ -78,9 +89,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Target distribution mode. Defaults to month.",
     )
     bootstrap_parser.add_argument(
+        "--stats-source",
+        choices=["redis", "csv"],
+        default="redis",
+        help="Monthly statistics source for normalization. Defaults to redis.",
+    )
+    bootstrap_parser.add_argument(
+        "--stats-redis-key",
+        default=None,
+        help="Redis key with OpenAlex monthly statistics. Defaults to a key derived from languages/types.",
+    )
+    bootstrap_parser.add_argument(
+        "--missing-stats-policy",
+        choices=["error", "fetch"],
+        default="error",
+        help="What to do when Redis stats are missing for the period. Defaults to error.",
+    )
+    bootstrap_parser.add_argument(
         "--monthly-counts-csv",
         default=str(DEFAULT_MONTHLY_COUNTS_CSV),
-        help="CSV with OpenAlex monthly counts.",
+        help="CSV with OpenAlex monthly counts. Used only with --stats-source csv.",
     )
     bootstrap_parser.add_argument(
         "--languages",
@@ -156,6 +184,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Build load plan only; do not call OpenAlex, write DB, or enqueue Redis.",
     )
     bootstrap_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars.",
+    )
+    bootstrap_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase logging verbosity. Use -v for DEBUG, -vv for verbose dependency logs.",
+    )
+    bootstrap_parser.add_argument(
         "--report-json",
         default=None,
         help="Optional path for JSON report.",
@@ -177,6 +217,91 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     add_redis_args(bootstrap_parser)
 
+    stats_parser = subparsers.add_parser(
+        "collect-stats",
+        aliases=["collect-monthly-stats", "update-stats"],
+        help="Collect or update OpenAlex monthly publication statistics in Redis.",
+    )
+    stats_parser.add_argument(
+        "--date-from",
+        type=parse_iso_date,
+        required=True,
+        help="Publication date lower bound in YYYY-MM-DD format.",
+    )
+    stats_parser.add_argument(
+        "--date-to",
+        type=parse_iso_date,
+        required=True,
+        help="Publication date upper bound in YYYY-MM-DD format.",
+    )
+    stats_parser.add_argument(
+        "--languages",
+        default="en,ru",
+        help="Comma-separated OpenAlex languages. Defaults to en,ru.",
+    )
+    stats_parser.add_argument(
+        "--types",
+        default="article",
+        help="Comma-separated OpenAlex work types. Defaults to article.",
+    )
+    stats_parser.add_argument(
+        "--stats-redis-key",
+        default=None,
+        help="Redis key to store monthly statistics. Defaults to a key derived from languages/types.",
+    )
+    stats_parser.add_argument(
+        "--stats-ttl-seconds",
+        type=int,
+        default=0,
+        help="Redis TTL for stats document. 0 means no expiration.",
+    )
+    stats_parser.add_argument(
+        "--missing-only",
+        action="store_true",
+        help="Collect only months not already present in Redis.",
+    )
+    stats_parser.add_argument(
+        "--request-workers",
+        type=int,
+        default=8,
+        help="Concurrent OpenAlex count request workers. Defaults to 8.",
+    )
+    stats_parser.add_argument(
+        "--rate-limit-rps",
+        type=float,
+        default=70.0,
+        help="OpenAlex requests per second limit. Defaults to 70.",
+    )
+    stats_parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="Retries for 429/5xx OpenAlex responses. Defaults to 5.",
+    )
+    stats_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars.",
+    )
+    stats_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase logging verbosity. Use -v for DEBUG, -vv for verbose dependency logs.",
+    )
+    stats_parser.add_argument(
+        "--env-file",
+        default=str(PROJECT_DIR / ".env"),
+        help="Path to .env file. Defaults to project .env.",
+    )
+    stats_parser.add_argument(
+        "--openalex-url",
+        default=None,
+        help="OpenAlex base URL. Defaults to OPENALEX_BASE_URL or https://api.openalex.org.",
+    )
+    add_redis_args(stats_parser)
+
     return parser.parse_args(argv)
 
 
@@ -184,14 +309,17 @@ def main(argv: list[str] | None = None) -> int:
     """Run the requested OpenAlex CLI command."""
     args = parse_args(argv)
     load_dotenv(args.env_file)
-    configure_logging()
+    configure_logging(getattr(args, "verbose", 0))
 
     try:
         if args.command == "bootstrap-papers":
             report = asyncio.run(run_bootstrap_papers(args))
+            payload = report_to_dict(report)
+        elif args.command == "collect-stats":
+            payload = asyncio.run(run_collect_stats(args))
         else:
             raise AssertionError(f"Unhandled command: {args.command}")
-        if args.report_json:
+        if getattr(args, "report_json", None):
             write_report(args.report_json, report)
     except AppError as exc:
         print_json(exc.to_dict(), stream=sys.stderr)
@@ -209,25 +337,35 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    print_json(report_to_dict(report))
+    print_json(payload)
     return 0
 
 
 async def run_bootstrap_papers(args: argparse.Namespace) -> Any:
     """Build request DTO and run OpenAlex bootstrap."""
-    target_count = resolve_target_count(args.target_count)
+    target_count, target_count_scope = resolve_target_count(
+        args.target_count,
+        args.target_period_count,
+    )
     if args.date_from > args.date_to:
         raise ValueError("--date-from must be before or equal to --date-to.")
+    languages = parse_csv_arg(args.languages)
+    types = parse_csv_arg(args.types)
+    stats_redis_key = args.stats_redis_key or default_stats_redis_key(languages, types)
 
     request = OpenAlexBootstrapRequestDTO(
         target_count=target_count,
+        target_count_scope=target_count_scope,
         date_from=args.date_from,
         date_to=args.date_to,
         sample=args.sample,
         normalize=args.normalize,
+        monthly_stats_source=args.stats_source,
+        monthly_counts_redis_key=stats_redis_key,
         monthly_counts_csv=args.monthly_counts_csv,
-        languages=parse_csv_arg(args.languages),
-        types=parse_csv_arg(args.types),
+        missing_stats_policy=args.missing_stats_policy,
+        languages=languages,
+        types=types,
         batch_size=args.batch_size,
         request_workers=args.request_workers,
         db_workers=args.db_workers,
@@ -239,6 +377,7 @@ async def run_bootstrap_papers(args: argparse.Namespace) -> Any:
         skip_existing=args.skip_existing,
         enqueue_indexing=args.enqueue_indexing,
         dry_run=args.dry_run,
+        show_progress=not args.no_progress,
     )
 
     database_url = args.database_url or Settings.from_env().database_url
@@ -246,16 +385,25 @@ async def run_bootstrap_papers(args: argparse.Namespace) -> Any:
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
     try:
-        redis_adapter = (
-            RedisAdapter(build_redis_client(args))
-            if request.enqueue_indexing and not request.dry_run
-            else None
-        )
+        redis_adapter = build_optional_redis_adapter(args, request)
+        stats_collector = None
+        if redis_adapter is not None and request.monthly_stats_source == "redis":
+            stats_collector = OpenAlexMonthlyStatsCollector(
+                redis_adapter=redis_adapter,
+                redis_key=stats_redis_key,
+                base_url=args.openalex_url
+                or os.getenv("OPENALEX_BASE_URL")
+                or "https://api.openalex.org",
+                request_workers=request.request_workers,
+                rate_limiter=AsyncRateLimiter(request.rate_limit_rps),
+                max_retries=request.max_retries,
+            )
         runner = OpenAlexBootstrapRunner(
             request=request,
             session_factory=SessionLocal,
             load_plan_builder=OpenAlexLoadPlanBuilder(
-                monthly_counts_loader=MonthlyCountsLoader()
+                monthly_counts_loader=MonthlyCountsLoader(),
+                redis_adapter=redis_adapter,
             ),
             downloader=OpenAlexBootstrapDownloader(
                 base_url=args.openalex_url
@@ -270,27 +418,107 @@ async def run_bootstrap_papers(args: argparse.Namespace) -> Any:
                 batch_size=request.batch_size,
             ),
             redis_adapter=redis_adapter,
+            stats_collector=stats_collector,
         )
         return await runner.run()
     finally:
         engine.dispose()
 
 
-def resolve_target_count(cli_value: int | None) -> int:
-    """Resolve target count from CLI or supported environment variables."""
-    if cli_value is not None:
-        if cli_value < 0:
+async def run_collect_stats(args: argparse.Namespace) -> dict[str, Any]:
+    """Collect OpenAlex monthly count statistics and store them in Redis."""
+    if args.date_from > args.date_to:
+        raise ValueError("--date-from must be before or equal to --date-to.")
+    if args.stats_ttl_seconds < 0:
+        raise ValueError("--stats-ttl-seconds must be non-negative.")
+
+    languages = parse_csv_arg(args.languages)
+    types = parse_csv_arg(args.types)
+    redis_key = args.stats_redis_key or default_stats_redis_key(languages, types)
+    collector = OpenAlexMonthlyStatsCollector(
+        redis_adapter=RedisAdapter(build_redis_client(args)),
+        redis_key=redis_key,
+        base_url=args.openalex_url
+        or os.getenv("OPENALEX_BASE_URL")
+        or "https://api.openalex.org",
+        request_workers=args.request_workers,
+        rate_limiter=AsyncRateLimiter(args.rate_limit_rps),
+        max_retries=args.max_retries,
+        ttl_seconds=args.stats_ttl_seconds or None,
+    )
+    result = await collector.collect_and_store(
+        date_from=args.date_from,
+        date_to=args.date_to,
+        languages=languages,
+        types=types,
+        missing_only=args.missing_only,
+        show_progress=not args.no_progress,
+    )
+    return {
+        "command": "collect-stats",
+        "redis_key": result.redis_key,
+        "date_from": result.date_from,
+        "date_to": result.date_to,
+        "collected_months": result.collected_months,
+        "openalex_requests": result.openalex_requests,
+        "failed": result.failed,
+        "errors": result.errors,
+        "months": [
+            {
+                "period": item.period,
+                "date_from": item.date_from,
+                "date_to": item.date_to,
+                "count": item.count,
+            }
+            for item in result.months
+        ],
+    }
+
+
+def resolve_target_count(
+    target_count: int | None,
+    target_period_count: int | None,
+) -> tuple[int, str]:
+    """Resolve target count and whether it applies to total DB or requested period."""
+    if target_count is not None and target_period_count is not None:
+        raise ValueError("--target-count and --target-period-count are mutually exclusive.")
+    if target_period_count is not None:
+        if target_period_count < 0:
+            raise ValueError("--target-period-count must be non-negative.")
+        return target_period_count, "period"
+    if target_count is not None:
+        if target_count < 0:
             raise ValueError("--target-count must be non-negative.")
-        return cli_value
+        return target_count, "total"
     env_value = os.getenv("BOOTSTRAP_PAPERS_COUNT") or os.getenv("BOOSTRAP_PAPERS_COUNT")
     if env_value is None or not env_value.strip():
         raise ValueError(
-            "--target-count is required unless BOOTSTRAP_PAPERS_COUNT is set."
+            "--target-count or --target-period-count is required unless "
+            "BOOTSTRAP_PAPERS_COUNT is set."
         )
-    target_count = int(env_value)
-    if target_count < 0:
+    resolved_target_count = int(env_value)
+    if resolved_target_count < 0:
         raise ValueError("BOOTSTRAP_PAPERS_COUNT must be non-negative.")
-    return target_count
+    return resolved_target_count, "total"
+
+
+def build_optional_redis_adapter(
+    args: argparse.Namespace,
+    request: OpenAlexBootstrapRequestDTO,
+) -> RedisAdapter | None:
+    """Build Redis adapter when bootstrap needs Redis for stats or task enqueueing."""
+    needs_redis_stats = request.normalize != "none" and request.monthly_stats_source == "redis"
+    needs_redis_queue = request.enqueue_indexing and not request.dry_run
+    if not needs_redis_stats and not needs_redis_queue:
+        return None
+    return RedisAdapter(build_redis_client(args))
+
+
+def default_stats_redis_key(languages: list[str], types: list[str]) -> str:
+    """Build a stable Redis key for OpenAlex stats with the selected filters."""
+    language_part = ",".join(sorted(languages)) or "all"
+    type_part = ",".join(sorted(types)) or "all"
+    return f"{DEFAULT_STATS_REDIS_KEY_PREFIX}:languages={language_part}:types={type_part}"
 
 
 def add_redis_args(parser: argparse.ArgumentParser) -> None:
@@ -361,12 +589,20 @@ def _optional_int_env(name: str) -> int | None:
     return int(value)
 
 
-def configure_logging() -> None:
+def configure_logging(verbosity: int = 0) -> None:
     """Configure bootstrap logging."""
+    env_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = logging.DEBUG if verbosity > 0 else getattr(logging, env_level, logging.INFO)
     logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
+        level=level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    if verbosity < 2:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+    else:
+        logging.getLogger("httpx").setLevel(logging.DEBUG)
+        logging.getLogger("httpcore").setLevel(logging.DEBUG)
 
 
 def print_json(payload: dict[str, Any], *, stream: Any = sys.stdout) -> None:

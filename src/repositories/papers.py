@@ -64,6 +64,19 @@ class PaperRepository(BaseRepository):
         """Return total paper count."""
         return int(self.session.scalar(select(func.count()).select_from(Paper)) or 0)
 
+    def count_by_period(
+        self,
+        date_from: date | None,
+        date_to: date | None,
+    ) -> int:
+        """Return paper count whose publication_date falls within the period."""
+        stmt = select(func.count()).select_from(Paper)
+        if date_from is not None:
+            stmt = stmt.where(Paper.publication_date >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(Paper.publication_date <= date_to)
+        return int(self.session.scalar(stmt) or 0)
+
     def existing_external_paper_keys(
         self,
         items: list[ExternalPaperDTO],

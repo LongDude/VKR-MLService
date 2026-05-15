@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
+from tqdm.auto import tqdm
 
 from dto.external import ExternalPaperDTO
 from ingestion.openalex_bootstrap.dto import BatchImportResultDTO
@@ -41,6 +42,7 @@ class OpenAlexBatchImporter:
         *,
         db_workers: int = 2,
         skip_existing: bool = False,
+        show_progress: bool = False,
     ) -> BatchImportResultDTO:
         """Import papers with multiple database workers and one session per worker task."""
         prepared, result = self._prepare_papers(papers)
@@ -50,17 +52,23 @@ class OpenAlexBatchImporter:
         chunks = list(self._chunks(prepared, self.batch_size))
         loop = asyncio.get_running_loop()
         with ThreadPoolExecutor(max_workers=max(1, db_workers)) as executor:
-            partial_results = await asyncio.gather(
-                *[
-                    loop.run_in_executor(
-                        executor,
-                        self._import_batch_with_session,
-                        chunk,
-                        skip_existing,
-                    )
-                    for chunk in chunks
-                ]
-            )
+            tasks = [
+                loop.run_in_executor(
+                    executor,
+                    self._import_batch_with_session,
+                    chunk,
+                    skip_existing,
+                )
+                for chunk in chunks
+            ]
+            if show_progress:
+                partial_results = []
+                with tqdm(total=len(tasks), desc="PostgreSQL import", unit="batch") as progress:
+                    for task in asyncio.as_completed(tasks):
+                        partial_results.append(await task)
+                        progress.update(1)
+            else:
+                partial_results = await asyncio.gather(*tasks)
 
         for partial in partial_results:
             self._merge_result(result, partial)
