@@ -22,10 +22,11 @@ from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.scoring import ScoringService
 from ml.services.trend_status import TrendStatusService
 from ml.services.vector_math import VectorMathService
+from ml.services.events import EventSink, MLEvent, NoopEventSink
 
 
 ENTITY_PAGE_SIZE = 500
-QDRANT_VECTOR_RETRIEVE_BATCH_SIZE = 256
+QDRANT_VECTOR_RETRIEVE_BATCH_SIZE = 512
 PAPER_METADATA_BATCH_SIZE = 1000
 MIN_INDEXED_PAPERS_FOR_CLUSTER = 2
 REPRESENTATIVE_PAPER_LIMIT = 5
@@ -68,6 +69,7 @@ class ClusterAnalyticsFacade:
         scoring_service: ScoringService | None = None,
         trend_status_service: TrendStatusService | None = None,
         payload_builder: QdrantPayloadBuilder | None = None,
+        event_sink: EventSink | None = None,
         papers_collection: str = PAPERS_COLLECTION,
         trend_clusters_collection: str = TREND_CLUSTERS_COLLECTION,
     ) -> None:
@@ -81,6 +83,7 @@ class ClusterAnalyticsFacade:
         self.scoring_service = scoring_service or ScoringService()
         self.trend_status_service = trend_status_service or TrendStatusService()
         self.payload_builder = payload_builder or QdrantPayloadBuilder()
+        self.event_sink = event_sink or NoopEventSink()
         self.papers_collection = papers_collection
         self.trend_clusters_collection = trend_clusters_collection
 
@@ -116,6 +119,20 @@ class ClusterAnalyticsFacade:
             )
 
         result = BatchOperationResultDTO()
+        self._emit(
+            "cluster_batch_started",
+            entity_id="all",
+            stage="batch",
+            current=0,
+            total=limit,
+            message="Starting trend cluster recompute",
+            payload={
+                "date_from": date_from,
+                "date_to": date_to,
+                "limit": limit,
+                "batch_size": batch_size,
+            },
+        )
         for topic_id in self._iter_topic_ids(date_from, date_to, limit, batch_size):
             result.total += 1
             try:
@@ -134,6 +151,29 @@ class ClusterAnalyticsFacade:
                 result.errors.append(self._error_payload(topic_id, exc))
             else:
                 result.updated += 1
+            self._emit(
+                "cluster_batch_progress",
+                entity_id="all",
+                stage="topics",
+                current=result.total,
+                total=limit,
+                message=(
+                    f"topics done={result.total} updated={result.updated} "
+                    f"skipped={result.skipped} failed={result.failed}"
+                ),
+            )
+        self._emit(
+            "cluster_batch_completed",
+            entity_id="all",
+            stage="topics",
+            current=result.total,
+            total=result.total,
+            message=(
+                f"Cluster recompute completed: updated={result.updated} "
+                f"skipped={result.skipped} failed={result.failed}"
+            ),
+            payload=result.model_dump(mode="json"),
+        )
         return result
 
     def recompute_cluster(
@@ -142,96 +182,170 @@ class ClusterAnalyticsFacade:
         force_summary: bool = False,
     ) -> TrendClusterDTO:
         """Recompute one MVP trend cluster identified as ``topic:{topic_id}``."""
-        topic_id = self._parse_topic_cluster_id(cluster_id)
-        topic = self.taxonomy_repository.get_topic_by_id(topic_id)
-        if topic is None:
-            raise EntityNotFoundError(
-                "Topic not found",
-                details={"cluster_id": cluster_id, "topic_id": topic_id},
+        self._emit(
+            "cluster_started",
+            entity_id=cluster_id,
+            stage="started",
+            message="Starting cluster recompute",
+            payload={"force_summary": force_summary},
+        )
+        try:
+            topic_id = self._parse_topic_cluster_id(cluster_id)
+            topic = self.taxonomy_repository.get_topic_by_id(topic_id)
+            if topic is None:
+                raise EntityNotFoundError(
+                    "Topic not found",
+                    details={"cluster_id": cluster_id, "topic_id": topic_id},
+                )
+
+            paper_ids = self.taxonomy_repository.list_paper_ids_by_topic(topic_id)
+            self._emit(
+                "paper_ids_loaded",
+                entity_id=cluster_id,
+                stage="paper_ids",
+                current=len(paper_ids),
+                total=len(paper_ids),
+                message=f"Loaded {len(paper_ids)} topic paper ids",
+            )
+            vector_data = self._cluster_vector_data(paper_ids, cluster_id=cluster_id)
+            if vector_data.indexed_paper_count < MIN_INDEXED_PAPERS_FOR_CLUSTER:
+                raise InvalidRequestError(
+                    "Topic has fewer than two indexed papers",
+                    details={
+                        "cluster_id": cluster_id,
+                        "topic_id": topic_id,
+                        "indexed_paper_count": vector_data.indexed_paper_count,
+                        "reason": "insufficient_indexed_papers",
+                    },
+                )
+
+            centroid = vector_data.centroid
+            representative_paper_ids = self._representative_paper_ids(
+                vector_data.representative_candidates,
+                centroid,
+            )
+            paper_metadata = self._paper_metadata(
+                paper_ids,
+                representative_paper_ids,
+                cluster_id=cluster_id,
             )
 
-        paper_ids = self.taxonomy_repository.list_paper_ids_by_topic(topic_id)
-        vector_data = self._cluster_vector_data(paper_ids)
-        if vector_data.indexed_paper_count < MIN_INDEXED_PAPERS_FOR_CLUSTER:
-            raise InvalidRequestError(
-                "Topic has fewer than two indexed papers",
-                details={
-                    "cluster_id": cluster_id,
-                    "topic_id": topic_id,
+            metrics_payload = self._calculate_metrics(paper_metadata.paper_dates)
+            self._emit(
+                "metrics_calculated",
+                entity_id=cluster_id,
+                stage="metrics",
+                message=(
+                    f"trend_score={metrics_payload['trend_score']:.3f} "
+                    f"status={metrics_payload['status']}"
+                ),
+                payload=metrics_payload,
+            )
+            top_keywords = vector_data.top_keywords
+            representative_titles = self._paper_titles(
+                representative_paper_ids,
+                paper_metadata.representative_paper_by_id,
+            )
+            representative_abstracts = self._paper_abstracts(
+                representative_paper_ids,
+                paper_metadata.representative_paper_by_id,
+            )
+
+            existing_cluster = self.get_cluster(cluster_id)
+            summary = existing_cluster.summary if existing_cluster is not None else None
+            summary_degraded = False
+            if force_summary or not summary:
+                self._emit(
+                    "summary_started",
+                    entity_id=cluster_id,
+                    stage="summary",
+                    message="Generating cluster summary",
+                )
+                cluster_summary = self.summary_facade.summarize_cluster(
+                    cluster_name=self._topic_name(topic),
+                    paper_titles=representative_titles,
+                    abstracts=representative_abstracts,
+                    top_keywords=top_keywords,
+                )
+                summary = cluster_summary.summary
+                summary_degraded = cluster_summary.degraded
+                self._emit(
+                    "summary_completed",
+                    entity_id=cluster_id,
+                    stage="summary",
+                    message=(
+                        "Cluster summary generated"
+                        if not summary_degraded
+                        else "Cluster summary generated with fallback"
+                    ),
+                    payload={"degraded": summary_degraded},
+                )
+
+            trend_cluster = TrendClusterDTO(
+                id=topic_id,
+                cluster_key=cluster_id,
+                cluster_type="topic",
+                name=self._topic_name(topic),
+                summary=summary,
+                status=metrics_payload["status"],
+                source_topic_id=topic_id,
+                metrics=TrendMetricsDTO(
+                    paper_count=metrics_payload["paper_count_total"],
+                    previous_paper_count=metrics_payload["previous_90d_count"],
+                    growth_rate=self._decimal(metrics_payload["growth_rate_90d"]),
+                    trend_score=self._decimal(metrics_payload["trend_score"]),
+                    citation_count_sum=paper_metadata.citation_count_sum,
+                    avg_cited_by_count=paper_metadata.avg_cited_by_count,
+                ),
+                top_keywords=top_keywords,
+                representative_paper_ids=representative_paper_ids,
+            )
+
+            payload = self.payload_builder.build_trend_cluster_payload(
+                trend_cluster,
+                cluster_id=cluster_id,
+                **metrics_payload,
+                indexed_paper_count=vector_data.indexed_paper_count,
+                vector_retrieve_batch_size=QDRANT_VECTOR_RETRIEVE_BATCH_SIZE,
+                representative_candidate_count=len(vector_data.representative_candidates),
+                summary_degraded=summary_degraded,
+                indexed_at=datetime.now(timezone.utc),
+            )
+            self.qdrant_adapter.upsert_point(
+                self.trend_clusters_collection,
+                cluster_id,
+                centroid,
+                payload,
+            )
+            self._emit(
+                "qdrant_upsert_completed",
+                entity_id=cluster_id,
+                stage="qdrant_upsert",
+                message="Cluster point upserted",
+                payload={"collection": self.trend_clusters_collection},
+            )
+            self._cache_cluster(trend_cluster)
+            self._emit(
+                "cluster_completed",
+                entity_id=cluster_id,
+                stage="completed",
+                message="Cluster recompute completed",
+                payload={
                     "indexed_paper_count": vector_data.indexed_paper_count,
-                    "reason": "insufficient_indexed_papers",
+                    "trend_score": metrics_payload["trend_score"],
+                    "status": metrics_payload["status"],
                 },
             )
-
-        centroid = vector_data.centroid
-        representative_paper_ids = self._representative_paper_ids(
-            vector_data.representative_candidates,
-            centroid,
-        )
-        paper_metadata = self._paper_metadata(paper_ids, representative_paper_ids)
-
-        metrics_payload = self._calculate_metrics(paper_metadata.paper_dates)
-        top_keywords = vector_data.top_keywords
-        representative_titles = self._paper_titles(
-            representative_paper_ids,
-            paper_metadata.representative_paper_by_id,
-        )
-        representative_abstracts = self._paper_abstracts(
-            representative_paper_ids,
-            paper_metadata.representative_paper_by_id,
-        )
-
-        existing_cluster = self.get_cluster(cluster_id)
-        summary = existing_cluster.summary if existing_cluster is not None else None
-        summary_degraded = False
-        if force_summary or not summary:
-            cluster_summary = self.summary_facade.summarize_cluster(
-                cluster_name=self._topic_name(topic),
-                paper_titles=representative_titles,
-                abstracts=representative_abstracts,
-                top_keywords=top_keywords,
+            return trend_cluster
+        except Exception as exc:
+            self._emit(
+                "cluster_failed",
+                entity_id=cluster_id,
+                stage="failed",
+                message=str(exc),
+                payload={"error_type": exc.__class__.__name__},
             )
-            summary = cluster_summary.summary
-            summary_degraded = cluster_summary.degraded
-
-        trend_cluster = TrendClusterDTO(
-            id=topic_id,
-            cluster_key=cluster_id,
-            cluster_type="topic",
-            name=self._topic_name(topic),
-            summary=summary,
-            status=metrics_payload["status"],
-            source_topic_id=topic_id,
-            metrics=TrendMetricsDTO(
-                paper_count=metrics_payload["paper_count_total"],
-                previous_paper_count=metrics_payload["previous_90d_count"],
-                growth_rate=self._decimal(metrics_payload["growth_rate_90d"]),
-                trend_score=self._decimal(metrics_payload["trend_score"]),
-                citation_count_sum=paper_metadata.citation_count_sum,
-                avg_cited_by_count=paper_metadata.avg_cited_by_count,
-            ),
-            top_keywords=top_keywords,
-            representative_paper_ids=representative_paper_ids,
-        )
-
-        payload = self.payload_builder.build_trend_cluster_payload(
-            trend_cluster,
-            cluster_id=cluster_id,
-            **metrics_payload,
-            indexed_paper_count=vector_data.indexed_paper_count,
-            vector_retrieve_batch_size=QDRANT_VECTOR_RETRIEVE_BATCH_SIZE,
-            representative_candidate_count=len(vector_data.representative_candidates),
-            summary_degraded=summary_degraded,
-            indexed_at=datetime.now(timezone.utc),
-        )
-        self.qdrant_adapter.upsert_point(
-            self.trend_clusters_collection,
-            cluster_id,
-            centroid,
-            payload,
-        )
-        self._cache_cluster(trend_cluster)
-        return trend_cluster
+            raise
 
     def get_cluster(
         self,
@@ -312,11 +426,17 @@ class ClusterAnalyticsFacade:
                 break
             offset += page_limit
 
-    def _cluster_vector_data(self, paper_ids: list[int]) -> _ClusterVectorData:
+    def _cluster_vector_data(
+        self,
+        paper_ids: list[int],
+        *,
+        cluster_id: str | None = None,
+    ) -> _ClusterVectorData:
         mean_vector: list[float] | None = None
         indexed_paper_count = 0
         representative_candidates: list[QdrantPointDTO] = []
         keyword_counter: Counter[str] = Counter()
+        processed = 0
 
         for chunk in self._chunks(paper_ids, QDRANT_VECTOR_RETRIEVE_BATCH_SIZE):
             points = self.qdrant_adapter.retrieve(
@@ -324,6 +444,7 @@ class ClusterAnalyticsFacade:
                 chunk,
                 with_vectors=True,
             )
+            processed += len(chunk)
             for point in self._indexed_points(points):
                 mean_vector, indexed_paper_count = (
                     self.vector_math_service.update_mean_vector(
@@ -335,6 +456,15 @@ class ClusterAnalyticsFacade:
                 if len(representative_candidates) < REPRESENTATIVE_CANDIDATE_LIMIT:
                     representative_candidates.append(point)
                 self._add_payload_keywords(keyword_counter, point)
+            self._emit(
+                "qdrant_vectors_progress",
+                entity_id=cluster_id,
+                stage="qdrant_vectors",
+                current=processed,
+                total=len(paper_ids),
+                message=f"vectors={indexed_paper_count}",
+                payload={"indexed_paper_count": indexed_paper_count},
+            )
 
         return _ClusterVectorData(
             centroid=mean_vector or [],
@@ -350,6 +480,8 @@ class ClusterAnalyticsFacade:
         self,
         paper_ids: list[int],
         representative_paper_ids: list[int],
+        *,
+        cluster_id: str | None = None,
     ) -> _PaperMetadata:
         paper_dates: list[date] = []
         citation_count_sum = 0
@@ -357,6 +489,7 @@ class ClusterAnalyticsFacade:
         representative_id_set = set(representative_paper_ids)
         representative_paper_by_id: dict[int, Any] = {}
 
+        processed = 0
         for chunk in self._chunks(paper_ids, PAPER_METADATA_BATCH_SIZE):
             for paper in self.paper_repository.get_by_ids(chunk):
                 paper_count += 1
@@ -365,6 +498,16 @@ class ClusterAnalyticsFacade:
                     representative_paper_by_id[int(paper_id)] = paper
                 citation_count_sum += int(getattr(paper, "cited_by_count", 0) or 0)
                 paper_dates.extend(self._paper_dates([paper]))
+            processed += len(chunk)
+            self._emit(
+                "postgres_metadata_progress",
+                entity_id=cluster_id,
+                stage="postgres_metadata",
+                current=processed,
+                total=len(paper_ids),
+                message=f"metadata={paper_count}",
+                payload={"loaded_paper_count": paper_count},
+            )
 
         avg_cited_by_count = (
             self._decimal(citation_count_sum / paper_count)
@@ -652,6 +795,30 @@ class ClusterAnalyticsFacade:
         if value is None:
             return None
         return Decimal(str(value))
+
+    def _emit(
+        self,
+        event_type: str,
+        *,
+        entity_id: str | int | None = None,
+        stage: str | None = None,
+        current: int | None = None,
+        total: int | None = None,
+        message: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.event_sink.emit(
+            MLEvent(
+                event_type=event_type,
+                task_type="cluster_recompute",
+                entity_id=entity_id,
+                stage=stage,
+                current=current,
+                total=total,
+                message=message,
+                payload=payload or {},
+            )
+        )
 
 
 __all__ = ["ClusterAnalyticsFacade"]

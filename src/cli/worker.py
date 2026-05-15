@@ -41,6 +41,14 @@ from ml.pipelines.paper_indexing_pipeline import PaperIndexingPipeline
 from ml.pipelines.research_entities_pipeline import ResearchEntitiesPipeline
 from ml.pipelines.trend_recompute_pipeline import TrendRecomputePipeline
 from ml.pipelines.user_profile_pipeline import UserProfilePipeline
+from ml.services.events import (
+    CompositeEventSink,
+    EventSink,
+    LoggingEventSink,
+    NoopEventSink,
+    RedisEventSink,
+    TqdmEventSink,
+)
 from ml.workers.redis_worker import (
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
@@ -117,6 +125,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-progress",
         action="store_true",
         help="Disable tqdm progress bars for worker tasks.",
+    )
+    run_parser.add_argument(
+        "--event-redis",
+        action="store_true",
+        help="Write latest task status events to Redis.",
+    )
+    run_parser.add_argument(
+        "--event-ttl-seconds",
+        type=int,
+        default=24 * 60 * 60,
+        help="TTL for Redis event status keys. Defaults to 86400.",
     )
     run_parser.add_argument(
         "--paper-indexing-batch-size",
@@ -228,6 +247,8 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--cluster-recompute-batch-size must be a positive integer.")
     if args.max_cluster_task_size is not None and args.max_cluster_task_size <= 0:
         raise ValueError("--max-cluster-task-size must be a positive integer.")
+    if args.event_ttl_seconds <= 0:
+        raise ValueError("--event-ttl-seconds must be a positive integer.")
     max_paper_task_size = args.max_paper_task_size or args.paper_indexing_batch_size
     max_cluster_task_size = (
         args.max_cluster_task_size or args.cluster_recompute_batch_size
@@ -241,6 +262,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
     processed = 0
     try:
         redis_adapter = RedisAdapter(build_redis_client(args))
+        event_sink = build_event_sink(args, redis_adapter=redis_adapter)
         qdrant_adapter = build_qdrant_adapter(args)
         embedding_adapter = LMStudioEmbeddingAdapter(
             base_url=args.lmstudio_url
@@ -263,6 +285,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 embedding_model=args.embedding_model
                 or os.getenv("EMBEDDING_MODEL")
                 or DEFAULT_EMBEDDING_MODEL,
+                event_sink=event_sink,
             )
             worker = RedisMLWorker(
                 redis_adapter=redis_adapter,
@@ -278,6 +301,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 },
                 idle_sleep_seconds=args.idle_sleep,
                 show_progress=not args.no_progress,
+                event_sink=event_sink,
             )
             logging.getLogger(__name__).info(
                 "Starting Redis ML worker queues=%s max_tasks=%s progress=%s verbosity=%s",
@@ -309,6 +333,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 CLUSTER_RECOMPUTE_QUEUE: max_cluster_task_size,
             },
             "progress": not args.no_progress,
+            "event_redis": bool(args.event_redis),
             "verbosity": args.verbose,
             "processed": processed,
         }
@@ -324,6 +349,7 @@ def build_task_handler(
     embedding_adapter: LMStudioEmbeddingAdapter,
     chat_adapter: LMStudioChatAdapter,
     embedding_model: str,
+    event_sink: EventSink,
 ) -> MLTaskHandler:
     """Build task handler with all ML pipelines configured."""
     taxonomy_repository = TaxonomyRepository(session)
@@ -342,6 +368,7 @@ def build_task_handler(
             qdrant_adapter=qdrant_adapter,
             redis_adapter=redis_adapter,
             embedding_model=embedding_model,
+            event_sink=event_sink,
         )
     )
     research_entities_pipeline = ResearchEntitiesPipeline(
@@ -351,6 +378,7 @@ def build_task_handler(
             embedding_adapter=embedding_adapter,
             qdrant_adapter=qdrant_adapter,
             embedding_model=embedding_model,
+            event_sink=event_sink,
         )
     )
     trend_recompute_pipeline = TrendRecomputePipeline(
@@ -361,6 +389,7 @@ def build_task_handler(
             qdrant_adapter=qdrant_adapter,
             redis_adapter=redis_adapter,
             summary_facade=summary_facade,
+            event_sink=event_sink,
         )
     )
     cluster_dynamics_pipeline = ClusterDynamicsPipeline(
@@ -368,6 +397,7 @@ def build_task_handler(
             taxonomy_repository=taxonomy_repository,
             paper_graph_repository=paper_graph_repository,
             qdrant_adapter=qdrant_adapter,
+            event_sink=event_sink,
         )
     )
     user_profile_pipeline = UserProfilePipeline(
@@ -376,6 +406,7 @@ def build_task_handler(
             tracked_area_repository=TrackedAreaRepository(session),
             taxonomy_repository=taxonomy_repository,
             qdrant_adapter=qdrant_adapter,
+            event_sink=event_sink,
         )
     )
 
@@ -386,6 +417,7 @@ def build_task_handler(
         trend_recompute_pipeline=trend_recompute_pipeline,
         cluster_dynamics_pipeline=cluster_dynamics_pipeline,
         user_profile_pipeline=user_profile_pipeline,
+        event_sink=event_sink,
     )
 
 
@@ -515,6 +547,29 @@ def build_qdrant_adapter(args: argparse.Namespace) -> QdrantAdapter:
     )
 
 
+def build_event_sink(
+    args: argparse.Namespace,
+    *,
+    redis_adapter: RedisAdapter,
+) -> EventSink:
+    """Build the worker event sink chain from CLI flags."""
+    sinks: list[EventSink] = [
+        LoggingEventSink(logging.getLogger("ml.worker.events"), verbosity=args.verbose)
+    ]
+    if not args.no_progress:
+        sinks.append(TqdmEventSink())
+    if args.event_redis:
+        sinks.append(
+            RedisEventSink(
+                redis_adapter,
+                ttl_seconds=max(1, int(args.event_ttl_seconds)),
+            )
+        )
+    if not sinks:
+        return NoopEventSink()
+    return CompositeEventSink(sinks, logger=logging.getLogger("ml.worker.events"))
+
+
 def _optional_int_env(name: str) -> int | None:
     value = os.getenv(name)
     if value is None or not value.strip():
@@ -525,7 +580,12 @@ def _optional_int_env(name: str) -> int | None:
 def configure_logging(verbosity: int = 0) -> None:
     """Configure basic worker logging."""
     env_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = logging.DEBUG if verbosity > 0 else getattr(logging, env_level, logging.INFO)
+    if verbosity <= 0:
+        level = getattr(logging, env_level, logging.INFO)
+    elif verbosity == 1:
+        level = logging.INFO
+    else:
+        level = logging.DEBUG
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",

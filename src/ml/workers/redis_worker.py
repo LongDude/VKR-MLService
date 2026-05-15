@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from contextlib import nullcontext
 import logging
 import time
 from typing import Any, Sequence
 
-from tqdm.auto import tqdm
-
 from adapters.redis_adapter import RedisAdapter
 from core.exceptions import AppError
+from ml.services.events import EventSink, MLEvent, NoopEventSink, TqdmEventSink
 from ml.workers.task_handlers import MLTaskHandler
 
 
@@ -42,6 +40,7 @@ class RedisMLWorker:
         dequeue_timeout_seconds: int = 1,
         idle_sleep_seconds: float = 1.0,
         show_progress: bool = False,
+        event_sink: EventSink | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.redis_adapter = redis_adapter
@@ -59,6 +58,9 @@ class RedisMLWorker:
         self.dequeue_timeout_seconds = dequeue_timeout_seconds
         self.idle_sleep_seconds = idle_sleep_seconds
         self.show_progress = show_progress
+        self.event_sink = event_sink or (
+            TqdmEventSink() if show_progress else NoopEventSink()
+        )
         self.logger = logger or logging.getLogger(__name__)
         self._stop_requested = False
         self.last_processed_message_count = 0
@@ -225,24 +227,44 @@ class RedisMLWorker:
             extra=task_summary,
         )
         started_at = time.monotonic()
-        progress_context = self._progress_context(task_summary)
+        self._emit_worker_event(
+            "worker_task_started",
+            task_summary,
+            current=0,
+            total=task_summary["item_count"],
+            message="Worker task started",
+        )
         try:
-            with progress_context as progress:
-                self.task_handler.handle(message)
-                if progress is not None:
-                    progress.update(task_summary["item_count"])
+            self.task_handler.handle(message)
         except Exception as exc:
+            self._emit_worker_event(
+                "worker_task_failed",
+                task_summary,
+                current=task_summary["item_count"],
+                total=task_summary["item_count"],
+                message=str(exc),
+                payload={"error_type": exc.__class__.__name__},
+            )
             self._handle_task_error(queue_name, message, exc)
         else:
+            elapsed_seconds = round(time.monotonic() - started_at, 3)
+            self._emit_worker_event(
+                "worker_task_completed",
+                task_summary,
+                current=task_summary["item_count"],
+                total=task_summary["item_count"],
+                message="Worker task completed",
+                payload={"elapsed_seconds": elapsed_seconds},
+            )
             self.logger.info(
                 "ML task completed queue=%s task_type=%s item_count=%s elapsed_seconds=%s",
                 task_summary["queue_name"],
                 task_summary["task_type"],
                 task_summary["item_count"],
-                round(time.monotonic() - started_at, 3),
+                elapsed_seconds,
                 extra={
                     **task_summary,
-                    "elapsed_seconds": round(time.monotonic() - started_at, 3),
+                    "elapsed_seconds": elapsed_seconds,
                 },
             )
 
@@ -404,16 +426,6 @@ class RedisMLWorker:
             "task_message": self._safe_message_summary(message),
         }
 
-    def _progress_context(self, task_summary: dict[str, Any]):
-        if not self.show_progress:
-            return nullcontext(None)
-        return tqdm(
-            total=int(task_summary["item_count"]),
-            desc=f"{task_summary['task_type']} [{task_summary['queue_name']}]",
-            unit="item",
-            leave=False,
-        )
-
     def _safe_message_summary(self, message: dict[str, Any]) -> dict[str, Any]:
         summary: dict[str, Any] = {}
         for key, value in message.items():
@@ -466,6 +478,34 @@ class RedisMLWorker:
             "message": str(exc),
             "details": {},
         }
+
+    def _emit_worker_event(
+        self,
+        event_type: str,
+        task_summary: dict[str, Any],
+        *,
+        current: int | None = None,
+        total: int | None = None,
+        message: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.event_sink.emit(
+            MLEvent(
+                event_type=event_type,
+                task_type=str(task_summary["task_type"]),
+                entity_id=task_summary.get("item_field") or "task",
+                stage="worker",
+                current=current,
+                total=total,
+                message=message,
+                payload={
+                    "queue_name": task_summary["queue_name"],
+                    "item_count": task_summary["item_count"],
+                    "item_field": task_summary.get("item_field"),
+                    **(payload or {}),
+                },
+            )
+        )
 
 
 __all__ = [

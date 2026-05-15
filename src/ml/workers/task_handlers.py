@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from core.exceptions import AppError, InvalidRequestError
 from dto.common import BatchOperationResultDTO, OperationResultDTO
+from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.pipelines.cluster_dynamics_pipeline import ClusterDynamicsPipeline
 from ml.pipelines.paper_indexing_pipeline import PaperIndexingPipeline
 from ml.pipelines.research_entities_pipeline import ResearchEntitiesPipeline
@@ -25,6 +26,7 @@ class MLTaskHandler:
         trend_recompute_pipeline: TrendRecomputePipeline | None = None,
         cluster_dynamics_pipeline: ClusterDynamicsPipeline | None = None,
         user_profile_pipeline: UserProfilePipeline | None = None,
+        event_sink: EventSink | None = None,
     ) -> None:
         self.session = session
         self.paper_indexing_pipeline = paper_indexing_pipeline
@@ -32,6 +34,7 @@ class MLTaskHandler:
         self.trend_recompute_pipeline = trend_recompute_pipeline
         self.cluster_dynamics_pipeline = cluster_dynamics_pipeline
         self.user_profile_pipeline = user_profile_pipeline
+        self.event_sink = event_sink or NoopEventSink()
 
     def handle(self, message: dict) -> OperationResultDTO:
         try:
@@ -101,6 +104,9 @@ class MLTaskHandler:
         result = pipeline.run(
             force_reindex=self._bool_field(message, "force_reindex", default=False),
             limit=self._optional_int(message, "limit"),
+            offset=self._optional_int(message, "offset") or 0,
+            entity_type=str(message.get("entity_type") or "all"),
+            batch_size=self._optional_int(message, "batch_size") or 128,
         )
         return self._batch_result(
             result,
@@ -130,7 +136,16 @@ class MLTaskHandler:
         topic_ids = self._topic_ids_from_message(message)
         if topic_ids:
             result = BatchOperationResultDTO(total=len(topic_ids))
-            for topic_id in topic_ids:
+            self._emit(
+                "cluster_batch_started",
+                "cluster_recompute",
+                entity_id="worker_batch",
+                stage="topics",
+                current=0,
+                total=len(topic_ids),
+                message=f"Recomputing {len(topic_ids)} topic clusters",
+            )
+            for index, topic_id in enumerate(topic_ids, start=1):
                 cluster_id = f"topic:{topic_id}"
                 try:
                     pipeline.recompute_cluster(
@@ -146,6 +161,31 @@ class MLTaskHandler:
                     )
                 else:
                     result.updated += 1
+                self._emit(
+                    "cluster_batch_progress",
+                    "cluster_recompute",
+                    entity_id="worker_batch",
+                    stage="topics",
+                    current=index,
+                    total=len(topic_ids),
+                    message=(
+                        f"topic={topic_id} updated={result.updated} "
+                        f"failed={result.failed}"
+                    ),
+                )
+            self._emit(
+                "cluster_batch_completed",
+                "cluster_recompute",
+                entity_id="worker_batch",
+                stage="topics",
+                current=len(topic_ids),
+                total=len(topic_ids),
+                message=(
+                    f"Topic cluster batch completed: updated={result.updated} "
+                    f"failed={result.failed}"
+                ),
+                payload=result.model_dump(mode="json"),
+            )
             return self._batch_result(
                 result,
                 "Topic cluster recompute completed",
@@ -155,6 +195,9 @@ class MLTaskHandler:
         result = pipeline.recompute_all(
             force_summary=force_summary,
             limit=self._optional_int(message, "limit"),
+            date_from=self._optional_date(message, "date_from"),
+            date_to=self._optional_date(message, "date_to"),
+            batch_size=self._optional_int(message, "batch_size") or 500,
         )
         return self._batch_result(
             result,
@@ -309,6 +352,11 @@ class MLTaskHandler:
             details={"field": field, "value": value},
         )
 
+    def _optional_date(self, message: dict[str, Any], field: str) -> date | None:
+        if field not in message or message.get(field) is None:
+            return None
+        return self._required_date(message, field)
+
     def _granularity(self, value: Any) -> Granularity:
         if value in {"week", "month"}:
             return value
@@ -340,6 +388,31 @@ class MLTaskHandler:
             "message": str(exc),
             "details": {},
         }
+
+    def _emit(
+        self,
+        event_type: str,
+        task_type: str,
+        *,
+        entity_id: str | int | None = None,
+        stage: str | None = None,
+        current: int | None = None,
+        total: int | None = None,
+        message: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.event_sink.emit(
+            MLEvent(
+                event_type=event_type,
+                task_type=task_type,
+                entity_id=entity_id,
+                stage=stage,
+                current=current,
+                total=total,
+                message=message,
+                payload=payload or {},
+            )
+        )
 
 
 __all__ = ["MLTaskHandler"]

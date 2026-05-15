@@ -17,6 +17,7 @@ from repositories.taxonomy import TaxonomyRepository
 
 from ml.constants import PAPERS_COLLECTION, TREND_CLUSTER_PERIODS_COLLECTION
 from ml.services.chart_builder import ChartBuilderService
+from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.scoring import ScoringService
 from ml.services.vector_math import VectorMathService
@@ -46,6 +47,7 @@ class ClusterDynamicsFacade:
         scoring_service: ScoringService | None = None,
         chart_builder_service: ChartBuilderService | None = None,
         payload_builder: QdrantPayloadBuilder | None = None,
+        event_sink: EventSink | None = None,
         papers_collection: str = PAPERS_COLLECTION,
         period_collection: str = TREND_CLUSTER_PERIODS_COLLECTION,
     ) -> None:
@@ -56,6 +58,7 @@ class ClusterDynamicsFacade:
         self.scoring_service = scoring_service or ScoringService()
         self.chart_builder_service = chart_builder_service or ChartBuilderService()
         self.payload_builder = payload_builder or QdrantPayloadBuilder()
+        self.event_sink = event_sink or NoopEventSink()
         self.papers_collection = papers_collection
         self.period_collection = period_collection
 
@@ -76,11 +79,40 @@ class ClusterDynamicsFacade:
             )
 
         windows = self._period_windows(date_from, date_to, granularity)
+        self._emit(
+            "cluster_dynamics_started",
+            entity_id=cluster_id,
+            stage="periods",
+            current=0,
+            total=len(windows),
+            message=f"Starting cluster dynamics recompute for {len(windows)} periods",
+            payload={
+                "date_from": date_from,
+                "date_to": date_to,
+                "granularity": granularity,
+            },
+        )
         all_paper_ids = self.taxonomy_repository.list_paper_ids_by_topic(topic_id)
+        self._emit(
+            "cluster_dynamics_paper_ids_loaded",
+            entity_id=cluster_id,
+            stage="paper_ids",
+            current=len(all_paper_ids),
+            total=len(all_paper_ids),
+            message=f"Loaded {len(all_paper_ids)} paper ids",
+        )
         all_points = self.qdrant_adapter.retrieve(
             self.papers_collection,
             all_paper_ids,
             with_vectors=True,
+        )
+        self._emit(
+            "cluster_dynamics_vectors_loaded",
+            entity_id=cluster_id,
+            stage="qdrant_vectors",
+            current=len(all_points),
+            total=len(all_paper_ids),
+            message=f"Loaded {len(all_points)} indexed paper vectors",
         )
         count_map = self._period_count_map(topic_id, date_from, date_to, granularity)
         previous_count_map = self._period_count_map(
@@ -92,7 +124,7 @@ class ClusterDynamicsFacade:
 
         result = BatchOperationResultDTO(total=len(windows))
         previous_centroid: list[float] | None = None
-        for window in windows:
+        for period_index, window in enumerate(windows, start=1):
             period_points = self._points_for_window(all_points, window)
             vectors = [point.vector for point in period_points if point.vector]
             paper_count = count_map.get(
@@ -120,6 +152,14 @@ class ClusterDynamicsFacade:
             if not vectors:
                 result.skipped += 1
                 previous_centroid = None
+                self._emit(
+                    "cluster_dynamics_progress",
+                    entity_id=cluster_id,
+                    stage="periods",
+                    current=period_index,
+                    total=len(windows),
+                    message=f"{window.period_start}: skipped, no vectors",
+                )
                 continue
 
             centroid = self.vector_math_service.mean_vector(vectors)
@@ -177,7 +217,28 @@ class ClusterDynamicsFacade:
                 payload,
             )
             result.updated += 1
+            self._emit(
+                "cluster_dynamics_progress",
+                entity_id=cluster_id,
+                stage="periods",
+                current=period_index,
+                total=len(windows),
+                message=f"{window.period_start}: papers={paper_count}",
+                payload={"period_id": period_id, "paper_count": paper_count},
+            )
 
+        self._emit(
+            "cluster_dynamics_completed",
+            entity_id=cluster_id,
+            stage="completed",
+            current=len(windows),
+            total=len(windows),
+            message=(
+                f"Cluster dynamics completed: updated={result.updated} "
+                f"skipped={result.skipped} failed={result.failed}"
+            ),
+            payload=result.model_dump(mode="json"),
+        )
         return result
 
     def get_cluster_periods(
@@ -548,6 +609,30 @@ class ClusterDynamicsFacade:
                 "date_from must be less than or equal to date_to",
                 details={"date_from": date_from, "date_to": date_to},
             )
+
+    def _emit(
+        self,
+        event_type: str,
+        *,
+        entity_id: str | int | None = None,
+        stage: str | None = None,
+        current: int | None = None,
+        total: int | None = None,
+        message: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.event_sink.emit(
+            MLEvent(
+                event_type=event_type,
+                task_type="cluster_dynamics_recompute",
+                entity_id=entity_id,
+                stage=stage,
+                current=current,
+                total=total,
+                message=message,
+                payload=payload or {},
+            )
+        )
 
 
 __all__ = ["ClusterDynamicsFacade"]

@@ -29,6 +29,7 @@ from repositories.taxonomy import TaxonomyRepository
 from utils.hashing import calculate_text_hash
 
 from ml.constants import DEFAULT_EMBEDDING_MODEL, PAPERS_COLLECTION
+from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.text_preparation import TextPreparationService
 
@@ -59,6 +60,7 @@ class PaperIndexingFacade:
         processing_state_repository: PaperProcessingStateRepository | None = None,
         text_preparation_service: TextPreparationService | None = None,
         payload_builder: QdrantPayloadBuilder | None = None,
+        event_sink: EventSink | None = None,
         collection_name: str = PAPERS_COLLECTION,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     ) -> None:
@@ -78,6 +80,7 @@ class PaperIndexingFacade:
             text_preparation_service or TextPreparationService()
         )
         self.payload_builder = payload_builder or QdrantPayloadBuilder()
+        self.event_sink = event_sink or NoopEventSink()
         self.collection_name = collection_name
         self.embedding_model = embedding_model
 
@@ -86,8 +89,20 @@ class PaperIndexingFacade:
         request: PaperIndexingRequestDTO,
     ) -> PaperIndexingResponseDTO:
         """Index one paper into Qdrant and enqueue cluster recompute."""
+        self._emit(
+            "paper_indexing_started",
+            entity_id=request.paper_id,
+            stage="started",
+            message="Starting paper indexing",
+        )
         paper = self.paper_repository.get_by_id(request.paper_id)
         if paper is None:
+            self._emit(
+                "paper_indexing_failed",
+                entity_id=request.paper_id,
+                stage="failed",
+                message="Paper not found",
+            )
             raise EntityNotFoundError(
                 "Paper not found",
                 details={"paper_id": request.paper_id},
@@ -118,6 +133,13 @@ class PaperIndexingFacade:
                 request.force_reindex,
             ):
                 self._mark_processing_indexed({request.paper_id: text_hash})
+                self._emit(
+                    "paper_indexing_completed",
+                    entity_id=request.paper_id,
+                    stage="completed",
+                    message="Paper already indexed; skipped",
+                    payload={"skipped": True},
+                )
                 return PaperIndexingResponseDTO(
                     paper_id=request.paper_id,
                     status="indexed",
@@ -125,6 +147,12 @@ class PaperIndexingFacade:
                 )
 
             self._mark_processing_started([request.paper_id])
+            self._emit(
+                "embedding_started",
+                entity_id=request.paper_id,
+                stage="embedding",
+                message="Generating paper embedding",
+            )
             embedding = self.embedding_adapter.embed_text(
                 embedding_text,
                 model=self.embedding_model,
@@ -134,6 +162,13 @@ class PaperIndexingFacade:
                     "Embedding vector was not generated",
                     details={"paper_id": request.paper_id},
                 )
+            self._emit(
+                "embedding_completed",
+                entity_id=request.paper_id,
+                stage="embedding",
+                message="Paper embedding generated",
+                payload={"vector_dimension": len(embedding.vector)},
+            )
 
             authors = self.author_repository.list_by_paper(request.paper_id)
             institution_payload = self._build_institution_payload(authors)
@@ -178,6 +213,13 @@ class PaperIndexingFacade:
                 embedding.vector,
                 payload,
             )
+            self._emit(
+                "qdrant_upsert_completed",
+                entity_id=request.paper_id,
+                stage="qdrant_upsert",
+                message="Paper point upserted",
+                payload={"collection": self.collection_name},
+            )
             self._mark_processing_indexed({request.paper_id: text_hash})
             qdrant_indexed = True
             self._enqueue_cluster_recompute(
@@ -189,8 +231,21 @@ class PaperIndexingFacade:
         except AppError as exc:
             if not qdrant_indexed:
                 self._mark_processing_failed([request.paper_id], exc.message)
+            self._emit(
+                "paper_indexing_failed",
+                entity_id=request.paper_id,
+                stage="failed",
+                message=exc.message,
+                payload={"code": exc.code, "details": exc.details or {}},
+            )
             raise
 
+        self._emit(
+            "paper_indexing_completed",
+            entity_id=request.paper_id,
+            stage="completed",
+            message="Paper indexed successfully",
+        )
         return PaperIndexingResponseDTO(
             paper_id=request.paper_id,
             status="indexed",
@@ -346,6 +401,14 @@ class PaperIndexingFacade:
             return result
 
         paper_ids = [int(paper.id) for paper in papers]
+        self._emit(
+            "paper_batch_started",
+            entity_id="batch",
+            stage="prepare",
+            current=0,
+            total=len(paper_ids),
+            message=f"Preparing {len(paper_ids)} papers",
+        )
         topics_by_paper = self.taxonomy_repository.list_topics_by_papers(paper_ids)
         keywords_by_paper = self.taxonomy_repository.list_keywords_by_papers(paper_ids)
         authors_by_paper = self.author_repository.list_by_papers(paper_ids)
@@ -412,9 +475,26 @@ class PaperIndexingFacade:
 
         if not pending_records:
             self._mark_processing_indexed(skipped_text_hashes)
+            self._emit(
+                "paper_batch_completed",
+                entity_id="batch",
+                stage="completed",
+                current=len(paper_ids),
+                total=len(paper_ids),
+                message=f"Paper batch skipped={result.skipped} failed={result.failed}",
+                payload=result.model_dump(mode="json"),
+            )
             return result
 
         self._mark_processing_started(record["paper_id"] for record in pending_records)
+        self._emit(
+            "embedding_started",
+            entity_id="batch",
+            stage="embedding",
+            current=0,
+            total=len(pending_records),
+            message=f"Generating {len(pending_records)} embeddings",
+        )
         try:
             embeddings = self.embedding_adapter.embed_batch(
                 [record["embedding_text"] for record in pending_records],
@@ -426,6 +506,14 @@ class PaperIndexingFacade:
                 exc.message,
             )
             raise
+        self._emit(
+            "embedding_completed",
+            entity_id="batch",
+            stage="embedding",
+            current=len(pending_records),
+            total=len(pending_records),
+            message="Paper embeddings generated",
+        )
         if len(embeddings) != len(pending_records):
             self._mark_processing_failed(
                 (record["paper_id"] for record in pending_records),
@@ -519,6 +607,15 @@ class PaperIndexingFacade:
                     exc.message,
                 )
                 raise
+            self._emit(
+                "qdrant_upsert_completed",
+                entity_id="batch",
+                stage="qdrant_upsert",
+                current=len(points),
+                total=len(pending_records),
+                message=f"Upserted {len(points)} paper points",
+                payload={"collection": self.collection_name},
+            )
             self._mark_processing_indexed(indexed_text_hashes)
             result.updated += len(points)
             self._enqueue_cluster_recompute_batch(
@@ -529,6 +626,18 @@ class PaperIndexingFacade:
             )
 
         self._mark_processing_indexed(skipped_text_hashes)
+        self._emit(
+            "paper_batch_completed",
+            entity_id="batch",
+            stage="completed",
+            current=result.updated + result.skipped + result.failed,
+            total=result.total,
+            message=(
+                f"Paper batch completed: updated={result.updated} "
+                f"skipped={result.skipped} failed={result.failed}"
+            ),
+            payload=result.model_dump(mode="json"),
+        )
         return result
 
     def _existing_text_hashes(
@@ -692,6 +801,30 @@ class PaperIndexingFacade:
             "message": exc.message,
             "details": exc.details or {},
         }
+
+    def _emit(
+        self,
+        event_type: str,
+        *,
+        entity_id: str | int | None = None,
+        stage: str | None = None,
+        current: int | None = None,
+        total: int | None = None,
+        message: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.event_sink.emit(
+            MLEvent(
+                event_type=event_type,
+                task_type="paper_indexing",
+                entity_id=entity_id,
+                stage=stage,
+                current=current,
+                total=total,
+                message=message,
+                payload=payload or {},
+            )
+        )
 
 
 __all__ = ["PaperIndexingFacade"]

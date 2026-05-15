@@ -16,6 +16,7 @@ from ml.constants import (
     RESEARCH_ENTITIES_COLLECTION,
     USER_PROFILES_COLLECTION,
 )
+from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.vector_math import VectorMathService
 
@@ -40,6 +41,7 @@ class UserProfileFacade:
         qdrant_adapter: QdrantAdapter,
         vector_math_service: VectorMathService | None = None,
         payload_builder: QdrantPayloadBuilder | None = None,
+        event_sink: EventSink | None = None,
         papers_collection: str = PAPERS_COLLECTION,
         research_entities_collection: str = RESEARCH_ENTITIES_COLLECTION,
         user_profiles_collection: str = USER_PROFILES_COLLECTION,
@@ -50,6 +52,7 @@ class UserProfileFacade:
         self.qdrant_adapter = qdrant_adapter
         self.vector_math_service = vector_math_service or VectorMathService()
         self.payload_builder = payload_builder or QdrantPayloadBuilder()
+        self.event_sink = event_sink or NoopEventSink()
         self.papers_collection = papers_collection
         self.research_entities_collection = research_entities_collection
         self.user_profiles_collection = user_profiles_collection
@@ -59,16 +62,48 @@ class UserProfileFacade:
         user_id: int,
     ) -> UserProfileDTO:
         """Recompute a user profile vector and upsert it into Qdrant."""
+        self._emit(
+            "user_profile_started",
+            entity_id=user_id,
+            stage="started",
+            message="Starting user profile recompute",
+        )
         sources = self._load_source_ids(user_id)
         if not self._has_any_source(sources):
+            self._emit(
+                "user_profile_failed",
+                entity_id=user_id,
+                stage="failed",
+                message="User profile has no source data",
+                payload={"source_counts": self._source_counts(sources)},
+            )
             raise InsufficientUserProfileDataError(
                 "User profile has no source data",
                 details={"user_id": user_id, "source_counts": self._source_counts(sources)},
             )
 
+        self._emit(
+            "user_profile_sources_loaded",
+            entity_id=user_id,
+            stage="sources",
+            message="Loaded user profile sources",
+            payload={"source_counts": self._source_counts(sources)},
+        )
         category_vectors = self._load_category_vectors(sources)
         weighted_vectors = self._weighted_vectors(category_vectors)
         if not weighted_vectors:
+            self._emit(
+                "user_profile_failed",
+                entity_id=user_id,
+                stage="failed",
+                message="User profile has no available vectors",
+                payload={
+                    "source_counts": self._source_counts(sources),
+                    "available_vector_counts": {
+                        key: len(value) for key, value in category_vectors.items()
+                    },
+                },
+            )
             raise InsufficientUserProfileDataError(
                 "User profile has no available vectors",
                 details={
@@ -112,6 +147,16 @@ class UserProfileFacade:
             self._profile_point_id(user_id),
             profile_vector,
             payload,
+        )
+        self._emit(
+            "user_profile_completed",
+            entity_id=user_id,
+            stage="completed",
+            message="User profile recompute completed",
+            payload={
+                "vector_dimension": len(profile_vector),
+                "source_counts": source_counts,
+            },
         )
         return profile
 
@@ -246,6 +291,30 @@ class UserProfileFacade:
 
     def _profile_point_id(self, user_id: int) -> str:
         return f"user:{user_id}"
+
+    def _emit(
+        self,
+        event_type: str,
+        *,
+        entity_id: str | int | None = None,
+        stage: str | None = None,
+        current: int | None = None,
+        total: int | None = None,
+        message: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.event_sink.emit(
+            MLEvent(
+                event_type=event_type,
+                task_type="user_profile_recompute",
+                entity_id=entity_id,
+                stage=stage,
+                current=current,
+                total=total,
+                message=message,
+                payload=payload or {},
+            )
+        )
 
 
 __all__ = ["UserProfileFacade"]

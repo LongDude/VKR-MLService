@@ -35,6 +35,7 @@ from ingestion.openalex_bootstrap.monthly_counts import MonthlyCount, MonthlyCou
 from cli.openalex import default_stats_redis_key, resolve_target_count
 from ml.constants import PAPERS_COLLECTION, TREND_CLUSTERS_COLLECTION
 from ml.facades.cluster_analytics import ClusterAnalyticsFacade
+from ml.services.events import CompositeEventSink, MLEvent, RedisEventSink
 from ml.workers.redis_worker import (
     CLUSTER_RECOMPUTE_QUEUE,
     PAPER_INDEXING_QUEUE,
@@ -89,6 +90,19 @@ class FakeRedisClient:
         return len(self.queues.setdefault(queue_name, []))
 
 
+class InMemoryEventSink:
+    def __init__(self) -> None:
+        self.events: list[MLEvent] = []
+
+    def emit(self, event: MLEvent) -> None:
+        self.events.append(event)
+
+
+class FailingEventSink:
+    def emit(self, event: MLEvent) -> None:
+        raise RuntimeError("sink failed")
+
+
 def test_redis_adapter_json_queue_and_lock() -> None:
     client = FakeRedisClient()
     adapter = RedisAdapter(client)
@@ -105,6 +119,44 @@ def test_redis_adapter_json_queue_and_lock() -> None:
     assert adapter.acquire_lock("lock:1", ttl_seconds=10) is False
     adapter.release_lock("lock:1")
     assert adapter.acquire_lock("lock:1", ttl_seconds=10) is True
+
+
+def test_composite_event_sink_isolates_sink_failures() -> None:
+    sink = InMemoryEventSink()
+    composite = CompositeEventSink([FailingEventSink(), sink])
+    event = MLEvent(
+        event_type="paper_indexing_started",
+        task_type="paper_indexing",
+        entity_id=1,
+        stage="started",
+    )
+
+    composite.emit(event)
+
+    assert sink.events == [event]
+
+
+def test_redis_event_sink_writes_latest_status() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    sink = RedisEventSink(adapter, ttl_seconds=60)
+
+    sink.emit(
+        MLEvent(
+            event_type="cluster_completed",
+            task_type="cluster_recompute",
+            entity_id="topic:1",
+            stage="completed",
+            current=1,
+            total=1,
+            message="done",
+        )
+    )
+
+    status = adapter.get_json("ml:task_status:cluster_recompute:topic:1")
+    assert status is not None
+    assert status["event_type"] == "cluster_completed"
+    assert status["current"] == 1
 
 
 def test_redis_adapter_wraps_decode_errors() -> None:

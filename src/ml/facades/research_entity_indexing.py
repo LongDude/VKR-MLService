@@ -19,6 +19,7 @@ from repositories.graph import PaperGraphRepository
 from repositories.taxonomy import TaxonomyRepository
 
 from ml.constants import DEFAULT_EMBEDDING_MODEL, RESEARCH_ENTITIES_COLLECTION
+from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.text_preparation import TextPreparationService
 
@@ -43,6 +44,7 @@ class ResearchEntityIndexingFacade:
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         embedding_version: str = DEFAULT_EMBEDDING_VERSION,
         recent_window_days: int = DEFAULT_RECENT_WINDOW_DAYS,
+        event_sink: EventSink | None = None,
     ) -> None:
         self.taxonomy_repository = taxonomy_repository
         self.paper_graph_repository = paper_graph_repository
@@ -56,6 +58,7 @@ class ResearchEntityIndexingFacade:
         self.embedding_model = embedding_model
         self.embedding_version = embedding_version
         self.recent_window_days = recent_window_days
+        self.event_sink = event_sink or NoopEventSink()
 
     def index_all_entities(
         self,
@@ -98,6 +101,15 @@ class ResearchEntityIndexingFacade:
             )
 
         result = BatchOperationResultDTO()
+        self._emit(
+            "entity_indexing_started",
+            entity_id=entity_type,
+            stage="started",
+            current=0,
+            total=limit,
+            message=f"Starting research entity indexing: {entity_type}",
+            payload={"offset": offset, "batch_size": batch_size},
+        )
         remaining = limit
         offset_remaining = offset
 
@@ -114,6 +126,19 @@ class ResearchEntityIndexingFacade:
 
             while True:
                 if remaining is not None and remaining <= 0:
+                    self._emit(
+                        "entity_indexing_completed",
+                        entity_id=entity_type,
+                        stage="completed",
+                        current=result.total,
+                        total=result.total,
+                        message=(
+                            "Research entity indexing completed: "
+                            f"updated={result.updated} skipped={result.skipped} "
+                            f"failed={result.failed}"
+                        ),
+                        payload=result.model_dump(mode="json"),
+                    )
                     return result
                 page_size = batch_size if remaining is None else min(batch_size, remaining)
                 entities = list_method(page_size, source_offset)
@@ -126,6 +151,18 @@ class ResearchEntityIndexingFacade:
                     force_reindex=force_reindex,
                 )
                 self._merge_batch_result(result, batch_result)
+                self._emit(
+                    "entity_indexing_progress",
+                    entity_id=current_type,
+                    stage="batches",
+                    current=result.total,
+                    total=limit,
+                    message=(
+                        f"{current_type}: updated={result.updated} "
+                        f"skipped={result.skipped} failed={result.failed}"
+                    ),
+                    payload=batch_result.model_dump(mode="json"),
+                )
 
                 loaded_count = len(entities)
                 source_offset += loaded_count
@@ -134,6 +171,18 @@ class ResearchEntityIndexingFacade:
                 if loaded_count < page_size:
                     break
 
+        self._emit(
+            "entity_indexing_completed",
+            entity_id=entity_type,
+            stage="completed",
+            current=result.total,
+            total=result.total,
+            message=(
+                f"Research entity indexing completed: updated={result.updated} "
+                f"skipped={result.skipped} failed={result.failed}"
+            ),
+            payload=result.model_dump(mode="json"),
+        )
         return result
 
     def index_topic(
@@ -255,9 +304,25 @@ class ResearchEntityIndexingFacade:
         if not pending_records:
             return result
 
+        self._emit(
+            "entity_embedding_started",
+            entity_id=entity_type,
+            stage="embedding",
+            current=0,
+            total=len(pending_records),
+            message=f"Generating {len(pending_records)} {entity_type} embeddings",
+        )
         embeddings = self.embedding_adapter.embed_batch(
             [record["embedding_text"] for record in pending_records],
             model=self.embedding_model,
+        )
+        self._emit(
+            "entity_embedding_completed",
+            entity_id=entity_type,
+            stage="embedding",
+            current=len(pending_records),
+            total=len(pending_records),
+            message=f"{entity_type} embeddings generated",
         )
         if len(embeddings) != len(pending_records):
             raise EmbeddingGenerationError(
@@ -308,6 +373,15 @@ class ResearchEntityIndexingFacade:
         if points:
             self.qdrant_adapter.upsert_points(self.collection_name, points)
             result.updated += len(points)
+            self._emit(
+                "entity_qdrant_upsert_completed",
+                entity_id=entity_type,
+                stage="qdrant_upsert",
+                current=len(points),
+                total=len(pending_records),
+                message=f"Upserted {len(points)} {entity_type} points",
+                payload={"collection": self.collection_name},
+            )
 
         return result
 
@@ -389,6 +463,13 @@ class ResearchEntityIndexingFacade:
             point_id,
             embedding.vector,
             payload,
+        )
+        self._emit(
+            "entity_indexing_completed",
+            entity_id=point_id,
+            stage="completed",
+            message="Research entity indexed successfully",
+            payload={"entity_type": entity_type, "entity_id": entity_id},
         )
 
         return OperationResultDTO(
@@ -621,6 +702,30 @@ class ResearchEntityIndexingFacade:
             return None
         name = getattr(entity, "name", None) or getattr(entity, "value", None)
         return str(name).strip() if name else None
+
+    def _emit(
+        self,
+        event_type: str,
+        *,
+        entity_id: str | int | None = None,
+        stage: str | None = None,
+        current: int | None = None,
+        total: int | None = None,
+        message: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.event_sink.emit(
+            MLEvent(
+                event_type=event_type,
+                task_type="entity_indexing",
+                entity_id=entity_id,
+                stage=stage,
+                current=current,
+                total=total,
+                message=message,
+                payload=payload or {},
+            )
+        )
 
 
 __all__ = ["ResearchEntityIndexingFacade"]
