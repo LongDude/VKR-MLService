@@ -335,6 +335,57 @@ class TaxonomyRepository(BaseRepository):
         """List topics ordered by name."""
         return self._list_entities(Topic, Topic.name, limit, offset)
 
+    def list_topics_by_ids(self, topic_ids: list[int]) -> list[Topic]:
+        """List topics by ids preserving caller order where possible."""
+        if not topic_ids:
+            return []
+        unique_ids = list(dict.fromkeys(int(topic_id) for topic_id in topic_ids))
+        topics = {
+            topic.id: topic
+            for topic in self.session.scalars(
+                select(Topic).where(Topic.id.in_(unique_ids))
+            )
+        }
+        return [topics[topic_id] for topic_id in unique_ids if topic_id in topics]
+
+    def list_topics_for_stats(
+        self,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[Topic]:
+        """List topics ordered by id for external statistics collection."""
+        stmt = select(Topic).order_by(Topic.id.asc()).offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def list_topics_with_openalex_id(
+        self,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[Topic]:
+        """List topics that can be matched to OpenAlex by external id."""
+        stmt = (
+            select(Topic)
+            .where(Topic.openalex_id.is_not(None))
+            .order_by(Topic.id.asc())
+            .offset(offset)
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def count_topics_with_openalex_id(self) -> int:
+        """Count topics that can be matched to OpenAlex by external id."""
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(Topic)
+                .where(Topic.openalex_id.is_not(None))
+            )
+            or 0
+        )
+
     def list_keywords(self, limit: int, offset: int) -> list[Keyword]:
         """List keywords ordered by value."""
         return self._list_entities(Keyword, Keyword.value, limit, offset)

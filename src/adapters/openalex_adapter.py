@@ -31,9 +31,13 @@ class OpenAlexAdapter:
         *,
         timeout_seconds: float = 30.0,
         client: httpx.Client | None = None,
+        api_key: str | None = None,
+        mailto: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
+        self._api_key = api_key.strip() if api_key and api_key.strip() else None
+        self._mailto = mailto.strip() if mailto and mailto.strip() else None
         self._client = client or httpx.Client(timeout=timeout_seconds)
 
     def get_work_by_doi(self, doi: str) -> ExternalPaperDTO | None:
@@ -74,6 +78,42 @@ class OpenAlexAdapter:
         payload = self._get_json("/works", params=params, allow_not_found=False)
         return self._normalize_search_result(payload)
 
+    def count_works(
+        self,
+        filters: OpenAlexSearchFiltersDTO,
+        *,
+        topic_external_id: str | None = None,
+        primary_topic_only: bool = False,
+    ) -> int:
+        """Return OpenAlex ``meta.count`` for works matching the supplied filters.
+
+        OpenAlex exposes total result counts in the list response metadata, so callers
+        can collect publication statistics without paginating through all works.
+        """
+        params: dict[str, Any] = {"page": 1, "per-page": 1, "select": "id"}
+        filter_value = self._build_filter_param(filters)
+        filter_parts = [filter_value] if filter_value else []
+        if topic_external_id:
+            topic_id = self._normalize_work_identifier(topic_external_id)
+            topic_filter = "primary_topic.id" if primary_topic_only else "topics.id"
+            filter_parts.append(f"{topic_filter}:{topic_id}")
+        if filter_parts:
+            params["filter"] = ",".join(filter_parts)
+
+        payload = self._get_json("/works", params=params, allow_not_found=False)
+        if not isinstance(payload, dict):
+            raise ExternalResponseFormatError("OpenAlex/OpenAlex count response is not an object")
+        meta = payload.get("meta")
+        if not isinstance(meta, dict):
+            raise ExternalResponseFormatError("OpenAlex/OpenAlex count response has no meta")
+        try:
+            return int(meta.get("count") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ExternalResponseFormatError(
+                "OpenAlex/OpenAlex count response has invalid meta.count",
+                details={"count": meta.get("count")},
+            ) from exc
+
     def list_recent_works(
         self,
         date_from: date,
@@ -93,7 +133,7 @@ class OpenAlexAdapter:
     ) -> dict[str, Any] | list[Any] | None:
         response = self._client.get(
             f"{self._base_url}{path}",
-            params=params,
+            params=self._with_auth_params(params),
             timeout=self._timeout_seconds,
         )
         if response.status_code == 404 and allow_not_found:
@@ -101,12 +141,25 @@ class OpenAlexAdapter:
         if response.status_code == 429:
             raise ExternalServiceRateLimitError(
                 "OpenAlex/OpenAlex rate limit exceeded",
-                details={"status_code": response.status_code, "body": response.text},
+                details={
+                    "status_code": response.status_code,
+                    "body": response.text,
+                    "retry_after": response.headers.get("Retry-After"),
+                    "rate_limit_remaining": response.headers.get("X-RateLimit-Remaining"),
+                    "rate_limit_reset": response.headers.get("X-RateLimit-Reset"),
+                    "rate_limit_credits_used": response.headers.get(
+                        "X-RateLimit-Credits-Used"
+                    ),
+                },
             )
         if response.status_code >= 500:
             raise ExternalServiceUnavailableError(
                 "OpenAlex/OpenAlex service is unavailable",
-                details={"status_code": response.status_code, "body": response.text},
+                details={
+                    "status_code": response.status_code,
+                    "body": response.text,
+                    "retry_after": response.headers.get("Retry-After"),
+                },
             )
         if response.status_code >= 400:
             raise ExternalResponseFormatError(
@@ -120,6 +173,19 @@ class OpenAlexAdapter:
                 "OpenAlex/OpenAlex response is not valid JSON",
                 details={"reason": str(exc)},
             ) from exc
+
+    def _with_auth_params(
+        self,
+        params: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not self._api_key and not self._mailto:
+            return params
+        result = dict(params or {})
+        if self._api_key:
+            result.setdefault("api_key", self._api_key)
+        if self._mailto:
+            result.setdefault("mailto", self._mailto)
+        return result
 
     def _normalize_search_result(
         self,

@@ -20,6 +20,7 @@ PROJECT_DIR = SRC_DIR.parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from adapters.openalex_adapter import OpenAlexAdapter
 from adapters.redis_adapter import RedisAdapter
 from core.config import Settings
 from core.exceptions import AppError
@@ -33,8 +34,11 @@ from ingestion.openalex_bootstrap import (
     OpenAlexMonthlyStatsCollector,
     MonthlyCountsLoader,
 )
-from ingestion.openalex_bootstrap.report import report_to_dict, write_report
+from ingestion.openalex_bootstrap.report import report_to_dict
+from ingestion.openalex_topic_stats import OpenAlexTopicStatsCollector, SyncRateLimiter
 from models.session import create_db_engine, create_session_factory
+from repositories.openalex_topic_stats import OpenAlexTopicStatsRepository
+from repositories.taxonomy import TaxonomyRepository
 
 
 DEFAULT_MONTHLY_COUNTS_CSV = BASE_DIR / "openalex_monthly_counts_2015_2025.csv"
@@ -302,6 +306,127 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     add_redis_args(stats_parser)
 
+    topic_stats_parser = subparsers.add_parser(
+        "collect-topic-stats",
+        aliases=["update-topic-stats"],
+        help="Collect OpenAlex monthly work counts for local topics into PostgreSQL.",
+    )
+    topic_stats_parser.add_argument(
+        "--date-from",
+        type=parse_iso_date,
+        required=True,
+        help="Publication period lower bound in YYYY-MM-DD format.",
+    )
+    topic_stats_parser.add_argument(
+        "--date-to",
+        type=parse_iso_date,
+        required=True,
+        help="Publication period upper bound in YYYY-MM-DD format.",
+    )
+    topic_stats_parser.add_argument(
+        "--topic-ids",
+        default=None,
+        help="Comma-separated local topic ids. Defaults to all topics; missing openalex_id is skipped.",
+    )
+    topic_stats_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum topics to process when --topic-ids is not set.",
+    )
+    topic_stats_parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Topic offset when --topic-ids is not set. Defaults to 0.",
+    )
+    topic_stats_parser.add_argument(
+        "--languages",
+        default="en,ru",
+        help="Comma-separated OpenAlex languages. Defaults to en,ru.",
+    )
+    topic_stats_parser.add_argument(
+        "--types",
+        default="article",
+        help="Comma-separated OpenAlex work types. Defaults to article.",
+    )
+    topic_stats_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="PostgreSQL upsert batch size. Defaults to 500.",
+    )
+    topic_stats_parser.add_argument(
+        "--request-workers",
+        type=int,
+        default=8,
+        help="Concurrent OpenAlex count workers. Defaults to 8.",
+    )
+    topic_stats_parser.add_argument(
+        "--rate-limit-rps",
+        type=float,
+        default=10.0,
+        help="OpenAlex requests per second limit. Defaults to 10 for topic stats.",
+    )
+    topic_stats_parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="Retries for rate-limit/service/network errors. Defaults to 5.",
+    )
+    topic_stats_parser.add_argument(
+        "--primary-topic-only",
+        action="store_true",
+        help="Use primary_topic.id instead of topics.id filter.",
+    )
+    topic_stats_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build the work plan only; do not call OpenAlex or write PostgreSQL.",
+    )
+    topic_stats_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars.",
+    )
+    topic_stats_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase logging verbosity. Use -v for DEBUG, -vv for dependency logs.",
+    )
+    topic_stats_parser.add_argument(
+        "--report-json",
+        default=None,
+        help="Optional path for JSON report.",
+    )
+    topic_stats_parser.add_argument(
+        "--env-file",
+        default=str(PROJECT_DIR / ".env"),
+        help="Path to .env file. Defaults to project .env.",
+    )
+    topic_stats_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="SQLAlchemy database URL. Defaults to DATABASE_URL or POSTGRES_* envs.",
+    )
+    topic_stats_parser.add_argument(
+        "--openalex-url",
+        default=None,
+        help="OpenAlex base URL. Defaults to OPENALEX_BASE_URL or https://api.openalex.org.",
+    )
+    topic_stats_parser.add_argument(
+        "--openalex-api-key",
+        default=None,
+        help="OpenAlex API key. Defaults to OPENALEX_API_KEY.",
+    )
+    topic_stats_parser.add_argument(
+        "--openalex-mailto",
+        default=None,
+        help="OpenAlex polite-pool email. Defaults to OPENALEX_MAILTO.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -315,12 +440,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "bootstrap-papers":
             report = asyncio.run(run_bootstrap_papers(args))
             payload = report_to_dict(report)
-        elif args.command == "collect-stats":
+        elif args.command in {"collect-stats", "collect-monthly-stats", "update-stats"}:
             payload = asyncio.run(run_collect_stats(args))
+        elif args.command in {"collect-topic-stats", "update-topic-stats"}:
+            payload = run_collect_topic_stats(args)
         else:
             raise AssertionError(f"Unhandled command: {args.command}")
         if getattr(args, "report_json", None):
-            write_report(args.report_json, report)
+            write_json_payload(args.report_json, payload)
     except AppError as exc:
         print_json(exc.to_dict(), stream=sys.stderr)
         return 1
@@ -475,6 +602,85 @@ async def run_collect_stats(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def run_collect_topic_stats(args: argparse.Namespace) -> dict[str, Any]:
+    """Collect monthly OpenAlex publication counts for local topics into PostgreSQL."""
+    if args.date_from > args.date_to:
+        raise ValueError("--date-from must be before or equal to --date-to.")
+    if args.offset < 0:
+        raise ValueError("--offset must be non-negative.")
+    if args.limit is not None and args.limit < 0:
+        raise ValueError("--limit must be non-negative.")
+
+    languages = parse_csv_arg(args.languages)
+    types = parse_csv_arg(args.types)
+    topic_ids = parse_int_csv_arg(args.topic_ids) if args.topic_ids else None
+    database_url = args.database_url or Settings.from_env().database_url
+    openalex_url = (
+        args.openalex_url
+        or os.getenv("OPENALEX_BASE_URL")
+        or "https://api.openalex.org"
+    )
+    openalex_api_key = args.openalex_api_key or os.getenv("OPENALEX_API_KEY")
+    openalex_mailto = args.openalex_mailto or os.getenv("OPENALEX_MAILTO")
+
+    engine = create_db_engine(database_url, echo=False)
+    SessionLocal = create_session_factory(engine, expire_on_commit=False)
+    session = SessionLocal()
+    try:
+        collector = OpenAlexTopicStatsCollector(
+            taxonomy_repository=TaxonomyRepository(session),
+            stats_repository=OpenAlexTopicStatsRepository(session),
+            openalex_adapter_factory=lambda: OpenAlexAdapter(
+                openalex_url,
+                api_key=openalex_api_key,
+                mailto=openalex_mailto,
+            ),
+            request_workers=args.request_workers,
+            rate_limiter=SyncRateLimiter(args.rate_limit_rps),
+            max_retries=args.max_retries,
+            primary_topic_only=args.primary_topic_only,
+        )
+        result = collector.collect_and_store(
+            date_from=args.date_from,
+            date_to=args.date_to,
+            topic_ids=topic_ids,
+            limit=args.limit,
+            offset=args.offset,
+            languages=languages,
+            types=types,
+            batch_size=args.batch_size,
+            dry_run=args.dry_run,
+            show_progress=not args.no_progress,
+        )
+        if args.dry_run:
+            session.rollback()
+        else:
+            session.commit()
+        return {
+            "command": "collect-topic-stats",
+            "date_from": result.date_from,
+            "date_to": result.date_to,
+            "total_topics": result.total_topics,
+            "topics_with_openalex_id": result.topics_with_openalex_id,
+            "skipped_topics_without_openalex_id": result.skipped_topics_without_openalex_id,
+            "periods": result.periods,
+            "planned_requests": result.planned_requests,
+            "openalex_requests": result.openalex_requests,
+            "collected": result.collected,
+            "created": result.created,
+            "updated": result.updated,
+            "failed": result.failed,
+            "dry_run": result.dry_run,
+            "errors": result.errors,
+        }
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+        engine.dispose()
+
+
 def resolve_target_count(
     target_count: int | None,
     target_period_count: int | None,
@@ -572,6 +778,17 @@ def parse_csv_arg(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def parse_int_csv_arg(value: str) -> list[int]:
+    """Parse comma-separated integers for argparse-backed options."""
+    result: list[int] = []
+    for item in parse_csv_arg(value):
+        try:
+            result.append(int(item))
+        except ValueError as exc:
+            raise ValueError(f"Expected comma-separated integer ids, got {item!r}.") from exc
+    return result
+
+
 def parse_iso_date(value: str) -> date:
     """Parse an ISO date for argparse."""
     try:
@@ -608,6 +825,16 @@ def configure_logging(verbosity: int = 0) -> None:
 def print_json(payload: dict[str, Any], *, stream: Any = sys.stdout) -> None:
     """Print JSON with stable UTF-8 output."""
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str), file=stream)
+
+
+def write_json_payload(path: str | Path, payload: dict[str, Any]) -> None:
+    """Write a CLI JSON payload to disk."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

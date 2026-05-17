@@ -15,7 +15,7 @@ from .associations import (
 from .base import Base
 
 if TYPE_CHECKING:
-    from .analytics import ResearchCluster
+    from .analytics import OpenAlexMonthlyTopicStat, ResearchCluster
     from .paper import Paper
     from .user import User
 
@@ -102,6 +102,9 @@ class Topic(Base):
     )
     research_clusters: Mapped[list["ResearchCluster"]] = relationship(
         back_populates="source_topic"
+    )
+    openalex_monthly_stats: Mapped[list["OpenAlexMonthlyTopicStat"]] = relationship(
+        back_populates="topic"
     )
     papers: AssociationProxy[list["Paper"]] = association_proxy(
         "paper_links",

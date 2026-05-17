@@ -11,6 +11,7 @@ from .associations import (
     UserTrackedTopic,
 )
 from .analytics import (
+    OpenAlexMonthlyTopicStat,
     PaperProcessingState,
     ResearchCluster,
     ResearchClusterPeriodStat,
@@ -33,6 +34,7 @@ __all__ = [
     "Keyword",
     "Landing",
     "MetaSource",
+    "OpenAlexMonthlyTopicStat",
     "Paper",
     "PaperAuthor",
     "PaperKeyword",

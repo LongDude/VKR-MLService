@@ -118,3 +118,28 @@ class ResearchClusterPeriodStat(Base):
 
     def __repr__(self) -> str:
         return f"ResearchClusterPeriodStat(id={self.id!r}, cluster_id={self.cluster_id!r})"
+
+
+class OpenAlexMonthlyTopicStat(Base):
+    __tablename__ = "openalex_montly_topic_stats"
+    __table_args__ = (
+        UniqueConstraint("topic_id", "period_start"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    topic_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("topics.id", ondelete="SET NULL")
+    )
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    works_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    collected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    topic: Mapped["Topic | None"] = relationship(back_populates="openalex_monthly_stats")
+
+    def __repr__(self) -> str:
+        return (
+            "OpenAlexMonthlyTopicStat("
+            f"topic_id={self.topic_id!r}, period_start={self.period_start!r})"
+        )

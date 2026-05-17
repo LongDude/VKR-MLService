@@ -9,6 +9,7 @@ from .landings import LandingRepository
 from .paper_meta_sources import PaperMetaSourceRepository
 from .paper_processing_states import PaperProcessingStateRepository
 from .papers import PaperRepository
+from .openalex_topic_stats import OpenAlexTopicMonthlyCount, OpenAlexTopicStatsRepository
 from .research_clusters import ResearchClusterRepository
 from .taxonomy import TaxonomyRepository
 from .tracked_areas import TrackedAreaRepository
@@ -20,6 +21,8 @@ __all__ = [
     "FavouriteRepository",
     "InstitutionRepository",
     "LandingRepository",
+    "OpenAlexTopicMonthlyCount",
+    "OpenAlexTopicStatsRepository",
     "PaperGraphRepository",
     "PaperMetaSourceRepository",
     "PaperProcessingStateRepository",

@@ -981,6 +981,56 @@ def test_openalex_adapter_normalizes_work_response() -> None:
     assert paper.raw is not None
 
 
+def test_openalex_adapter_count_works_uses_meta_count_and_topic_filter() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        assert request.url.path == "/works"
+        assert params["page"] == "1"
+        assert params["per-page"] == "1"
+        assert params["select"] == "id"
+        filter_value = params["filter"]
+        assert "type:article" in filter_value
+        assert "language:en" in filter_value
+        assert "from_publication_date:2026-01-01" in filter_value
+        assert "to_publication_date:2026-01-31" in filter_value
+        assert "topics.id:T123" in filter_value
+        return httpx.Response(200, json={"meta": {"count": 42}, "results": []})
+
+    adapter = OpenAlexAdapter(
+        "https://openalex.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    count = adapter.count_works(
+        OpenAlexSearchFiltersDTO(
+            date_from=date(2026, 1, 1),
+            date_to=date(2026, 1, 31),
+            type="article",
+            language="en",
+        ),
+        topic_external_id="https://openalex.org/T123",
+    )
+
+    assert count == 42
+
+
+def test_openalex_adapter_adds_openalex_auth_params() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        assert params["api_key"] == "secret"
+        assert params["mailto"] == "dev@example.test"
+        return httpx.Response(200, json={"meta": {"count": 1}, "results": []})
+
+    adapter = OpenAlexAdapter(
+        "https://openalex.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        api_key="secret",
+        mailto="dev@example.test",
+    )
+
+    assert adapter.count_works(OpenAlexSearchFiltersDTO(type="article")) == 1
+
+
 def test_openalex_adapter_maps_429_to_rate_limit() -> None:
     adapter = OpenAlexAdapter(
         "https://openalex.test",
