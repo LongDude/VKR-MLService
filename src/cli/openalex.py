@@ -38,6 +38,7 @@ from ingestion.openalex_bootstrap.report import report_to_dict
 from ingestion.openalex_topic_stats import OpenAlexTopicStatsCollector, SyncRateLimiter
 from models.session import create_db_engine, create_session_factory
 from repositories.openalex_topic_stats import OpenAlexTopicStatsRepository
+from repositories.openalex_yearly_topic_stats import OpenAlexYearlyTopicStatsRepository
 from repositories.taxonomy import TaxonomyRepository
 
 
@@ -329,6 +330,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Comma-separated local topic ids. Defaults to all topics; missing openalex_id is skipped.",
     )
     topic_stats_parser.add_argument(
+        "--taxonomy-scope",
+        choices=["topic", "field", "subfield"],
+        default="topic",
+        help=(
+            "Taxonomy level used for OpenAlex collection. "
+            "field/subfield use group_by=topics.id instead of one request per topic."
+        ),
+    )
+    topic_stats_parser.add_argument(
+        "--field-ids",
+        default=None,
+        help="Comma-separated local field ids. Used with --taxonomy-scope field.",
+    )
+    topic_stats_parser.add_argument(
+        "--subfield-ids",
+        default=None,
+        help="Comma-separated local subfield ids. Used with --taxonomy-scope subfield.",
+    )
+    topic_stats_parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -378,6 +398,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--primary-topic-only",
         action="store_true",
         help="Use primary_topic.id instead of topics.id filter.",
+    )
+    topic_stats_parser.add_argument(
+        "--group-by-page-size",
+        type=int,
+        default=200,
+        help="OpenAlex group_by page size for field/subfield scope, max 200. Defaults to 200.",
+    )
+    topic_stats_parser.add_argument(
+        "--normalize-january-first",
+        action="store_true",
+        help=(
+            "Estimate and remove January-1 artificial publication dates. "
+            "Also updates openalex_yearly_topic_stats.artifical_pubdates_estimation."
+        ),
     )
     topic_stats_parser.add_argument(
         "--dry-run",
@@ -614,6 +648,16 @@ def run_collect_topic_stats(args: argparse.Namespace) -> dict[str, Any]:
     languages = parse_csv_arg(args.languages)
     types = parse_csv_arg(args.types)
     topic_ids = parse_int_csv_arg(args.topic_ids) if args.topic_ids else None
+    field_ids = parse_int_csv_arg(args.field_ids) if args.field_ids else None
+    subfield_ids = parse_int_csv_arg(args.subfield_ids) if args.subfield_ids else None
+    if args.taxonomy_scope != "topic" and topic_ids:
+        raise ValueError("--topic-ids can only be used with --taxonomy-scope topic.")
+    if args.taxonomy_scope != "field" and field_ids:
+        raise ValueError("--field-ids can only be used with --taxonomy-scope field.")
+    if args.taxonomy_scope != "subfield" and subfield_ids:
+        raise ValueError("--subfield-ids can only be used with --taxonomy-scope subfield.")
+    if args.group_by_page_size <= 0 or args.group_by_page_size > 200:
+        raise ValueError("--group-by-page-size must be between 1 and 200.")
     database_url = args.database_url or Settings.from_env().database_url
     openalex_url = (
         args.openalex_url
@@ -630,6 +674,7 @@ def run_collect_topic_stats(args: argparse.Namespace) -> dict[str, Any]:
         collector = OpenAlexTopicStatsCollector(
             taxonomy_repository=TaxonomyRepository(session),
             stats_repository=OpenAlexTopicStatsRepository(session),
+            yearly_stats_repository=OpenAlexYearlyTopicStatsRepository(session),
             openalex_adapter_factory=lambda: OpenAlexAdapter(
                 openalex_url,
                 api_key=openalex_api_key,
@@ -644,11 +689,16 @@ def run_collect_topic_stats(args: argparse.Namespace) -> dict[str, Any]:
             date_from=args.date_from,
             date_to=args.date_to,
             topic_ids=topic_ids,
+            field_ids=field_ids,
+            subfield_ids=subfield_ids,
+            taxonomy_scope=args.taxonomy_scope,
             limit=args.limit,
             offset=args.offset,
             languages=languages,
             types=types,
             batch_size=args.batch_size,
+            group_by_page_size=args.group_by_page_size,
+            normalize_january_first=args.normalize_january_first,
             dry_run=args.dry_run,
             show_progress=not args.no_progress,
         )
@@ -658,6 +708,7 @@ def run_collect_topic_stats(args: argparse.Namespace) -> dict[str, Any]:
             session.commit()
         return {
             "command": "collect-topic-stats",
+            "taxonomy_scope": result.taxonomy_scope,
             "date_from": result.date_from,
             "date_to": result.date_to,
             "total_topics": result.total_topics,
@@ -666,6 +717,7 @@ def run_collect_topic_stats(args: argparse.Namespace) -> dict[str, Any]:
             "periods": result.periods,
             "planned_requests": result.planned_requests,
             "openalex_requests": result.openalex_requests,
+            "yearly_artificial_estimates": result.yearly_artificial_estimates,
             "collected": result.collected,
             "created": result.created,
             "updated": result.updated,

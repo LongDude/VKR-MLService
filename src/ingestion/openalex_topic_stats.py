@@ -8,8 +8,9 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from email.utils import parsedate_to_datetime
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Literal
 
 import httpx
 from tqdm.auto import tqdm
@@ -26,10 +27,15 @@ from repositories.openalex_topic_stats import (
     OpenAlexTopicMonthlyCount,
     OpenAlexTopicStatsRepository,
 )
+from repositories.openalex_yearly_topic_stats import (
+    OpenAlexTopicYearlyArtificialEstimate,
+    OpenAlexYearlyTopicStatsRepository,
+)
 from repositories.taxonomy import TaxonomyRepository
 
 
 logger = logging.getLogger(__name__)
+TaxonomyStatsScope = Literal["topic", "field", "subfield"]
 
 
 @dataclass(frozen=True)
@@ -46,12 +52,14 @@ class OpenAlexTopicStatsCollectionResult:
 
     date_from: date
     date_to: date
+    taxonomy_scope: str = "topic"
     total_topics: int = 0
     topics_with_openalex_id: int = 0
     skipped_topics_without_openalex_id: int = 0
     periods: int = 0
     planned_requests: int = 0
     openalex_requests: int = 0
+    yearly_artificial_estimates: int = 0
     collected: int = 0
     created: int = 0
     updated: int = 0
@@ -72,6 +80,21 @@ class _FetchResult:
     item: OpenAlexTopicMonthlyCount | None
     openalex_requests: int
     errors: list[dict[str, object]]
+    yearly_item: OpenAlexTopicYearlyArtificialEstimate | None = None
+
+
+@dataclass(frozen=True)
+class _GroupedFetchResult:
+    items: list[OpenAlexTopicMonthlyCount]
+    yearly_items: list[OpenAlexTopicYearlyArtificialEstimate]
+    openalex_requests: int
+    errors: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
+class _JanuaryNormalizationResult:
+    expected_real_count: int
+    estimated_artificial_count: int
 
 
 class SyncRateLimiter:
@@ -107,6 +130,7 @@ class OpenAlexTopicStatsCollector:
         taxonomy_repository: TaxonomyRepository,
         stats_repository: OpenAlexTopicStatsRepository,
         openalex_adapter_factory: Callable[[], OpenAlexAdapter],
+        yearly_stats_repository: OpenAlexYearlyTopicStatsRepository | None = None,
         request_workers: int = 8,
         rate_limiter: SyncRateLimiter | None = None,
         max_retries: int = 5,
@@ -115,6 +139,7 @@ class OpenAlexTopicStatsCollector:
     ) -> None:
         self.taxonomy_repository = taxonomy_repository
         self.stats_repository = stats_repository
+        self.yearly_stats_repository = yearly_stats_repository
         self.openalex_adapter_factory = openalex_adapter_factory
         self.request_workers = max(1, request_workers)
         self.rate_limiter = rate_limiter or SyncRateLimiter(70)
@@ -131,11 +156,16 @@ class OpenAlexTopicStatsCollector:
         date_from: date,
         date_to: date,
         topic_ids: list[int] | None = None,
+        field_ids: list[int] | None = None,
+        subfield_ids: list[int] | None = None,
+        taxonomy_scope: TaxonomyStatsScope = "topic",
         limit: int | None = None,
         offset: int = 0,
         languages: list[str] | None = None,
         types: list[str] | None = None,
         batch_size: int = 500,
+        group_by_page_size: int = 200,
+        normalize_january_first: bool = False,
         dry_run: bool = False,
         show_progress: bool = True,
     ) -> OpenAlexTopicStatsCollectionResult:
@@ -148,29 +178,58 @@ class OpenAlexTopicStatsCollector:
             raise ValueError("date_from must be before or equal to date_to")
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if taxonomy_scope not in {"topic", "field", "subfield"}:
+            raise ValueError("taxonomy_scope must be one of: topic, field, subfield")
+        if normalize_january_first and self.yearly_stats_repository is None:
+            raise ValueError("Yearly stats repository is required for January normalization")
 
         periods = list(iter_month_periods(date_from, date_to))
-        topics, missing_topic_ids = self._load_topics(topic_ids, limit, offset)
+        group_filter_parts, scope_errors = self._group_filter_parts(
+            taxonomy_scope,
+            field_ids=field_ids,
+            subfield_ids=subfield_ids,
+        )
+        topics, missing_topic_ids = self._load_topics(
+            topic_ids,
+            limit,
+            offset,
+            taxonomy_scope=taxonomy_scope,
+            field_ids=field_ids,
+            subfield_ids=subfield_ids,
+        )
         topic_infos, skipped_without_openalex = self._topic_infos(topics)
-        languages = _clean_list(languages or ["en", "ru"])
-        types = _clean_list(types or ["article"])
+        language_filter = _or_filter_value(languages or ["en", "ru"])
+        type_filter = _or_filter_value(types or ["article"])
+        january_period_count = (
+            sum(1 for period in periods if period.period_start.month == 1)
+            if normalize_january_first
+            else 0
+        )
+        planned_requests = (
+            len(topic_infos) * (len(periods) + january_period_count)
+            if taxonomy_scope == "topic"
+            else len(periods) + january_period_count
+        )
 
         result = OpenAlexTopicStatsCollectionResult(
             date_from=date_from,
             date_to=date_to,
+            taxonomy_scope=taxonomy_scope,
             total_topics=len(topics),
             topics_with_openalex_id=len(topic_infos),
             skipped_topics_without_openalex_id=skipped_without_openalex,
             periods=len(periods),
-            planned_requests=len(topic_infos) * len(periods) * len(languages) * len(types),
+            planned_requests=planned_requests,
             dry_run=dry_run,
         )
         for topic_id in missing_topic_ids:
             result.errors.append({"topic_id": topic_id, "message": "Topic not found"})
+        result.errors.extend(scope_errors)
         if dry_run or not topic_infos or not periods:
             return result
 
         pending_items: list[OpenAlexTopicMonthlyCount] = []
+        pending_yearly_items: list[OpenAlexTopicYearlyArtificialEstimate] = []
         logger.info(
             "OpenAlex topic stats collection started: topics=%s periods=%s planned_requests=%s workers=%s batch_size=%s",
             len(topic_infos),
@@ -180,30 +239,68 @@ class OpenAlexTopicStatsCollector:
             batch_size,
         )
         progress_bar = (
-            tqdm(total=len(topic_infos) * len(periods), desc="OpenAlex topic stats", unit="month")
+            tqdm(
+                total=(
+                    len(topic_infos) * len(periods)
+                    if taxonomy_scope == "topic"
+                    else len(periods)
+                ),
+                desc="OpenAlex topic stats",
+                unit="month",
+            )
             if show_progress
             else None
         )
         try:
-            for fetch_result in self._iter_fetch_results(
-                topics=topic_infos,
-                periods=periods,
-                languages=languages,
-                types=types,
-            ):
-                result.openalex_requests += fetch_result.openalex_requests
-                if fetch_result.errors:
-                    result.failed += 1
-                    result.errors.extend(fetch_result.errors)
-                if fetch_result.item is not None:
-                    pending_items.append(fetch_result.item)
-                if progress_bar is not None:
-                    progress_bar.update(1)
-                if len(pending_items) >= batch_size:
-                    self._flush_batch(pending_items, result)
+            if taxonomy_scope == "topic":
+                for fetch_result in self._iter_fetch_results(
+                    topics=topic_infos,
+                    periods=periods,
+                    language_filter=language_filter,
+                    type_filter=type_filter,
+                    normalize_january_first=normalize_january_first,
+                ):
+                    result.openalex_requests += fetch_result.openalex_requests
+                    if fetch_result.errors:
+                        result.failed += 1
+                        result.errors.extend(fetch_result.errors)
+                    if fetch_result.item is not None:
+                        pending_items.append(fetch_result.item)
+                    if fetch_result.yearly_item is not None:
+                        pending_yearly_items.append(fetch_result.yearly_item)
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+                    if len(pending_items) >= batch_size:
+                        self._flush_batch(pending_items, pending_yearly_items, result)
+            else:
+                topic_by_external_id = {
+                    _normalize_external_id(item.openalex_id): item
+                    for item in topic_infos
+                }
+                for grouped_result in self._iter_grouped_fetch_results(
+                    periods=periods,
+                    topic_by_external_id=topic_by_external_id,
+                    group_filter_parts=group_filter_parts,
+                    language_filter=language_filter,
+                    type_filter=type_filter,
+                    group_by_page_size=group_by_page_size,
+                    normalize_january_first=normalize_january_first,
+                ):
+                    result.openalex_requests += grouped_result.openalex_requests
+                    if grouped_result.errors:
+                        result.failed += 1
+                        result.errors.extend(grouped_result.errors)
+                    pending_items.extend(grouped_result.items)
+                    pending_yearly_items.extend(grouped_result.yearly_items)
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+                    if len(pending_items) >= batch_size:
+                        self._flush_batch(pending_items, pending_yearly_items, result)
 
             if pending_items:
-                self._flush_batch(pending_items, result)
+                self._flush_batch(pending_items, pending_yearly_items, result)
+            elif pending_yearly_items:
+                self._flush_batch(pending_items, pending_yearly_items, result)
         finally:
             if progress_bar is not None:
                 progress_bar.close()
@@ -221,23 +318,36 @@ class OpenAlexTopicStatsCollector:
     def _flush_batch(
         self,
         pending_items: list[OpenAlexTopicMonthlyCount],
+        pending_yearly_items: list[OpenAlexTopicYearlyArtificialEstimate],
         result: OpenAlexTopicStatsCollectionResult,
     ) -> None:
         batch_size = len(pending_items)
-        logger.info("Upserting OpenAlex topic stats batch: rows=%s", batch_size)
+        yearly_batch_size = len(pending_yearly_items)
+        logger.info(
+            "Upserting OpenAlex topic stats batch: rows=%s yearly_artificial=%s",
+            batch_size,
+            yearly_batch_size,
+        )
         started_at = time.monotonic()
         created, updated = self.stats_repository.upsert_many(pending_items)
+        if pending_yearly_items:
+            if self.yearly_stats_repository is None:
+                raise ValueError("Yearly stats repository is required for yearly estimates")
+            self.yearly_stats_repository.upsert_artificial_estimates(pending_yearly_items)
         if self.commit_each_batch:
             self.stats_repository.session.commit()
         result.created += created
         result.updated += updated
         result.collected += batch_size
+        result.yearly_artificial_estimates += yearly_batch_size
         pending_items.clear()
+        pending_yearly_items.clear()
         logger.info(
-            "OpenAlex topic stats batch upserted: rows=%s created=%s updated=%s elapsed=%.2fs",
+            "OpenAlex topic stats batch upserted: rows=%s created=%s updated=%s yearly_artificial=%s elapsed=%.2fs",
             batch_size,
             created,
             updated,
+            yearly_batch_size,
             time.monotonic() - started_at,
         )
 
@@ -246,8 +356,9 @@ class OpenAlexTopicStatsCollector:
         *,
         topics: list[_TopicInfo],
         periods: list[MonthPeriod],
-        languages: list[str],
-        types: list[str],
+        language_filter: str,
+        type_filter: str,
+        normalize_january_first: bool,
     ) -> Iterator[_FetchResult]:
         iterator = iter((topic, period) for topic in topics for period in periods)
         max_pending = max(1, self.request_workers)
@@ -264,8 +375,9 @@ class OpenAlexTopicStatsCollector:
                         self._fetch_topic_month,
                         topic,
                         period,
-                        languages,
-                        types,
+                        language_filter,
+                        type_filter,
+                        normalize_january_first,
                     )
                 )
 
@@ -281,27 +393,36 @@ class OpenAlexTopicStatsCollector:
         self,
         topic: _TopicInfo,
         period: MonthPeriod,
-        languages: list[str],
-        types: list[str],
+        language_filter: str,
+        type_filter: str,
+        normalize_january_first: bool,
     ) -> _FetchResult:
-        count = 0
-        requests = 0
-        errors: list[dict[str, object]] = []
-        for language in languages:
-            for publication_type in types:
-                value, request_count, error = self._count_with_retries(
-                    topic=topic,
-                    period=period,
-                    language=language,
-                    publication_type=publication_type,
-                )
-                requests += request_count
-                if error is not None:
-                    errors.append(error)
-                    continue
-                count += value
-        if errors:
-            return _FetchResult(item=None, openalex_requests=requests, errors=errors)
+        count, requests, error = self._count_with_retries(
+            topic=topic,
+            period=period,
+            language=language_filter,
+            publication_type=type_filter,
+        )
+        if error is not None:
+            return _FetchResult(item=None, openalex_requests=requests, errors=[error])
+        yearly_item: OpenAlexTopicYearlyArtificialEstimate | None = None
+        if normalize_january_first and period.period_start.month == 1:
+            jan1_count, jan1_requests, jan1_error = self._count_with_retries(
+                topic=topic,
+                period=MonthPeriod(period.period_start, period.period_start),
+                language=language_filter,
+                publication_type=type_filter,
+            )
+            requests += jan1_requests
+            if jan1_error is not None:
+                return _FetchResult(item=None, openalex_requests=requests, errors=[jan1_error])
+            normalized = normalize_january_publication_count(count, jan1_count)
+            count = normalized.expected_real_count
+            yearly_item = OpenAlexTopicYearlyArtificialEstimate(
+                topic_id=topic.id,
+                stat_year=date(period.period_start.year, 1, 1),
+                artifical_pubdates_estimation=normalized.estimated_artificial_count,
+            )
         return _FetchResult(
             item=OpenAlexTopicMonthlyCount(
                 topic_id=topic.id,
@@ -310,7 +431,198 @@ class OpenAlexTopicStatsCollector:
             ),
             openalex_requests=requests,
             errors=[],
+            yearly_item=yearly_item,
         )
+
+    def _iter_grouped_fetch_results(
+        self,
+        *,
+        periods: list[MonthPeriod],
+        topic_by_external_id: dict[str, _TopicInfo],
+        group_filter_parts: list[str],
+        language_filter: str,
+        type_filter: str,
+        group_by_page_size: int,
+        normalize_january_first: bool,
+    ) -> Iterator[_GroupedFetchResult]:
+        iterator = iter(periods)
+        max_pending = max(1, self.request_workers)
+        with ThreadPoolExecutor(max_workers=self.request_workers) as executor:
+            pending: set[Future[_GroupedFetchResult]] = set()
+
+            def submit_next() -> None:
+                try:
+                    period = next(iterator)
+                except StopIteration:
+                    return
+                pending.add(
+                    executor.submit(
+                        self._fetch_grouped_month,
+                        period,
+                        topic_by_external_id,
+                        group_filter_parts,
+                        language_filter,
+                        type_filter,
+                        group_by_page_size,
+                        normalize_january_first,
+                    )
+                )
+
+            for _ in range(max_pending):
+                submit_next()
+            while pending:
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    submit_next()
+                    yield future.result()
+
+    def _fetch_grouped_month(
+        self,
+        period: MonthPeriod,
+        topic_by_external_id: dict[str, _TopicInfo],
+        group_filter_parts: list[str],
+        language_filter: str,
+        type_filter: str,
+        group_by_page_size: int,
+        normalize_january_first: bool,
+    ) -> _GroupedFetchResult:
+        group_by = "primary_topic.id" if self.primary_topic_only else "topics.id"
+        counts, requests, error = self._group_counts_with_retries(
+            period=period,
+            group_by=group_by,
+            group_filter_parts=group_filter_parts,
+            language=language_filter,
+            publication_type=type_filter,
+            group_by_page_size=group_by_page_size,
+        )
+        if error is not None:
+            return _GroupedFetchResult([], [], requests, [error])
+
+        jan1_counts: dict[str, int] = {}
+        if normalize_january_first and period.period_start.month == 1:
+            jan1_counts, jan1_requests, jan1_error = self._group_counts_with_retries(
+                period=MonthPeriod(period.period_start, period.period_start),
+                group_by=group_by,
+                group_filter_parts=group_filter_parts,
+                language=language_filter,
+                publication_type=type_filter,
+                group_by_page_size=group_by_page_size,
+            )
+            requests += jan1_requests
+            if jan1_error is not None:
+                return _GroupedFetchResult([], [], requests, [jan1_error])
+
+        items: list[OpenAlexTopicMonthlyCount] = []
+        yearly_items: list[OpenAlexTopicYearlyArtificialEstimate] = []
+        for external_id, count in counts.items():
+            topic = topic_by_external_id.get(external_id)
+            if topic is None:
+                continue
+            works_count = count
+            if normalize_january_first and period.period_start.month == 1:
+                normalized = normalize_january_publication_count(
+                    count,
+                    jan1_counts.get(external_id, 0),
+                )
+                works_count = normalized.expected_real_count
+                yearly_items.append(
+                    OpenAlexTopicYearlyArtificialEstimate(
+                        topic_id=topic.id,
+                        stat_year=date(period.period_start.year, 1, 1),
+                        artifical_pubdates_estimation=(
+                            normalized.estimated_artificial_count
+                        ),
+                    )
+                )
+            items.append(
+                OpenAlexTopicMonthlyCount(
+                    topic_id=topic.id,
+                    period_start=period.period_start,
+                    works_count=works_count,
+                )
+            )
+        return _GroupedFetchResult(items, yearly_items, requests, [])
+
+    def _group_counts_with_retries(
+        self,
+        *,
+        period: MonthPeriod,
+        group_by: str,
+        group_filter_parts: list[str],
+        language: str,
+        publication_type: str,
+        group_by_page_size: int,
+    ) -> tuple[dict[str, int], int, dict[str, object] | None]:
+        requests = 0
+        for attempt in range(self.max_retries + 1):
+            try:
+                counts: dict[str, int] = {}
+                cursor: str | None = "*"
+                seen_cursors: set[str] = set()
+                while cursor:
+                    self.rate_limiter.acquire()
+                    requests += 1
+                    groups, next_cursor = self._adapter().group_works(
+                        OpenAlexSearchFiltersDTO(
+                            date_from=period.period_start,
+                            date_to=period.period_end,
+                            type=publication_type,
+                            language=language,
+                        ),
+                        group_by=group_by,
+                        extra_filter_parts=group_filter_parts,
+                        cursor=cursor,
+                        per_page=group_by_page_size,
+                    )
+                    for group in groups:
+                        key = _normalize_external_id(group.get("key") or group.get("id"))
+                        if not key:
+                            continue
+                        counts[key] = int(group.get("count") or 0)
+                    if (
+                        not next_cursor
+                        or next_cursor == cursor
+                        or next_cursor in seen_cursors
+                    ):
+                        break
+                    seen_cursors.add(cursor)
+                    cursor = next_cursor
+                return counts, requests, None
+            except (
+                ExternalServiceRateLimitError,
+                ExternalServiceUnavailableError,
+                httpx.HTTPError,
+            ) as exc:
+                if attempt >= self.max_retries:
+                    return {}, requests, self._group_error_payload(
+                        period,
+                        language,
+                        publication_type,
+                        group_by,
+                        exc,
+                    )
+                delay = self._retry_delay(exc, attempt)
+                logger.warning(
+                    "OpenAlex group retry: period=%s language=%s type=%s group_by=%s attempt=%s/%s delay=%.2fs reason=%s",
+                    period.period_start.isoformat(),
+                    language,
+                    publication_type,
+                    group_by,
+                    attempt + 1,
+                    self.max_retries,
+                    delay,
+                    exc.__class__.__name__,
+                )
+                time.sleep(delay)
+            except AppError as exc:
+                return {}, requests, self._group_error_payload(
+                    period,
+                    language,
+                    publication_type,
+                    group_by,
+                    exc,
+                )
+        return {}, requests, None
 
     def _count_with_retries(
         self,
@@ -396,7 +708,21 @@ class OpenAlexTopicStatsCollector:
         topic_ids: list[int] | None,
         limit: int | None,
         offset: int,
+        *,
+        taxonomy_scope: TaxonomyStatsScope,
+        field_ids: list[int] | None,
+        subfield_ids: list[int] | None,
     ) -> tuple[list[Topic], list[int]]:
+        if taxonomy_scope != "topic":
+            return (
+                self.taxonomy_repository.list_topics_for_stats(
+                    limit=limit,
+                    offset=offset,
+                    field_ids=field_ids if taxonomy_scope == "field" else None,
+                    subfield_ids=subfield_ids if taxonomy_scope == "subfield" else None,
+                ),
+                [],
+            )
         if topic_ids:
             requested = list(dict.fromkeys(int(topic_id) for topic_id in topic_ids))
             topics = self.taxonomy_repository.list_topics_by_ids(requested)
@@ -407,6 +733,54 @@ class OpenAlexTopicStatsCollector:
             self.taxonomy_repository.list_topics_for_stats(limit=limit, offset=offset),
             [],
         )
+
+    def _group_filter_parts(
+        self,
+        taxonomy_scope: TaxonomyStatsScope,
+        *,
+        field_ids: list[int] | None,
+        subfield_ids: list[int] | None,
+    ) -> tuple[list[str], list[dict[str, object]]]:
+        group_prefix = "primary_topic" if self.primary_topic_only else "topics"
+        if taxonomy_scope == "topic":
+            return [], []
+        if taxonomy_scope == "field" and field_ids:
+            fields = self.taxonomy_repository.list_fields_by_ids(field_ids)
+            found = {int(field.id) for field in fields}
+            missing = [field_id for field_id in field_ids if field_id not in found]
+            openalex_ids = [
+                _normalize_external_id(field.openalex_id)
+                for field in fields
+                if field.openalex_id
+            ]
+            errors: list[dict[str, object]] = [
+                {"field_id": field_id, "message": "Field not found"}
+                for field_id in missing
+            ]
+            if openalex_ids:
+                return [f"{group_prefix}.field.id:{'|'.join(openalex_ids)}"], errors
+            return [], errors
+        if taxonomy_scope == "subfield" and subfield_ids:
+            subfields = self.taxonomy_repository.list_subfields_by_ids(subfield_ids)
+            found = {int(subfield.id) for subfield in subfields}
+            missing = [
+                subfield_id
+                for subfield_id in subfield_ids
+                if subfield_id not in found
+            ]
+            openalex_ids = [
+                _normalize_external_id(subfield.openalex_id)
+                for subfield in subfields
+                if subfield.openalex_id
+            ]
+            errors = [
+                {"subfield_id": subfield_id, "message": "Subfield not found"}
+                for subfield_id in missing
+            ]
+            if openalex_ids:
+                return [f"{group_prefix}.subfield.id:{'|'.join(openalex_ids)}"], errors
+            return [], errors
+        return [], []
 
     def _topic_infos(self, topics: list[Topic]) -> tuple[list[_TopicInfo], int]:
         topic_infos: list[_TopicInfo] = []
@@ -439,6 +813,26 @@ class OpenAlexTopicStatsCollector:
             "period_start": period.period_start.isoformat(),
             "language": language,
             "type": publication_type,
+            "code": exc.__class__.__name__,
+            "message": str(exc),
+            "details": details or {},
+        }
+
+    def _group_error_payload(
+        self,
+        period: MonthPeriod,
+        language: str,
+        publication_type: str,
+        group_by: str,
+        exc: Exception,
+    ) -> dict[str, object]:
+        details = getattr(exc, "details", None)
+        return {
+            "period_start": period.period_start.isoformat(),
+            "period_end": period.period_end.isoformat(),
+            "language": language,
+            "type": publication_type,
+            "group_by": group_by,
             "code": exc.__class__.__name__,
             "message": str(exc),
             "details": details or {},
@@ -497,10 +891,45 @@ def _clean_list(values: list[str]) -> list[str]:
     return [value.strip() for value in values if value and value.strip()]
 
 
+def _or_filter_value(values: list[str]) -> str:
+    cleaned = list(dict.fromkeys(_clean_list(values)))
+    if not cleaned:
+        raise ValueError("At least one OpenAlex filter value is required")
+    return "|".join(cleaned)
+
+
+def _normalize_external_id(value: object) -> str:
+    text = str(value or "").strip().rstrip("/")
+    if "/" in text:
+        text = text.rsplit("/", 1)[-1]
+    return text
+
+
+def normalize_january_publication_count(
+    jan_pubcount: int,
+    jan1_pubcount: int,
+) -> _JanuaryNormalizationResult:
+    """Estimate real January publications after removing January-1 artifacts."""
+    jan_pubcount = max(0, int(jan_pubcount))
+    jan1_pubcount = max(0, int(jan1_pubcount))
+    jan_guarantee = max(0, jan_pubcount - jan1_pubcount)
+    jan_expected = Decimal(jan_guarantee) + (Decimal(jan_guarantee) / Decimal(30))
+    expected_real_count = int(
+        jan_expected.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+    expected_real_count = min(jan_pubcount, max(0, expected_real_count))
+    estimated_artificial_count = max(0, jan_pubcount - expected_real_count)
+    return _JanuaryNormalizationResult(
+        expected_real_count=expected_real_count,
+        estimated_artificial_count=estimated_artificial_count,
+    )
+
+
 __all__ = [
     "MonthPeriod",
     "OpenAlexTopicStatsCollectionResult",
     "OpenAlexTopicStatsCollector",
     "SyncRateLimiter",
     "iter_month_periods",
+    "normalize_january_publication_count",
 ]

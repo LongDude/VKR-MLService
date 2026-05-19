@@ -10,6 +10,11 @@ from .paper_meta_sources import PaperMetaSourceRepository
 from .paper_processing_states import PaperProcessingStateRepository
 from .papers import PaperRepository
 from .openalex_topic_stats import OpenAlexTopicMonthlyCount, OpenAlexTopicStatsRepository
+from .openalex_yearly_topic_stats import (
+    OpenAlexTopicYearlyArtificialEstimate,
+    OpenAlexTopicYearlyCount,
+    OpenAlexYearlyTopicStatsRepository,
+)
 from .research_clusters import ResearchClusterRepository
 from .taxonomy import TaxonomyRepository
 from .tracked_areas import TrackedAreaRepository
@@ -23,6 +28,9 @@ __all__ = [
     "LandingRepository",
     "OpenAlexTopicMonthlyCount",
     "OpenAlexTopicStatsRepository",
+    "OpenAlexTopicYearlyArtificialEstimate",
+    "OpenAlexTopicYearlyCount",
+    "OpenAlexYearlyTopicStatsRepository",
     "PaperGraphRepository",
     "PaperMetaSourceRepository",
     "PaperProcessingStateRepository",

@@ -60,27 +60,22 @@ class OpenAlexLoadPlanBuilder:
         items: list[OpenAlexLoadPlanItemDTO] = []
         seed_offset = 0
         max_item_size = self.max_sample_size if request.sample else target_new_count
+        language_filter = self._or_filter_value(request.languages, "languages")
+        type_filter = self._or_filter_value(request.types, "types")
         for period, quota in base_periods:
             if quota <= 0:
                 continue
-            for language, publication_type, combo_quota in self._combo_quotas(
+            pieces, seed_offset = self._split_period(
+                period.date_from,
+                period.date_to,
                 quota,
-                request.languages,
-                request.types,
-            ):
-                if combo_quota <= 0:
-                    continue
-                pieces, seed_offset = self._split_period(
-                    period.date_from,
-                    period.date_to,
-                    combo_quota,
-                    language,
-                    publication_type,
-                    seed,
-                    seed_offset,
-                    max_item_size,
-                )
-                items.extend(pieces)
+                language_filter,
+                type_filter,
+                seed,
+                seed_offset,
+                max_item_size,
+            )
+            items.extend(pieces)
 
         total_sample_count = sum(item.sample_size for item in items)
         return OpenAlexLoadPlanDTO(
@@ -202,28 +197,18 @@ class OpenAlexLoadPlanBuilder:
             quotas[index] += 1
         return quotas
 
-    def _combo_quotas(
+    def _or_filter_value(
         self,
-        quota: int,
-        languages: list[str],
-        types: list[str],
-    ) -> list[tuple[str, str, int]]:
-        combos = [
-            (language.strip(), publication_type.strip())
-            for language in languages
-            for publication_type in types
-            if language.strip() and publication_type.strip()
-        ]
-        if not combos:
+        values: list[str],
+        field_name: str,
+    ) -> str:
+        cleaned = list(dict.fromkeys(value.strip() for value in values if value.strip()))
+        if not cleaned:
             raise InvalidRequestError(
-                "At least one language and one type are required",
-                details={"languages": languages, "types": types},
+                f"At least one OpenAlex {field_name} value is required",
+                details={field_name: values},
             )
-        quotas = self._equal_quotas(quota, len(combos))
-        return [
-            (language, publication_type, combo_quota)
-            for (language, publication_type), combo_quota in zip(combos, quotas, strict=True)
-        ]
+        return "|".join(cleaned)
 
     def _equal_quotas(self, total: int, parts: int) -> list[int]:
         if parts <= 0:

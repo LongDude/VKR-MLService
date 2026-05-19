@@ -348,13 +348,49 @@ class TaxonomyRepository(BaseRepository):
         }
         return [topics[topic_id] for topic_id in unique_ids if topic_id in topics]
 
+    def list_fields_by_ids(self, field_ids: list[int]) -> list[Field]:
+        """List fields by ids preserving caller order where possible."""
+        if not field_ids:
+            return []
+        unique_ids = list(dict.fromkeys(int(field_id) for field_id in field_ids))
+        fields = {
+            field.id: field
+            for field in self.session.scalars(select(Field).where(Field.id.in_(unique_ids)))
+        }
+        return [fields[field_id] for field_id in unique_ids if field_id in fields]
+
+    def list_subfields_by_ids(self, subfield_ids: list[int]) -> list[Subfield]:
+        """List subfields by ids preserving caller order where possible."""
+        if not subfield_ids:
+            return []
+        unique_ids = list(dict.fromkeys(int(subfield_id) for subfield_id in subfield_ids))
+        subfields = {
+            subfield.id: subfield
+            for subfield in self.session.scalars(
+                select(Subfield).where(Subfield.id.in_(unique_ids))
+            )
+        }
+        return [
+            subfields[subfield_id]
+            for subfield_id in unique_ids
+            if subfield_id in subfields
+        ]
+
     def list_topics_for_stats(
         self,
         limit: int | None = None,
         offset: int = 0,
+        field_ids: list[int] | None = None,
+        subfield_ids: list[int] | None = None,
     ) -> list[Topic]:
         """List topics ordered by id for external statistics collection."""
         stmt = select(Topic).order_by(Topic.id.asc()).offset(offset)
+        if field_ids:
+            stmt = stmt.join(Subfield, Topic.subfield_id == Subfield.id).where(
+                Subfield.field_id.in_(sorted(set(field_ids)))
+            )
+        if subfield_ids:
+            stmt = stmt.where(Topic.subfield_id.in_(sorted(set(subfield_ids))))
         if limit is not None:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())

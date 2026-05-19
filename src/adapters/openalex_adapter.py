@@ -114,6 +114,39 @@ class OpenAlexAdapter:
                 details={"count": meta.get("count")},
             ) from exc
 
+    def group_works(
+        self,
+        filters: OpenAlexSearchFiltersDTO,
+        *,
+        group_by: str,
+        extra_filter_parts: list[str] | None = None,
+        cursor: str = "*",
+        per_page: int = 200,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Return one OpenAlex ``group_by`` page and the next cursor."""
+        params: dict[str, Any] = {
+            "group_by": group_by,
+            "cursor": cursor,
+            "per-page": max(1, min(200, per_page)),
+        }
+        filter_value = self._build_filter_param(filters)
+        filter_parts = [filter_value] if filter_value else []
+        filter_parts.extend(extra_filter_parts or [])
+        if filter_parts:
+            params["filter"] = ",".join(filter_parts)
+
+        payload = self._get_json("/works", params=params, allow_not_found=False)
+        if not isinstance(payload, dict):
+            raise ExternalResponseFormatError("OpenAlex/OpenAlex group response is not an object")
+        groups = payload.get("group_by")
+        if not isinstance(groups, list):
+            raise ExternalResponseFormatError("OpenAlex/OpenAlex group_by payload is not a list")
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        next_cursor = meta.get("next_cursor") if isinstance(meta, dict) else None
+        return [item for item in groups if isinstance(item, dict)], (
+            str(next_cursor) if next_cursor else None
+        )
+
     def list_recent_works(
         self,
         date_from: date,

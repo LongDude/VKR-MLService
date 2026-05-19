@@ -143,3 +143,31 @@ class OpenAlexMonthlyTopicStat(Base):
             "OpenAlexMonthlyTopicStat("
             f"topic_id={self.topic_id!r}, period_start={self.period_start!r})"
         )
+
+
+class OpenAlexYearlyTopicStat(Base):
+    __tablename__ = "openalex_yearly_topic_stats"
+    __table_args__ = (
+        UniqueConstraint("topic_id", "stat_year"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    topic_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("topics.id", ondelete="SET NULL")
+    )
+    stat_year: Mapped[date] = mapped_column(Date, nullable=False)
+    works_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    artifical_pubdates_estimation: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    collected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    topic: Mapped["Topic | None"] = relationship(back_populates="openalex_yearly_stats")
+
+    def __repr__(self) -> str:
+        return (
+            "OpenAlexYearlyTopicStat("
+            f"topic_id={self.topic_id!r}, stat_year={self.stat_year!r})"
+        )

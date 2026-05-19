@@ -12,6 +12,7 @@ from .associations import (
 )
 from .analytics import (
     OpenAlexMonthlyTopicStat,
+    OpenAlexYearlyTopicStat,
     PaperProcessingState,
     ResearchCluster,
     ResearchClusterPeriodStat,
@@ -35,6 +36,7 @@ __all__ = [
     "Landing",
     "MetaSource",
     "OpenAlexMonthlyTopicStat",
+    "OpenAlexYearlyTopicStat",
     "Paper",
     "PaperAuthor",
     "PaperKeyword",

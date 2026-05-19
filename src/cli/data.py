@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from collections import defaultdict
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,6 +27,7 @@ from models import (
     Field,
     Keyword,
     MetaSource,
+    OpenAlexYearlyTopicStat,
     Paper,
     PaperMetaSource,
     PaperTopic,
@@ -33,6 +35,7 @@ from models import (
     Topic,
 )
 from models.session import create_db_engine, create_session_factory
+from repositories.openalex_yearly_topic_stats import OpenAlexYearlyTopicStatsRepository
 
 
 SAMPLE_LIMIT = 20
@@ -560,6 +563,112 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="SQLAlchemy database URL. Defaults to DATABASE_URL or POSTGRES_* envs.",
     )
 
+    yearly_parser = subparsers.add_parser(
+        "rebuild-openalex-yearly-topic-stats",
+        help="Rebuild yearly OpenAlex topic stats from monthly rows.",
+    )
+    yearly_parser.add_argument(
+        "--date-from",
+        type=parse_iso_date,
+        required=True,
+        help="Monthly period lower bound in YYYY-MM-DD format.",
+    )
+    yearly_parser.add_argument(
+        "--date-to",
+        type=parse_iso_date,
+        required=True,
+        help="Monthly period upper bound in YYYY-MM-DD format.",
+    )
+    yearly_parser.add_argument(
+        "--topic-ids",
+        default=None,
+        help="Comma-separated local topic ids. Defaults to all topics.",
+    )
+    yearly_parser.add_argument(
+        "--exclude-artificial",
+        action="store_true",
+        help="Do not add artifical_pubdates_estimation to yearly works_count.",
+    )
+    yearly_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build yearly rows but roll back instead of writing to PostgreSQL.",
+    )
+    yearly_parser.add_argument(
+        "--report-json",
+        default=None,
+        help="Optional path to write JSON report.",
+    )
+    yearly_parser.add_argument(
+        "--env-file",
+        default=str(PROJECT_DIR / ".env"),
+        help="Path to .env file. Defaults to project .env.",
+    )
+    yearly_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="SQLAlchemy database URL. Defaults to DATABASE_URL or POSTGRES_* envs.",
+    )
+
+    jan_parser = subparsers.add_parser(
+        "check-openalex-jan1-anomalies",
+        help="Check January-1 artificial publication estimates by year and taxonomy area.",
+    )
+    jan_parser.add_argument(
+        "--date-from",
+        type=parse_iso_date,
+        required=True,
+        help="Year lower bound in YYYY-MM-DD format.",
+    )
+    jan_parser.add_argument(
+        "--date-to",
+        type=parse_iso_date,
+        required=True,
+        help="Year upper bound in YYYY-MM-DD format.",
+    )
+    jan_parser.add_argument(
+        "--topic-ids",
+        default=None,
+        help="Comma-separated local topic ids. Defaults to all topics.",
+    )
+    jan_parser.add_argument(
+        "--field-ids",
+        default=None,
+        help="Comma-separated local field ids.",
+    )
+    jan_parser.add_argument(
+        "--subfield-ids",
+        default=None,
+        help="Comma-separated local subfield ids.",
+    )
+    jan_parser.add_argument(
+        "--min-estimate",
+        type=int,
+        default=1,
+        help="Minimum artificial estimate to include. Defaults to 1.",
+    )
+    jan_parser.add_argument(
+        "--sample-limit",
+        type=int,
+        default=SAMPLE_LIMIT,
+        help="Maximum detailed topic rows in the report.",
+    )
+    jan_parser.add_argument(
+        "--report-json",
+        default=None,
+        help="Optional path to write JSON report.",
+    )
+    jan_parser.add_argument(
+        "--env-file",
+        default=str(PROJECT_DIR / ".env"),
+        help="Path to .env file. Defaults to project .env.",
+    )
+    jan_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="SQLAlchemy database URL. Defaults to DATABASE_URL or POSTGRES_* envs.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -571,6 +680,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "validate-local-data":
             report = run_validate_local_data(args)
+        elif args.command == "rebuild-openalex-yearly-topic-stats":
+            report = run_rebuild_openalex_yearly_topic_stats(args)
+        elif args.command == "check-openalex-jan1-anomalies":
+            report = run_check_openalex_jan1_anomalies(args)
         else:
             raise AssertionError(f"Unhandled command: {args.command}")
         if args.report_json:
@@ -618,6 +731,213 @@ def run_validate_local_data(args: argparse.Namespace) -> dict[str, Any]:
             )
     finally:
         engine.dispose()
+
+
+def run_rebuild_openalex_yearly_topic_stats(args: argparse.Namespace) -> dict[str, Any]:
+    """Rebuild yearly OpenAlex topic stats from monthly stats."""
+    if args.date_from > args.date_to:
+        raise ValueError("--date-from must be before or equal to --date-to.")
+    topic_ids = parse_int_csv_arg(args.topic_ids) if args.topic_ids else None
+    database_url = args.database_url or Settings.from_env().database_url
+    engine = create_db_engine(database_url, echo=False)
+    SessionLocal = create_session_factory(engine, expire_on_commit=False)
+
+    try:
+        with SessionLocal() as session:
+            repository = OpenAlexYearlyTopicStatsRepository(session)
+            items = repository.rebuild_from_monthly(
+                date_from=args.date_from,
+                date_to=args.date_to,
+                topic_ids=topic_ids,
+                include_artificial=not args.exclude_artificial,
+            )
+            if args.dry_run:
+                session.rollback()
+            else:
+                session.commit()
+            return {
+                "command": "rebuild-openalex-yearly-topic-stats",
+                "date_from": args.date_from,
+                "date_to": args.date_to,
+                "topic_ids": topic_ids,
+                "include_artificial": not args.exclude_artificial,
+                "dry_run": args.dry_run,
+                "upserted": len(items),
+                "sample": [
+                    {
+                        "topic_id": item.topic_id,
+                        "stat_year": item.stat_year,
+                        "works_count": item.works_count,
+                        "artifical_pubdates_estimation": (
+                            item.artifical_pubdates_estimation
+                        ),
+                    }
+                    for item in items[:SAMPLE_LIMIT]
+                ],
+            }
+    finally:
+        engine.dispose()
+
+
+def run_check_openalex_jan1_anomalies(args: argparse.Namespace) -> dict[str, Any]:
+    """Report January-1 artificial publication estimates by year/topic/area."""
+    if args.date_from > args.date_to:
+        raise ValueError("--date-from must be before or equal to --date-to.")
+    if args.min_estimate < 0:
+        raise ValueError("--min-estimate must be non-negative.")
+    if args.sample_limit < 0:
+        raise ValueError("--sample-limit must be non-negative.")
+    topic_ids = parse_int_csv_arg(args.topic_ids) if args.topic_ids else None
+    field_ids = parse_int_csv_arg(args.field_ids) if args.field_ids else None
+    subfield_ids = parse_int_csv_arg(args.subfield_ids) if args.subfield_ids else None
+    database_url = args.database_url or Settings.from_env().database_url
+    engine = create_db_engine(database_url, echo=False)
+    SessionLocal = create_session_factory(engine, expire_on_commit=False)
+
+    try:
+        with SessionLocal() as session:
+            rows = _load_january_anomaly_rows(
+                session,
+                date_from=args.date_from,
+                date_to=args.date_to,
+                topic_ids=topic_ids,
+                field_ids=field_ids,
+                subfield_ids=subfield_ids,
+                min_estimate=args.min_estimate,
+            )
+            return {
+                "command": "check-openalex-jan1-anomalies",
+                "date_from": args.date_from,
+                "date_to": args.date_to,
+                "min_estimate": args.min_estimate,
+                "summary": _january_anomaly_summary(rows),
+                "sample": rows[: args.sample_limit],
+            }
+    finally:
+        engine.dispose()
+
+
+def _load_january_anomaly_rows(
+    session: Session,
+    *,
+    date_from: date,
+    date_to: date,
+    topic_ids: list[int] | None,
+    field_ids: list[int] | None,
+    subfield_ids: list[int] | None,
+    min_estimate: int,
+) -> list[dict[str, Any]]:
+    stmt = (
+        select(
+            OpenAlexYearlyTopicStat.stat_year,
+            OpenAlexYearlyTopicStat.topic_id,
+            Topic.name.label("topic_name"),
+            Subfield.id.label("subfield_id"),
+            Subfield.name.label("subfield_name"),
+            Field.id.label("field_id"),
+            Field.name.label("field_name"),
+            OpenAlexYearlyTopicStat.works_count,
+            OpenAlexYearlyTopicStat.artifical_pubdates_estimation,
+        )
+        .join(Topic, Topic.id == OpenAlexYearlyTopicStat.topic_id)
+        .outerjoin(Subfield, Subfield.id == Topic.subfield_id)
+        .outerjoin(Field, Field.id == Subfield.field_id)
+        .where(
+            OpenAlexYearlyTopicStat.stat_year >= date(date_from.year, 1, 1),
+            OpenAlexYearlyTopicStat.stat_year <= date(date_to.year, 1, 1),
+            OpenAlexYearlyTopicStat.artifical_pubdates_estimation >= min_estimate,
+        )
+        .order_by(
+            OpenAlexYearlyTopicStat.artifical_pubdates_estimation.desc(),
+            OpenAlexYearlyTopicStat.stat_year.asc(),
+            Topic.name.asc(),
+        )
+    )
+    if topic_ids:
+        stmt = stmt.where(OpenAlexYearlyTopicStat.topic_id.in_(sorted(set(topic_ids))))
+    if field_ids:
+        stmt = stmt.where(Field.id.in_(sorted(set(field_ids))))
+    if subfield_ids:
+        stmt = stmt.where(Subfield.id.in_(sorted(set(subfield_ids))))
+    return [dict(row) for row in session.execute(stmt).mappings()]
+
+
+def _january_anomaly_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_year: dict[str, dict[str, Any]] = {}
+    by_field: dict[tuple[str, int | None], dict[str, Any]] = {}
+    by_subfield: dict[tuple[str, int | None], dict[str, Any]] = {}
+    affected_topics: set[int] = set()
+
+    for row in rows:
+        year = str(row["stat_year"].year)
+        artificial = int(row["artifical_pubdates_estimation"] or 0)
+        topic_id = int(row["topic_id"])
+        affected_topics.add(topic_id)
+
+        year_item = by_year.setdefault(
+            year,
+            {"year": year, "topics": set(), "artifical_pubdates_estimation": 0},
+        )
+        year_item["topics"].add(topic_id)
+        year_item["artifical_pubdates_estimation"] += artificial
+
+        field_key = (year, row.get("field_id"))
+        field_item = by_field.setdefault(
+            field_key,
+            {
+                "year": year,
+                "field_id": row.get("field_id"),
+                "field_name": row.get("field_name"),
+                "topics": set(),
+                "artifical_pubdates_estimation": 0,
+            },
+        )
+        field_item["topics"].add(topic_id)
+        field_item["artifical_pubdates_estimation"] += artificial
+
+        subfield_key = (year, row.get("subfield_id"))
+        subfield_item = by_subfield.setdefault(
+            subfield_key,
+            {
+                "year": year,
+                "subfield_id": row.get("subfield_id"),
+                "subfield_name": row.get("subfield_name"),
+                "field_id": row.get("field_id"),
+                "field_name": row.get("field_name"),
+                "topics": set(),
+                "artifical_pubdates_estimation": 0,
+            },
+        )
+        subfield_item["topics"].add(topic_id)
+        subfield_item["artifical_pubdates_estimation"] += artificial
+
+    return {
+        "rows": len(rows),
+        "affected_topics": len(affected_topics),
+        "artifical_pubdates_estimation": sum(
+            int(row["artifical_pubdates_estimation"] or 0)
+            for row in rows
+        ),
+        "by_year": _finalize_anomaly_groups(by_year.values()),
+        "by_field": _finalize_anomaly_groups(by_field.values()),
+        "by_subfield": _finalize_anomaly_groups(by_subfield.values()),
+    }
+
+
+def _finalize_anomaly_groups(groups: Any) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for group in groups:
+        item = dict(group)
+        topics = item.pop("topics", set())
+        item["affected_topics"] = len(topics)
+        result.append(item)
+    return sorted(
+        result,
+        key=lambda item: (
+            str(item.get("year")),
+            -(int(item.get("artifical_pubdates_estimation") or 0)),
+        ),
+    )
 
 
 def build_report(
@@ -669,6 +989,30 @@ def normalize_doi(value: str | None) -> str | None:
             break
     normalized = normalized.strip()
     return normalized or None
+
+
+def parse_iso_date(value: str) -> date:
+    """Parse an ISO date for argparse."""
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Expected YYYY-MM-DD date, got {value!r}."
+        ) from exc
+
+
+def parse_int_csv_arg(value: str) -> list[int]:
+    """Parse comma-separated integer ids."""
+    result: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            result.append(int(item))
+        except ValueError as exc:
+            raise ValueError(f"Expected comma-separated integer ids, got {item!r}.") from exc
+    return result
 
 
 def normalize_keyword(value: str) -> str:
