@@ -144,9 +144,10 @@ class TopicQuarterReportFacade:
             period_start=request.period_start,
             period_end=request.period_end,
             period_key=period_key,
-            title=self._clean_text(response_payload.get("title")),
             summary=self._clean_text(response_payload.get("summary")),
-            definition=self._clean_text(response_payload.get("definition")),
+            period_characterization=self._clean_text(
+                response_payload.get("period_characterization")
+            ),
             dynamics_summary=self._clean_text(response_payload.get("dynamics_summary")),
             future_dynamics=self._clean_text(response_payload.get("future_dynamics")),
             metrics=metrics,

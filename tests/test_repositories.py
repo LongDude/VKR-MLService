@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 import sys
 from pathlib import Path
 
@@ -8,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from core.config import Settings
 from dto.charts import PeriodCountDTO
-from models import Paper
+from models import Paper, TopicQuarterReport
 from models.models import User
 from models.session import create_engine_from_settings, create_session_factory
 from repositories import (
@@ -159,3 +160,96 @@ def test_repository_classes_expose_required_docstring_methods() -> None:
         for method_name in method_names:
             method = getattr(repository_type, method_name)
             assert method.__doc__, f"{repository_type.__name__}.{method_name} lacks docstring"
+
+
+class _FakeDialect:
+    name = "sqlite"
+
+
+class _FakeBind:
+    dialect = _FakeDialect()
+
+
+class _FakeTopicQuarterReportSession:
+    def __init__(self, existing: TopicQuarterReport | None = None) -> None:
+        self.existing = existing
+        self.added: list[TopicQuarterReport] = []
+        self.flushes = 0
+
+    def get_bind(self) -> _FakeBind:
+        return _FakeBind()
+
+    def scalar(self, _stmt: object) -> TopicQuarterReport | None:
+        return self.existing
+
+    def add(self, instance: TopicQuarterReport) -> None:
+        if getattr(instance, "id", None) is None:
+            instance.id = 1
+        self.added.append(instance)
+
+    def flush(self) -> None:
+        self.flushes += 1
+
+
+def test_topic_quarter_report_repository_uses_period_characterization() -> None:
+    session = _FakeTopicQuarterReportSession()
+    repository = TopicQuarterReportRepository(session)  # type: ignore[arg-type]
+
+    report, created = repository.upsert_report(
+        topic_id=1,
+        period_start=date(2025, 1, 1),
+        period_end=date(2025, 3, 31),
+        period_key="2025-Q1",
+        summary="timeline summary",
+        period_characterization="quarter state",
+        dynamics_summary="dynamic",
+        future_dynamics="future",
+        metrics={"paper_count": 3},
+        keyword_dynamics={"top_keywords": ["graph"]},
+    )
+    dto = repository.to_dto(report)
+
+    assert created is True
+    assert not hasattr(report, "title")
+    assert not hasattr(report, "definition")
+    assert report.period_characterization == "quarter state"
+    assert dto.period_characterization == "quarter state"
+    assert not hasattr(dto, "title")
+    assert not hasattr(dto, "definition")
+
+
+def test_topic_quarter_report_repository_updates_period_characterization() -> None:
+    existing = TopicQuarterReport(
+        id=7,
+        topic_id=1,
+        period_start=date(2025, 1, 1),
+        period_end=date(2025, 3, 31),
+        period_key="2025-Q1",
+        summary="old",
+        period_characterization="old state",
+        dynamics_summary="old dynamic",
+        future_dynamics="old future",
+        metrics={},
+        keyword_dynamics={},
+    )
+    session = _FakeTopicQuarterReportSession(existing=existing)
+    repository = TopicQuarterReportRepository(session)  # type: ignore[arg-type]
+
+    report, created = repository.upsert_report(
+        topic_id=1,
+        period_start=date(2025, 1, 1),
+        period_end=date(2025, 3, 31),
+        period_key="2025-Q1",
+        summary="new",
+        period_characterization="new state",
+        dynamics_summary="new dynamic",
+        future_dynamics="new future",
+        metrics={"paper_count": 5},
+        keyword_dynamics={"top_keywords": ["matching"]},
+    )
+
+    assert created is False
+    assert report is existing
+    assert report.period_characterization == "new state"
+    assert report.summary == "new"
+    assert session.added == []

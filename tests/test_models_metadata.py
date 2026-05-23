@@ -48,3 +48,11 @@ def test_all_migration_tables_are_registered() -> None:
 
 def test_sqlalchemy_mappers_are_configurable() -> None:
     configure_mappers()
+
+
+def test_topic_quarter_report_columns_match_latest_migration() -> None:
+    table = Base.metadata.tables["topic_quarter_reports"]
+
+    assert "title" not in table.columns
+    assert "definition" not in table.columns
+    assert "period_characterization" in table.columns

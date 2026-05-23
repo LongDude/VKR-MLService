@@ -96,9 +96,8 @@ class TopicQuarterReportDTO(BaseDTO):
     period_start: date
     period_end: date
     period_key: str
-    title: str | None = None
     summary: str | None = None
-    definition: str | None = None
+    period_characterization: str | None = None
     dynamics_summary: str | None = None
     future_dynamics: str | None = None
     metrics: dict[str, Any] = Field(default_factory=dict)

@@ -158,9 +158,8 @@ class TopicQuarterReport(Base):
     period_start: Mapped[date] = mapped_column(Date, nullable=False)
     period_end: Mapped[date] = mapped_column(Date, nullable=False)
     period_key: Mapped[str] = mapped_column(Text, nullable=False)
-    title: Mapped[str | None] = mapped_column(Text)
     summary: Mapped[str | None] = mapped_column(Text)
-    definition: Mapped[str | None] = mapped_column(Text)
+    period_characterization: Mapped[str | None] = mapped_column(Text)
     dynamics_summary: Mapped[str | None] = mapped_column(Text)
     future_dynamics: Mapped[str | None] = mapped_column(Text)
     metrics: Mapped[Any] = mapped_column(
