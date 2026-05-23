@@ -15,6 +15,9 @@ from .analytics import (
     OpenAlexYearlyTopicStat,
     ResearchCluster,
     ResearchClusterPeriodStat,
+    TopicQuarterReport,
+    TopicQuarterReportItem,
+    TopicQuarterReportPaper,
 )
 from .author import Author
 from .base import Base
@@ -43,6 +46,9 @@ __all__ = [
     "ResearchClusterPeriodStat",
     "Subfield",
     "Topic",
+    "TopicQuarterReport",
+    "TopicQuarterReportItem",
+    "TopicQuarterReportPaper",
     "User",
     "UserFavouritePaper",
     "UserTrackedDomain",

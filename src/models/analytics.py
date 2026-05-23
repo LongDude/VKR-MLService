@@ -21,6 +21,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .base import Base
 
 if TYPE_CHECKING:
+    from .paper import Paper
     from .topic import Topic
 
 
@@ -141,4 +142,107 @@ class OpenAlexYearlyTopicStat(Base):
         return (
             "OpenAlexYearlyTopicStat("
             f"topic_id={self.topic_id!r}, stat_year={self.stat_year!r})"
+        )
+
+
+class TopicQuarterReport(Base):
+    __tablename__ = "topic_quarter_reports"
+    __table_args__ = (
+        UniqueConstraint("topic_id", "period_key"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    topic_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("topics.id", ondelete="CASCADE"), nullable=False
+    )
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    period_key: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str | None] = mapped_column(Text)
+    summary: Mapped[str | None] = mapped_column(Text)
+    definition: Mapped[str | None] = mapped_column(Text)
+    dynamics_summary: Mapped[str | None] = mapped_column(Text)
+    future_dynamics: Mapped[str | None] = mapped_column(Text)
+    metrics: Mapped[Any] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    keyword_dynamics: Mapped[Any] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    topic: Mapped["Topic"] = relationship(back_populates="quarter_reports")
+    items: Mapped[list["TopicQuarterReportItem"]] = relationship(
+        back_populates="report", cascade="all, delete-orphan"
+    )
+    paper_links: Mapped[list["TopicQuarterReportPaper"]] = relationship(
+        back_populates="report", cascade="all, delete-orphan"
+    )
+
+    def __repr__(self) -> str:
+        return (
+            "TopicQuarterReport("
+            f"id={self.id!r}, topic_id={self.topic_id!r}, period_key={self.period_key!r})"
+        )
+
+
+class TopicQuarterReportItem(Base):
+    __tablename__ = "topic_quarter_report_items"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    report_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("topic_quarter_reports.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    item_type: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    maturity: Mapped[str | None] = mapped_column(Text)
+    evidence: Mapped[Any] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    sort_order: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    report: Mapped["TopicQuarterReport"] = relationship(back_populates="items")
+
+    def __repr__(self) -> str:
+        return (
+            "TopicQuarterReportItem("
+            f"id={self.id!r}, report_id={self.report_id!r}, item_type={self.item_type!r})"
+        )
+
+
+class TopicQuarterReportPaper(Base):
+    __tablename__ = "topic_quarter_report_papers"
+
+    report_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("topic_quarter_reports.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    paper_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("papers.id", ondelete="CASCADE"), primary_key=True
+    )
+    role: Mapped[str] = mapped_column(Text, primary_key=True)
+    score: Mapped[Decimal | None] = mapped_column(Numeric(10, 5))
+    note: Mapped[str | None] = mapped_column(Text)
+
+    report: Mapped["TopicQuarterReport"] = relationship(back_populates="paper_links")
+    paper: Mapped["Paper"] = relationship(back_populates="quarter_report_links")
+
+    def __repr__(self) -> str:
+        return (
+            "TopicQuarterReportPaper("
+            f"report_id={self.report_id!r}, paper_id={self.paper_id!r}, role={self.role!r})"
         )

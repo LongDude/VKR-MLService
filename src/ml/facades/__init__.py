@@ -9,6 +9,7 @@ from .paper_indexing import PaperIndexingFacade
 from .recommendations import RecommendationFacade
 from .research_entity_indexing import ResearchEntityIndexingFacade
 from .summaries import SummaryFacade
+from .topic_quarter_reports import TopicQuarterReportFacade
 from .user_profile import UserProfileFacade
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "RecommendationFacade",
     "ResearchEntityIndexingFacade",
     "SummaryFacade",
+    "TopicQuarterReportFacade",
     "UserProfileFacade",
 ]

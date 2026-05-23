@@ -9,6 +9,8 @@ from core.exceptions import LLMGenerationError
 
 
 class LMStudioChatAdapter:
+    """Small OpenAI-compatible chat client for LMStudio local server."""
+
     def __init__(
         self,
         base_url: str = "http://localhost:1234",
@@ -27,14 +29,18 @@ class LMStudioChatAdapter:
         temperature: float = 0.2,
         response_format: dict[str, Any] | None = None,
     ) -> str:
+        """Return assistant text from a chat completion request."""
         try:
+            normalized_response_format = self._normalize_response_format(
+                response_format
+            )
             payload: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
                 "temperature": temperature,
             }
-            if response_format is not None:
-                payload["response_format"] = response_format
+            if normalized_response_format is not None:
+                payload["response_format"] = normalized_response_format
 
             response = self._client.post(
                 f"{self._base_url}/v1/chat/completions",
@@ -44,7 +50,7 @@ class LMStudioChatAdapter:
             self._raise_for_status(response)
             data = response.json()
             content = self._extract_content(data)
-            if response_format is not None:
+            if self._expects_json_response(response_format):
                 self._parse_json_content(content)
             return content
         except LLMGenerationError:
@@ -56,6 +62,7 @@ class LMStudioChatAdapter:
             ) from exc
 
     def summarize_cluster(self, title: str, abstracts: list[str]) -> dict[str, Any]:
+        """Return a compact JSON summary for a research cluster."""
         content = self.chat_completion(
             messages=[
                 {
@@ -80,6 +87,7 @@ class LMStudioChatAdapter:
         paper_title: str,
         paper_abstract: str | None,
     ) -> str:
+        """Return a concise natural-language paper recommendation explanation."""
         interests = ", ".join(user_interests) if user_interests else "not specified"
         return self.chat_completion(
             messages=[
@@ -97,6 +105,32 @@ class LMStudioChatAdapter:
                 },
             ],
         )
+
+    def _normalize_response_format(
+        self,
+        response_format: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if response_format is None:
+            return None
+        if response_format.get("type") != "json_object":
+            return response_format
+
+        schema = response_format.get("schema") or {
+            "type": "object",
+            "additionalProperties": True,
+        }
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": str(response_format.get("name") or "json_response"),
+                "schema": schema,
+            },
+        }
+
+    def _expects_json_response(self, response_format: dict[str, Any] | None) -> bool:
+        if response_format is None:
+            return False
+        return response_format.get("type") in {"json_object", "json_schema"}
 
     def _extract_content(self, payload: dict[str, Any]) -> str:
         choices = payload.get("choices")

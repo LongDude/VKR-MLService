@@ -21,6 +21,25 @@ class ResearchClusterRepository(BaseRepository):
         stmt = select(ResearchCluster).where(ResearchCluster.cluster_key == cluster_key)
         return self.session.scalar(stmt)
 
+    def list_period_stats(
+        self,
+        cluster_key: str,
+        date_from: date,
+        date_to: date,
+    ) -> list[ResearchClusterPeriodStat]:
+        """List persisted period stats for one cluster and date range."""
+        stmt = (
+            select(ResearchClusterPeriodStat)
+            .join(ResearchCluster, ResearchCluster.id == ResearchClusterPeriodStat.cluster_id)
+            .where(
+                ResearchCluster.cluster_key == cluster_key,
+                ResearchClusterPeriodStat.period_start >= date_from,
+                ResearchClusterPeriodStat.period_end <= date_to,
+            )
+            .order_by(ResearchClusterPeriodStat.period_start.asc())
+        )
+        return list(self.session.scalars(stmt).all())
+
     def upsert_cluster_from_payload(
         self,
         payload: dict[str, Any],

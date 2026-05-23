@@ -16,6 +16,7 @@ PAPER_INDEXING_QUEUE = "queue:paper_indexing"
 ENTITY_INDEXING_QUEUE = "queue:entity_indexing"
 CLUSTER_RECOMPUTE_QUEUE = "queue:cluster_recompute"
 CLUSTER_DYNAMICS_RECOMPUTE_QUEUE = "queue:cluster_dynamics_recompute"
+TOPIC_QUARTER_REPORT_QUEUE = "queue:topic_quarter_reports"
 USER_PROFILE_RECOMPUTE_QUEUE = "queue:user_profile_recompute"
 FAILED_TASKS_QUEUE = "queue:failed_tasks"
 
@@ -25,6 +26,7 @@ DEFAULT_QUEUE_ORDER = (
     ENTITY_INDEXING_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
+    TOPIC_QUARTER_REPORT_QUEUE,
     USER_PROFILE_RECOMPUTE_QUEUE,
 )
 
@@ -278,7 +280,7 @@ class RedisMLWorker:
             message="Worker task started",
         )
         try:
-            self.task_handler.handle(message)
+            result = self.task_handler.handle(message)
         except KeyboardInterrupt as exc:
             self._rollback_handler_session()
             self._emit_worker_event(
@@ -292,34 +294,44 @@ class RedisMLWorker:
             self._handle_task_interrupt(queue_name, message, exc)
             raise
         except Exception as exc:
+            error_payload = self._error_payload(exc)
             self._emit_worker_event(
                 "worker_task_failed",
                 task_summary,
                 current=task_summary["item_count"],
                 total=task_summary["item_count"],
                 message=str(exc),
-                payload={"error_type": exc.__class__.__name__},
+                payload={
+                    "error_type": exc.__class__.__name__,
+                    "error": error_payload,
+                },
             )
             self._handle_task_error(queue_name, message, exc)
         else:
             elapsed_seconds = round(time.monotonic() - started_at, 3)
+            result_summary = self._safe_result_summary(result)
             self._emit_worker_event(
                 "worker_task_completed",
                 task_summary,
                 current=task_summary["item_count"],
                 total=task_summary["item_count"],
                 message="Worker task completed",
-                payload={"elapsed_seconds": elapsed_seconds},
+                payload={
+                    "elapsed_seconds": elapsed_seconds,
+                    "result": result_summary,
+                },
             )
             self.logger.info(
-                "ML task completed queue=%s task_type=%s item_count=%s elapsed_seconds=%s",
+                "ML task completed queue=%s task_type=%s item_count=%s elapsed_seconds=%s result=%s",
                 task_summary["queue_name"],
                 task_summary["task_type"],
                 task_summary["item_count"],
                 elapsed_seconds,
+                result_summary,
                 extra={
                     **task_summary,
                     "elapsed_seconds": elapsed_seconds,
+                    "task_result": result_summary,
                 },
             )
         finally:
@@ -409,11 +421,17 @@ class RedisMLWorker:
             return [message]
 
         force_summary = bool(message.get("force_summary", False))
+        cluster_workers = message.get("cluster_workers")
         return [
             {
                 "task_type": "recompute_topic_clusters",
                 "topic_ids": topic_ids[index : index + max_task_size],
                 "force_summary": force_summary,
+                **(
+                    {"cluster_workers": int(cluster_workers)}
+                    if cluster_workers is not None
+                    else {}
+                ),
             }
             for index in range(0, len(topic_ids), max_task_size)
         ]
@@ -528,8 +546,16 @@ class RedisMLWorker:
             item_field = "topic_ids"
             item_count = len(topic_ids)
 
+        cluster_ids = message.get("cluster_ids")
+        if isinstance(cluster_ids, list) and cluster_ids:
+            item_field = "cluster_ids"
+            item_count = len(cluster_ids)
+
         if "cluster_id" in message:
             item_field = "cluster_id"
+        elif isinstance(message.get("requests"), list):
+            item_field = "requests"
+            item_count = len(message["requests"])
         elif "user_id" in message:
             item_field = "user_id"
         elif "limit" in message and item_field is None:
@@ -544,16 +570,39 @@ class RedisMLWorker:
         }
 
     def _safe_message_summary(self, message: dict[str, Any]) -> dict[str, Any]:
-        summary: dict[str, Any] = {}
-        for key, value in message.items():
-            if isinstance(value, list):
-                summary[key] = {
-                    "count": len(value),
-                    "sample": value[:5],
-                }
-            else:
-                summary[key] = value
-        return summary
+        return self._safe_payload_summary(message)
+
+    def _safe_result_summary(self, result: Any) -> dict[str, Any]:
+        if result is None:
+            return {}
+        if hasattr(result, "model_dump"):
+            value = result.model_dump(mode="json")
+        elif hasattr(result, "dict"):
+            value = result.dict()
+        elif isinstance(result, dict):
+            value = result
+        else:
+            value = {"value": result}
+        safe_value = self._safe_payload_summary(value)
+        return safe_value if isinstance(safe_value, dict) else {"value": safe_value}
+
+    def _safe_payload_summary(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(key): self._safe_payload_summary(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return {
+                "count": len(value),
+                "sample": [
+                    self._safe_payload_summary(item)
+                    for item in value[:5]
+                ],
+            }
+        if isinstance(value, str) and len(value) > 500:
+            return f"{value[:500]}..."
+        return value
 
     def _handle_task_error(
         self,
@@ -561,11 +610,14 @@ class RedisMLWorker:
         message: dict,
         exc: Exception,
     ) -> None:
+        error_payload = self._error_payload(exc)
         self.logger.exception(
-            "ML task failed",
+            "ML task failed error=%s",
+            error_payload,
             extra={
                 "queue_name": queue_name,
                 "task_type": message.get("task_type"),
+                "task_error": error_payload,
             },
         )
         try:
@@ -574,7 +626,7 @@ class RedisMLWorker:
                 {
                     "source_queue": queue_name,
                     "message": message,
-                    "error": self._error_payload(exc),
+                    "error": error_payload,
                 },
             )
         except Exception:
@@ -678,5 +730,6 @@ __all__ = [
     "KEYWORD_EXTRACTION_QUEUE",
     "PAPER_INDEXING_QUEUE",
     "RedisMLWorker",
+    "TOPIC_QUARTER_REPORT_QUEUE",
     "USER_PROFILE_RECOMPUTE_QUEUE",
 ]

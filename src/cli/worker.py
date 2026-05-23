@@ -35,12 +35,14 @@ from ml.facades import (
     PaperIndexingFacade,
     ResearchEntityIndexingFacade,
     SummaryFacade,
+    TopicQuarterReportFacade,
     UserProfileFacade,
 )
 from ml.pipelines.cluster_dynamics_pipeline import ClusterDynamicsPipeline
 from ml.pipelines.keyword_extraction_pipeline import KeywordExtractionPipeline
 from ml.pipelines.paper_indexing_pipeline import PaperIndexingPipeline
 from ml.pipelines.research_entities_pipeline import ResearchEntitiesPipeline
+from ml.pipelines.topic_quarter_report_pipeline import TopicQuarterReportPipeline
 from ml.pipelines.trend_recompute_pipeline import TrendRecomputePipeline
 from ml.pipelines.user_profile_pipeline import UserProfilePipeline
 from ml.services.events import (
@@ -59,6 +61,7 @@ from ml.workers.redis_worker import (
     ENTITY_INDEXING_QUEUE,
     KEYWORD_EXTRACTION_QUEUE,
     PAPER_INDEXING_QUEUE,
+    TOPIC_QUARTER_REPORT_QUEUE,
     USER_PROFILE_RECOMPUTE_QUEUE,
     RedisMLWorker,
 )
@@ -68,10 +71,12 @@ from repositories import (
     AuthorRepository,
     FavouriteRepository,
     InstitutionRepository,
+    OpenAlexTopicStatsRepository,
     PaperGraphRepository,
     PaperRepository,
     ResearchClusterRepository,
     TaxonomyRepository,
+    TopicQuarterReportRepository,
     TrackedAreaRepository,
 )
 
@@ -83,6 +88,8 @@ QUEUE_ALIASES = {
     "research_entities_indexing": ENTITY_INDEXING_QUEUE,
     "cluster_recompute": CLUSTER_RECOMPUTE_QUEUE,
     "cluster_dynamics_recompute": CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
+    "topic_quarter_reports": TOPIC_QUARTER_REPORT_QUEUE,
+    "topic_quarter_report": TOPIC_QUARTER_REPORT_QUEUE,
     "user_profile_recompute": USER_PROFILE_RECOMPUTE_QUEUE,
 }
 
@@ -465,6 +472,17 @@ def build_task_handler(
             event_sink=event_sink,
         )
     )
+    topic_quarter_report_pipeline = TopicQuarterReportPipeline(
+        TopicQuarterReportFacade(
+            taxonomy_repository=taxonomy_repository,
+            paper_repository=paper_repository,
+            research_cluster_repository=research_cluster_repository,
+            topic_report_repository=TopicQuarterReportRepository(session),
+            openalex_topic_stats_repository=OpenAlexTopicStatsRepository(session),
+            chat_adapter=chat_adapter,
+            event_sink=event_sink,
+        )
+    )
     user_profile_pipeline = UserProfilePipeline(
         UserProfileFacade(
             favourite_repository=FavouriteRepository(session),
@@ -482,6 +500,7 @@ def build_task_handler(
         research_entities_pipeline=research_entities_pipeline,
         trend_recompute_pipeline=trend_recompute_pipeline,
         cluster_dynamics_pipeline=cluster_dynamics_pipeline,
+        topic_quarter_report_pipeline=topic_quarter_report_pipeline,
         user_profile_pipeline=user_profile_pipeline,
         event_sink=event_sink,
         cluster_recompute_workers=cluster_recompute_workers,

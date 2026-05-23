@@ -7,11 +7,13 @@ from typing import Any, Callable, Literal
 from core.exceptions import AppError, InvalidRequestError
 from dto.common import BatchOperationResultDTO, OperationResultDTO
 from dto.keywords import PaperKeywordExtractionBatchRequestDTO
+from dto.topic_reports import TopicQuarterReportGenerateRequestDTO
 from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.pipelines.cluster_dynamics_pipeline import ClusterDynamicsPipeline
 from ml.pipelines.keyword_extraction_pipeline import KeywordExtractionPipeline
 from ml.pipelines.paper_indexing_pipeline import PaperIndexingPipeline
 from ml.pipelines.research_entities_pipeline import ResearchEntitiesPipeline
+from ml.pipelines.topic_quarter_report_pipeline import TopicQuarterReportPipeline
 from ml.pipelines.trend_recompute_pipeline import TrendRecomputePipeline
 from ml.pipelines.user_profile_pipeline import UserProfilePipeline
 
@@ -29,6 +31,7 @@ class MLTaskHandler:
         research_entities_pipeline: ResearchEntitiesPipeline | None = None,
         trend_recompute_pipeline: TrendRecomputePipeline | None = None,
         cluster_dynamics_pipeline: ClusterDynamicsPipeline | None = None,
+        topic_quarter_report_pipeline: TopicQuarterReportPipeline | None = None,
         user_profile_pipeline: UserProfilePipeline | None = None,
         event_sink: EventSink | None = None,
         cluster_recompute_workers: int = 1,
@@ -40,6 +43,7 @@ class MLTaskHandler:
         self.research_entities_pipeline = research_entities_pipeline
         self.trend_recompute_pipeline = trend_recompute_pipeline
         self.cluster_dynamics_pipeline = cluster_dynamics_pipeline
+        self.topic_quarter_report_pipeline = topic_quarter_report_pipeline
         self.user_profile_pipeline = user_profile_pipeline
         self.event_sink = event_sink or NoopEventSink()
         self.cluster_recompute_workers = max(1, int(cluster_recompute_workers))
@@ -71,6 +75,8 @@ class MLTaskHandler:
             return self._handle_cluster_recompute(message)
         if task_type == "cluster_dynamics_recompute":
             return self._handle_cluster_dynamics_recompute(message)
+        if task_type == "topic_quarter_report":
+            return self._handle_topic_quarter_report(message)
         if task_type == "user_profile_recompute":
             return self._handle_user_profile_recompute(message)
 
@@ -332,6 +338,37 @@ class MLTaskHandler:
             self.cluster_dynamics_pipeline,
             "cluster_dynamics_pipeline",
         )
+        if "cluster_ids" in message:
+            cluster_ids = self._str_list_field(message, "cluster_ids")
+            date_from = self._required_date(message, "date_from")
+            date_to = self._required_date(message, "date_to")
+            granularity = self._granularity(message.get("granularity", "month"))
+            result = BatchOperationResultDTO(total=len(cluster_ids))
+            for cluster_id in cluster_ids:
+                try:
+                    partial = pipeline.recompute(
+                        cluster_id=cluster_id,
+                        date_from=date_from,
+                        date_to=date_to,
+                        granularity=granularity,
+                    )
+                except Exception as exc:
+                    result.failed += 1
+                    result.errors.append(self._task_error_payload(cluster_id, exc))
+                    continue
+                result.updated += partial.updated
+                result.skipped += partial.skipped
+                result.failed += partial.failed
+                result.errors.extend(
+                    {"cluster_id": cluster_id, **error}
+                    for error in partial.errors
+                )
+            return self._batch_result(
+                result,
+                "Cluster dynamics recompute batch completed",
+                task_type="cluster_dynamics_recompute",
+            )
+
         result = pipeline.recompute(
             cluster_id=self._required_str(message, "cluster_id"),
             date_from=self._required_date(message, "date_from"),
@@ -342,6 +379,24 @@ class MLTaskHandler:
             result,
             "Cluster dynamics recompute completed",
             task_type="cluster_dynamics_recompute",
+        )
+
+    def _handle_topic_quarter_report(
+        self,
+        message: dict[str, Any],
+    ) -> OperationResultDTO:
+        pipeline = self._required_pipeline(
+            self.topic_quarter_report_pipeline,
+            "topic_quarter_report_pipeline",
+        )
+        requests = self._topic_report_requests(message)
+        if len(requests) == 1:
+            return pipeline.generate_one(requests[0])
+        result = pipeline.generate_many(requests)
+        return self._batch_result(
+            result,
+            "Topic quarter report batch completed",
+            task_type="topic_quarter_report",
         )
 
     def _handle_user_profile_recompute(
@@ -365,6 +420,43 @@ class MLTaskHandler:
         if "topic_id" in message:
             return [self._required_int(message, "topic_id")]
         return []
+
+    def _topic_report_requests(
+        self,
+        message: dict[str, Any],
+    ) -> list[TopicQuarterReportGenerateRequestDTO]:
+        force = self._bool_field(message, "force", default=False)
+        report_language = str(message.get("report_language") or "ru")
+        raw_requests = message.get("requests")
+        if raw_requests is None:
+            raw_requests = [
+                {
+                    "topic_id": self._required_int(message, "topic_id"),
+                    "period_start": self._required_date(message, "period_start"),
+                    "period_end": self._required_date(message, "period_end"),
+                }
+            ]
+        if not isinstance(raw_requests, list):
+            raise InvalidRequestError(
+                "Topic report task requests must be a list",
+                details={"field": "requests", "value": raw_requests},
+            )
+        requests: list[TopicQuarterReportGenerateRequestDTO] = []
+        for item in raw_requests:
+            if not isinstance(item, dict):
+                raise InvalidRequestError(
+                    "Topic report task request must be an object",
+                    details={"item": item},
+                )
+            payload = {
+                **item,
+                "force": item.get("force", force),
+                "report_language": item.get("report_language", report_language),
+            }
+            requests.append(TopicQuarterReportGenerateRequestDTO.model_validate(payload))
+        if not requests:
+            raise InvalidRequestError("Topic report task requires at least one request")
+        return requests
 
     def _batch_result(
         self,
@@ -465,6 +557,21 @@ class MLTaskHandler:
                 "Task list field must contain integers",
                 details={"field": field, "value": value},
             ) from exc
+
+    def _str_list_field(self, message: dict[str, Any], field: str) -> list[str]:
+        value = message.get(field)
+        if not isinstance(value, list):
+            raise InvalidRequestError(
+                "Task field must be a list",
+                details={"field": field, "value": value},
+            )
+        result = [str(item).strip() for item in value if str(item).strip()]
+        if not result:
+            raise InvalidRequestError(
+                "Task list field must contain strings",
+                details={"field": field, "value": value},
+            )
+        return result
 
     def _required_date(self, message: dict[str, Any], field: str) -> date:
         value = message.get(field)

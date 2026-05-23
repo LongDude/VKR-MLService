@@ -9,6 +9,7 @@ from .redis_worker import (
     KEYWORD_EXTRACTION_QUEUE,
     PAPER_INDEXING_QUEUE,
     RedisMLWorker,
+    TOPIC_QUARTER_REPORT_QUEUE,
     USER_PROFILE_RECOMPUTE_QUEUE,
 )
 from .task_handlers import MLTaskHandler
@@ -23,5 +24,6 @@ __all__ = [
     "MLTaskHandler",
     "PAPER_INDEXING_QUEUE",
     "RedisMLWorker",
+    "TOPIC_QUARTER_REPORT_QUEUE",
     "USER_PROFILE_RECOMPUTE_QUEUE",
 ]

@@ -22,17 +22,259 @@ from adapters import QdrantAdapter, RedisAdapter
 from core.config import Settings
 from core.exceptions import AppError
 from ml.constants import PAPERS_COLLECTION
+from ml.services.quarter_periods import QuarterPeriodService
 from ml.workers.redis_worker import (
+    CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
     FAILED_TASKS_QUEUE,
     PAPER_INDEXING_QUEUE,
+    TOPIC_QUARTER_REPORT_QUEUE,
 )
 from models.session import create_db_engine, create_session_factory
-from repositories import PaperRepository
+from repositories import PaperRepository, TaxonomyRepository
 
 
 DEFAULT_PAGE_SIZE = 1000
 DEFAULT_QDRANT_RETRIEVE_SIZE = 256
+
+
+class ClusterRecomputeTaskEnqueuer:
+    """Create Redis tasks for static topic cluster recomputation."""
+
+    def __init__(
+        self,
+        *,
+        redis_adapter: RedisAdapter | None,
+        queue_name: str = CLUSTER_RECOMPUTE_QUEUE,
+    ) -> None:
+        self.redis_adapter = redis_adapter
+        self.queue_name = queue_name
+
+    def enqueue(
+        self,
+        *,
+        topic_ids: list[int],
+        batch_size: int,
+        force_summary: bool = False,
+        cluster_workers: int = 1,
+        dry_run: bool = False,
+        show_progress: bool = True,
+    ) -> dict[str, Any]:
+        """Build static cluster recompute messages and optionally enqueue them."""
+        if not topic_ids:
+            raise ValueError("At least one topic id is required.")
+        if batch_size <= 0:
+            raise ValueError("--batch-size must be a positive integer.")
+        if cluster_workers <= 0:
+            raise ValueError("--cluster-workers must be a positive integer.")
+        messages = [
+            {
+                "task_type": "recompute_topic_clusters",
+                "topic_ids": chunk,
+                "force_summary": bool(force_summary),
+                "cluster_workers": int(cluster_workers),
+            }
+            for chunk in chunked(list(dict.fromkeys(topic_ids)), batch_size)
+        ]
+        self._enqueue_messages(messages, dry_run=dry_run, show_progress=show_progress)
+        return {
+            "queue": self.queue_name,
+            "dry_run": dry_run,
+            "topic_count": len(set(topic_ids)),
+            "messages": len(messages),
+            "batch_size": batch_size,
+            "force_summary": bool(force_summary),
+            "cluster_workers": int(cluster_workers),
+            "sample": messages[:3],
+        }
+
+    def _enqueue_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        dry_run: bool,
+        show_progress: bool,
+    ) -> None:
+        if dry_run:
+            return
+        if self.redis_adapter is None:
+            raise ValueError("Redis adapter is required unless --dry-run is used.")
+        progress = None
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            progress = tqdm(total=len(messages), desc="Enqueue cluster recompute", unit="batch")
+        try:
+            for message in messages:
+                self.redis_adapter.enqueue(self.queue_name, message)
+                if progress is not None:
+                    progress.update(1)
+        finally:
+            if progress is not None:
+                progress.close()
+
+
+class ClusterDynamicsTaskEnqueuer:
+    """Create Redis tasks for time-sliced topic cluster dynamics recomputation."""
+
+    def __init__(
+        self,
+        *,
+        redis_adapter: RedisAdapter | None,
+        queue_name: str = CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
+    ) -> None:
+        self.redis_adapter = redis_adapter
+        self.queue_name = queue_name
+
+    def enqueue(
+        self,
+        *,
+        cluster_ids: list[str],
+        date_from: date,
+        date_to: date,
+        granularity: str,
+        batch_size: int,
+        dry_run: bool = False,
+        show_progress: bool = True,
+    ) -> dict[str, Any]:
+        """Build cluster dynamics recompute messages and optionally enqueue them."""
+        if not cluster_ids:
+            raise ValueError("At least one cluster id is required.")
+        if date_from > date_to:
+            raise ValueError("--date-from must be before or equal to --date-to.")
+        if granularity not in {"week", "month"}:
+            raise ValueError("--granularity must be 'week' or 'month'.")
+        if batch_size <= 0:
+            raise ValueError("--batch-size must be a positive integer.")
+        unique_cluster_ids = list(dict.fromkeys(cluster_ids))
+        messages = [
+            {
+                "task_type": "cluster_dynamics_recompute",
+                "cluster_ids": chunk,
+                "date_from": date_from.isoformat(),
+                "date_to": date_to.isoformat(),
+                "granularity": granularity,
+            }
+            for chunk in chunked_strings(unique_cluster_ids, batch_size)
+        ]
+        self._enqueue_messages(messages, dry_run=dry_run, show_progress=show_progress)
+        return {
+            "queue": self.queue_name,
+            "dry_run": dry_run,
+            "cluster_count": len(unique_cluster_ids),
+            "messages": len(messages),
+            "batch_size": batch_size,
+            "date_from": date_from,
+            "date_to": date_to,
+            "granularity": granularity,
+            "sample": messages[:3],
+        }
+
+    def _enqueue_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        dry_run: bool,
+        show_progress: bool,
+    ) -> None:
+        if dry_run:
+            return
+        if self.redis_adapter is None:
+            raise ValueError("Redis adapter is required unless --dry-run is used.")
+        progress = None
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            progress = tqdm(total=len(messages), desc="Enqueue cluster dynamics", unit="batch")
+        try:
+            for message in messages:
+                self.redis_adapter.enqueue(self.queue_name, message)
+                if progress is not None:
+                    progress.update(1)
+        finally:
+            if progress is not None:
+                progress.close()
+
+
+class TopicQuarterReportTaskEnqueuer:
+    """Create Redis tasks for quarterly topic report generation."""
+
+    def __init__(
+        self,
+        *,
+        redis_adapter: RedisAdapter | None,
+        queue_name: str = TOPIC_QUARTER_REPORT_QUEUE,
+        quarter_period_service: QuarterPeriodService | None = None,
+    ) -> None:
+        self.redis_adapter = redis_adapter
+        self.queue_name = queue_name
+        self.quarter_period_service = quarter_period_service or QuarterPeriodService()
+
+    def enqueue(
+        self,
+        *,
+        topic_ids: list[int],
+        date_from: date,
+        date_to: date,
+        batch_size: int,
+        force: bool = False,
+        report_language: str = "ru",
+        dry_run: bool = False,
+        show_progress: bool = True,
+    ) -> dict[str, Any]:
+        """Build topic-quarter report task messages and optionally enqueue them."""
+        if not topic_ids:
+            raise ValueError("At least one topic id is required.")
+        if batch_size <= 0:
+            raise ValueError("--batch-size must be a positive integer.")
+        periods = self.quarter_period_service.quarter_periods(date_from, date_to)
+        requests = [
+            {
+                "topic_id": int(topic_id),
+                "period_start": period.date_from.isoformat(),
+                "period_end": period.date_to.isoformat(),
+            }
+            for topic_id in list(dict.fromkeys(topic_ids))
+            for period in periods
+        ]
+        messages = [
+            {
+                "task_type": "topic_quarter_report",
+                "requests": chunk,
+                "force": bool(force),
+                "report_language": report_language,
+            }
+            for chunk in chunked_dicts(requests, batch_size)
+        ]
+        if not dry_run:
+            if self.redis_adapter is None:
+                raise ValueError("Redis adapter is required unless --dry-run is used.")
+            iterator = messages
+            progress = None
+            if show_progress:
+                from tqdm.auto import tqdm
+
+                progress = tqdm(total=len(messages), desc="Enqueue topic reports", unit="batch")
+            try:
+                for message in iterator:
+                    self.redis_adapter.enqueue(self.queue_name, message)
+                    if progress is not None:
+                        progress.update(1)
+            finally:
+                if progress is not None:
+                    progress.close()
+        return {
+            "queue": self.queue_name,
+            "dry_run": dry_run,
+            "topic_count": len(set(topic_ids)),
+            "periods": [period.key for period in periods],
+            "request_count": len(requests),
+            "messages": len(messages),
+            "batch_size": batch_size,
+            "force": bool(force),
+            "report_language": report_language,
+            "sample": messages[:3],
+        }
 
 
 class PaperIndexingTaskEnqueuer:
@@ -201,6 +443,173 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_redis_args(enqueue_parser)
     add_qdrant_args(enqueue_parser)
 
+    cluster_parser = subparsers.add_parser(
+        "enqueue-cluster-recompute",
+        help="Enqueue static topic cluster recomputation tasks.",
+    )
+    add_topic_scope_args(cluster_parser)
+    cluster_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50,
+        help="Maximum topic ids per Redis message. Defaults to 50.",
+    )
+    cluster_parser.add_argument(
+        "--force-summary",
+        action="store_true",
+        help="Regenerate LLM cluster summaries.",
+    )
+    cluster_parser.add_argument(
+        "--cluster-workers",
+        type=int,
+        default=1,
+        help="Worker-side parallel cluster recompute workers. Defaults to 1.",
+    )
+    cluster_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview messages without modifying Redis.",
+    )
+    cluster_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable enqueue progress bar.",
+    )
+    add_database_args(cluster_parser)
+    add_redis_args(cluster_parser)
+
+    dynamics_parser = subparsers.add_parser(
+        "enqueue-cluster-dynamics",
+        help="Enqueue time-sliced cluster dynamics recomputation tasks.",
+    )
+    dynamics_scope = dynamics_parser.add_mutually_exclusive_group(required=True)
+    dynamics_scope.add_argument(
+        "--cluster-ids",
+        default=None,
+        help="Comma-separated cluster ids, for example topic:1,topic:2.",
+    )
+    dynamics_scope.add_argument(
+        "--topic-ids",
+        default=None,
+        help="Comma-separated topic ids to schedule as topic:{id} clusters.",
+    )
+    dynamics_scope.add_argument(
+        "--field-id",
+        type=int,
+        default=None,
+        help="Schedule dynamics for all topics belonging to one field.",
+    )
+    dynamics_scope.add_argument(
+        "--all-topics",
+        action="store_true",
+        help="Schedule dynamics for all topics, optionally constrained by --limit/--offset.",
+    )
+    dynamics_parser.add_argument(
+        "--date-from",
+        type=parse_iso_date,
+        required=True,
+        help="Dynamics period lower bound in YYYY-MM-DD format.",
+    )
+    dynamics_parser.add_argument(
+        "--date-to",
+        type=parse_iso_date,
+        required=True,
+        help="Dynamics period upper bound in YYYY-MM-DD format.",
+    )
+    dynamics_parser.add_argument(
+        "--granularity",
+        choices=["month", "week"],
+        default="month",
+        help="Dynamics period granularity. Defaults to month.",
+    )
+    dynamics_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum topics to resolve for --field-id/--all-topics.",
+    )
+    dynamics_parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Topic offset for --field-id/--all-topics. Defaults to 0.",
+    )
+    dynamics_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50,
+        help="Maximum cluster ids per Redis message. Defaults to 50.",
+    )
+    dynamics_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview messages without modifying Redis.",
+    )
+    dynamics_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable enqueue progress bar.",
+    )
+    add_database_args(dynamics_parser)
+    add_redis_args(dynamics_parser)
+
+    report_parser = subparsers.add_parser(
+        "enqueue-topic-reports",
+        help="Enqueue quarterly topic report generation tasks.",
+    )
+    report_scope = report_parser.add_mutually_exclusive_group(required=True)
+    report_scope.add_argument(
+        "--topic-ids",
+        default=None,
+        help="Comma-separated topic ids to schedule.",
+    )
+    report_scope.add_argument(
+        "--field-id",
+        type=int,
+        default=None,
+        help="Schedule reports for all topics belonging to one field.",
+    )
+    report_parser.add_argument(
+        "--date-from",
+        type=parse_iso_date,
+        required=True,
+        help="Report period lower bound in YYYY-MM-DD format.",
+    )
+    report_parser.add_argument(
+        "--date-to",
+        type=parse_iso_date,
+        required=True,
+        help="Report period upper bound in YYYY-MM-DD format.",
+    )
+    report_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50,
+        help="Maximum topic-quarter requests per Redis message. Defaults to 50.",
+    )
+    report_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Set force=true for report generation tasks.",
+    )
+    report_parser.add_argument(
+        "--report-language",
+        default="ru",
+        help="Narrative language for generated report text. Defaults to ru.",
+    )
+    report_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview messages without modifying Redis.",
+    )
+    report_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable enqueue progress bar.",
+    )
+    add_database_args(report_parser)
+    add_redis_args(report_parser)
+
     restore_parser = subparsers.add_parser(
         "restore-failed",
         help="Move failed worker messages back from queue:failed_tasks to their source queues.",
@@ -277,6 +686,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "enqueue-indexing":
             payload = run_enqueue_indexing(args)
+        elif args.command == "enqueue-cluster-recompute":
+            payload = run_enqueue_cluster_recompute(args)
+        elif args.command == "enqueue-cluster-dynamics":
+            payload = run_enqueue_cluster_dynamics(args)
+        elif args.command == "enqueue-topic-reports":
+            payload = run_enqueue_topic_reports(args)
         elif args.command == "restore-failed":
             payload = run_restore_failed(args)
         else:
@@ -345,6 +760,140 @@ def run_enqueue_indexing(args: argparse.Namespace) -> dict[str, Any]:
         "paper_ids_file": args.paper_ids,
         "result": result,
     }
+
+
+def run_enqueue_cluster_recompute(args: argparse.Namespace) -> dict[str, Any]:
+    """Enqueue static topic cluster recomputation tasks into Redis."""
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be a positive integer.")
+    if args.cluster_workers <= 0:
+        raise ValueError("--cluster-workers must be a positive integer.")
+    topic_ids = resolve_topic_ids_for_scope(args)
+    redis_adapter = None if args.dry_run else RedisAdapter(build_redis_client(args))
+    result = ClusterRecomputeTaskEnqueuer(redis_adapter=redis_adapter).enqueue(
+        topic_ids=topic_ids,
+        batch_size=args.batch_size,
+        force_summary=bool(args.force_summary),
+        cluster_workers=args.cluster_workers,
+        dry_run=bool(args.dry_run),
+        show_progress=not args.no_progress,
+    )
+    return {
+        "command": "enqueue-cluster-recompute",
+        "field_id": getattr(args, "field_id", None),
+        "all_topics": bool(getattr(args, "all_topics", False)),
+        "topic_ids": topic_ids[:20],
+        "topic_count": len(topic_ids),
+        "result": result,
+    }
+
+
+def run_enqueue_cluster_dynamics(args: argparse.Namespace) -> dict[str, Any]:
+    """Enqueue time-sliced cluster dynamics recomputation tasks into Redis."""
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be a positive integer.")
+    if args.date_from > args.date_to:
+        raise ValueError("--date-from must be before or equal to --date-to.")
+    if args.cluster_ids:
+        cluster_ids = parse_csv_arg(args.cluster_ids)
+    else:
+        cluster_ids = [
+            f"topic:{topic_id}"
+            for topic_id in resolve_topic_ids_for_scope(args)
+        ]
+    redis_adapter = None if args.dry_run else RedisAdapter(build_redis_client(args))
+    result = ClusterDynamicsTaskEnqueuer(redis_adapter=redis_adapter).enqueue(
+        cluster_ids=cluster_ids,
+        date_from=args.date_from,
+        date_to=args.date_to,
+        granularity=args.granularity,
+        batch_size=args.batch_size,
+        dry_run=bool(args.dry_run),
+        show_progress=not args.no_progress,
+    )
+    return {
+        "command": "enqueue-cluster-dynamics",
+        "field_id": getattr(args, "field_id", None),
+        "all_topics": bool(getattr(args, "all_topics", False)),
+        "cluster_ids": cluster_ids[:20],
+        "cluster_count": len(cluster_ids),
+        "date_from": args.date_from,
+        "date_to": args.date_to,
+        "granularity": args.granularity,
+        "result": result,
+    }
+
+
+def run_enqueue_topic_reports(args: argparse.Namespace) -> dict[str, Any]:
+    """Enqueue quarterly topic report generation tasks into Redis."""
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be a positive integer.")
+    if args.date_from > args.date_to:
+        raise ValueError("--date-from must be before or equal to --date-to.")
+    topic_ids = resolve_report_topic_ids(args)
+    redis_adapter = None if args.dry_run else RedisAdapter(build_redis_client(args))
+    result = TopicQuarterReportTaskEnqueuer(
+        redis_adapter=redis_adapter,
+    ).enqueue(
+        topic_ids=topic_ids,
+        date_from=args.date_from,
+        date_to=args.date_to,
+        batch_size=args.batch_size,
+        force=bool(args.force),
+        report_language=args.report_language,
+        dry_run=bool(args.dry_run),
+        show_progress=not args.no_progress,
+    )
+    return {
+        "command": "enqueue-topic-reports",
+        "field_id": args.field_id,
+        "topic_ids": topic_ids[:20],
+        "topic_count": len(topic_ids),
+        "date_from": args.date_from,
+        "date_to": args.date_to,
+        "result": result,
+    }
+
+
+def resolve_report_topic_ids(args: argparse.Namespace) -> list[int]:
+    """Resolve topic ids for topic report task enqueueing."""
+    return resolve_topic_ids_for_scope(args)
+
+
+def resolve_topic_ids_for_scope(args: argparse.Namespace) -> list[int]:
+    """Resolve topic ids from CLI scope arguments."""
+    if getattr(args, "topic_ids", None):
+        topic_ids = parse_int_csv_arg(args.topic_ids)
+        if not topic_ids:
+            raise ValueError("--topic-ids must contain at least one id.")
+        return topic_ids
+
+    field_id = getattr(args, "field_id", None)
+    all_topics = bool(getattr(args, "all_topics", False))
+    if field_id is not None and field_id <= 0:
+        raise ValueError("--field-id must be a positive integer.")
+    if not all_topics and field_id is None:
+        raise ValueError("Provide --topic-ids, --field-id, or --all-topics.")
+
+    limit = getattr(args, "limit", None)
+    offset = int(getattr(args, "offset", 0) or 0)
+    if limit is not None and limit < 0:
+        raise ValueError("--limit must be non-negative.")
+    if offset < 0:
+        raise ValueError("--offset must be non-negative.")
+    database_url = args.database_url or Settings.from_env().database_url
+    engine = create_db_engine(database_url, echo=False)
+    SessionLocal = create_session_factory(engine, expire_on_commit=False)
+    try:
+        with SessionLocal() as session:
+            topics = TaxonomyRepository(session).list_topics_for_stats(
+                field_ids=[field_id] if field_id is not None else None,
+                limit=limit,
+                offset=offset,
+            )
+            return [int(topic.id) for topic in topics]
+    finally:
+        engine.dispose()
 
 
 class FailedTaskRestorer:
@@ -600,11 +1149,17 @@ class FailedTaskRestorer:
                 and len(topic_ids) > split_cluster_recompute_batch_size
             ):
                 force_summary = bool(message.get("force_summary", False))
+                cluster_workers = message.get("cluster_workers")
                 return [
                     {
                         "task_type": "recompute_topic_clusters",
                         "topic_ids": chunk,
                         "force_summary": force_summary,
+                        **(
+                            {"cluster_workers": int(cluster_workers)}
+                            if cluster_workers is not None
+                            else {}
+                        ),
                     }
                     for chunk in chunked(topic_ids, split_cluster_recompute_batch_size)
                 ]
@@ -666,6 +1221,39 @@ def add_database_args(parser: argparse.ArgumentParser) -> None:
         "--database-url",
         default=None,
         help="SQLAlchemy database URL. Defaults to DATABASE_URL or POSTGRES_* envs.",
+    )
+
+
+def add_topic_scope_args(parser: argparse.ArgumentParser) -> None:
+    """Add shared topic scope arguments for cluster task enqueueing."""
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument(
+        "--topic-ids",
+        default=None,
+        help="Comma-separated topic ids to schedule.",
+    )
+    scope.add_argument(
+        "--field-id",
+        type=int,
+        default=None,
+        help="Schedule all topics belonging to one field.",
+    )
+    scope.add_argument(
+        "--all-topics",
+        action="store_true",
+        help="Schedule all topics, optionally constrained by --limit/--offset.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum topics to resolve for --field-id/--all-topics.",
+    )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Topic offset for --field-id/--all-topics. Defaults to 0.",
     )
 
 
@@ -736,6 +1324,36 @@ def read_paper_ids_file(path: str) -> list[int]:
     return ids
 
 
+def parse_int_csv_arg(value: str) -> list[int]:
+    """Parse comma-separated integer ids preserving first occurrence order."""
+    ids: list[int] = []
+    seen: set[int] = set()
+    for item in value.split(","):
+        clean = item.strip()
+        if not clean:
+            continue
+        item_id = int(clean)
+        if item_id <= 0:
+            raise ValueError(f"Ids must be positive integers, got {item_id}.")
+        if item_id not in seen:
+            ids.append(item_id)
+            seen.add(item_id)
+    return ids
+
+
+def parse_csv_arg(value: str) -> list[str]:
+    """Parse comma-separated strings preserving first occurrence order."""
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in value.split(","):
+        clean = item.strip()
+        if not clean or clean in seen:
+            continue
+        values.append(clean)
+        seen.add(clean)
+    return values
+
+
 def build_redis_client(args: argparse.Namespace) -> Any:
     """Build a redis-py client from CLI arguments or environment variables."""
     try:
@@ -782,6 +1400,16 @@ def parse_iso_date(value: str) -> date:
 
 def chunked(values: list[int], size: int) -> list[list[int]]:
     """Split integer values into fixed-size chunks."""
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def chunked_dicts(values: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
+    """Split dictionary values into fixed-size chunks."""
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def chunked_strings(values: list[str], size: int) -> list[list[str]]:
+    """Split string values into fixed-size chunks."""
     return [values[index : index + size] for index in range(0, len(values), size)]
 
 

@@ -15,6 +15,7 @@ from .openalex_yearly_topic_stats import (
 )
 from .research_clusters import ResearchClusterRepository
 from .taxonomy import TaxonomyRepository
+from .topic_quarter_reports import TopicQuarterReportRepository
 from .tracked_areas import TrackedAreaRepository
 from .users import UserRepository
 
@@ -33,6 +34,7 @@ __all__ = [
     "PaperRepository",
     "ResearchClusterRepository",
     "TaxonomyRepository",
+    "TopicQuarterReportRepository",
     "TrackedAreaRepository",
     "UserRepository",
 ]

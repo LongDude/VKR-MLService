@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         OpenAlexMonthlyTopicStat,
         OpenAlexYearlyTopicStat,
         ResearchCluster,
+        TopicQuarterReport,
     )
     from .paper import Paper
     from .user import User
@@ -125,6 +126,9 @@ class Topic(Base):
     )
     openalex_yearly_stats: Mapped[list["OpenAlexYearlyTopicStat"]] = relationship(
         back_populates="topic"
+    )
+    quarter_reports: Mapped[list["TopicQuarterReport"]] = relationship(
+        back_populates="topic", cascade="all, delete-orphan"
     )
     papers: AssociationProxy[list["Paper"]] = association_proxy(
         "paper_links",

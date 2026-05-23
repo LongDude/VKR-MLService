@@ -35,8 +35,10 @@ from ml.facades import (
     ClusterDynamicsFacade,
     ResearchEntityIndexingFacade,
     SummaryFacade,
+    TopicQuarterReportFacade,
     UserProfileFacade,
 )
+from dto.topic_reports import TopicQuarterReportGenerateRequestDTO
 from ml.services.events import (
     CompositeEventSink,
     EventSink,
@@ -46,19 +48,24 @@ from ml.services.events import (
     RedisEventSink,
     TqdmEventSink,
 )
+from ml.services.quarter_periods import QuarterPeriodService
+from ml.pipelines.topic_quarter_report_pipeline import TopicQuarterReportPipeline
 from ml.workers.redis_worker import (
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
     ENTITY_INDEXING_QUEUE,
+    TOPIC_QUARTER_REPORT_QUEUE,
     USER_PROFILE_RECOMPUTE_QUEUE,
 )
 from models.session import create_db_engine, create_session_factory
 from repositories import (
     FavouriteRepository,
+    OpenAlexTopicStatsRepository,
     PaperGraphRepository,
     PaperRepository,
     ResearchClusterRepository,
     TaxonomyRepository,
+    TopicQuarterReportRepository,
     TrackedAreaRepository,
     UserRepository,
 )
@@ -192,6 +199,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_common_connection_args(dynamics_parser)
     add_redis_connection_args(dynamics_parser)
 
+    report_parser = subparsers.add_parser(
+        "generate-topic-report",
+        help="Generate quarterly LLM reports for one topic.",
+    )
+    report_parser.add_argument(
+        "--topic-id",
+        type=int,
+        required=True,
+        help="Topic id to report.",
+    )
+    report_parser.add_argument(
+        "--date-from",
+        type=parse_iso_date,
+        required=True,
+        help="Report period lower bound in YYYY-MM-DD format.",
+    )
+    report_parser.add_argument(
+        "--date-to",
+        type=parse_iso_date,
+        required=True,
+        help="Report period upper bound in YYYY-MM-DD format.",
+    )
+    report_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate existing topic quarter reports.",
+    )
+    report_parser.add_argument(
+        "--report-language",
+        default="ru",
+        help="Narrative language for generated report text. Defaults to ru.",
+    )
+    add_runtime_args(report_parser, include_enqueue=False)
+    add_common_connection_args(report_parser)
+    add_redis_connection_args(report_parser)
+
     user_profile_parser = subparsers.add_parser(
         "recompute-user-profile",
         help="Recompute one or all user vector profiles into Qdrant.",
@@ -274,6 +317,8 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_recompute_trends(args)
         elif args.command == "recompute-cluster-dynamics":
             payload = run_recompute_cluster_dynamics(args)
+        elif args.command == "generate-topic-report":
+            payload = run_generate_topic_report(args)
         elif args.command == "recompute-user-profile":
             payload = run_recompute_user_profile(args)
         elif args.command == "sync-clusters-db":
@@ -493,6 +538,70 @@ def run_recompute_cluster_dynamics(args: argparse.Namespace) -> dict[str, Any]:
             "date_to": args.date_to,
             "granularity": args.granularity,
             "result": result,
+        }
+    finally:
+        engine.dispose()
+
+
+def run_generate_topic_report(args: argparse.Namespace) -> dict[str, Any]:
+    """Generate quarterly reports for one topic through TopicQuarterReportPipeline."""
+    if args.topic_id <= 0:
+        raise ValueError("--topic-id must be a positive integer.")
+    quarter_service = QuarterPeriodService()
+    periods = quarter_service.quarter_periods(args.date_from, args.date_to)
+    requests = [
+        TopicQuarterReportGenerateRequestDTO(
+            topic_id=args.topic_id,
+            period_start=period.date_from,
+            period_end=period.date_to,
+            force=bool(args.force),
+            report_language=args.report_language,
+        )
+        for period in periods
+    ]
+
+    database_url = args.database_url or Settings.from_env().database_url
+    engine = create_db_engine(database_url, echo=False)
+    SessionLocal = create_session_factory(engine, expire_on_commit=False)
+
+    try:
+        redis_adapter = (
+            RedisAdapter(build_redis_client(args)) if args.event_redis else None
+        )
+        event_sink = build_event_sink(args, redis_adapter=redis_adapter)
+        chat_adapter = LMStudioChatAdapter(
+            base_url=args.lmstudio_url
+            or os.getenv("LMSTUDIO_BASE_URL")
+            or "http://localhost:1234",
+        )
+
+        with SessionLocal() as session:
+            pipeline = TopicQuarterReportPipeline(
+                TopicQuarterReportFacade(
+                    taxonomy_repository=TaxonomyRepository(session),
+                    paper_repository=PaperRepository(session),
+                    research_cluster_repository=ResearchClusterRepository(session),
+                    topic_report_repository=TopicQuarterReportRepository(session),
+                    openalex_topic_stats_repository=OpenAlexTopicStatsRepository(session),
+                    chat_adapter=chat_adapter,
+                    event_sink=event_sink,
+                )
+            )
+            result = pipeline.generate_many(
+                requests,
+                show_progress=not args.no_progress,
+            )
+            session.commit()
+
+        return {
+            "command": "generate-topic-report",
+            "topic_id": args.topic_id,
+            "date_from": args.date_from,
+            "date_to": args.date_to,
+            "periods": [period.key for period in periods],
+            "force": bool(args.force),
+            "report_language": args.report_language,
+            "result": result.model_dump(mode="json"),
         }
     finally:
         engine.dispose()

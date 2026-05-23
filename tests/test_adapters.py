@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from datetime import date
 from pathlib import Path
@@ -26,7 +27,7 @@ from core.exceptions import (
     LLMGenerationError,
     RedisOperationError,
 )
-from dto.common import BatchOperationResultDTO
+from dto.common import BatchOperationResultDTO, OperationResultDTO
 from dto.external import OpenAlexSearchFiltersDTO
 from dto.keywords import KeywordExtractionMetadataDTO, KeywordExtractionResponseDTO
 from dto.papers import PaperBatchIndexingRequestDTO, PaperIndexingRequestDTO
@@ -421,6 +422,14 @@ class CapturingTaskHandler:
         self.messages.append(message)
 
 
+class CapturingEventSink:
+    def __init__(self) -> None:
+        self.events: list[MLEvent] = []
+
+    def emit(self, event: MLEvent) -> None:
+        self.events.append(event)
+
+
 def test_redis_worker_splits_oversized_paper_indexing_messages_before_handling() -> None:
     client = FakeRedisClient()
     adapter = RedisAdapter(client)
@@ -497,6 +506,47 @@ def test_redis_worker_splits_oversized_cluster_recompute_messages_before_handlin
     assert worker.run_once() is True
     assert [len(message["topic_ids"]) for message in handler.messages] == [4, 4, 2]
     assert all(message["force_summary"] is True for message in handler.messages)
+
+
+def test_redis_worker_emits_completed_result_summary() -> None:
+    class ResultHandler:
+        def handle(self, message: dict[str, Any]) -> OperationResultDTO:
+            return OperationResultDTO(
+                success=True,
+                message="done",
+                details={
+                    "task_type": message["task_type"],
+                    "status": "skipped",
+                    "reason": "report_exists",
+                },
+            )
+
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    sink = CapturingEventSink()
+    adapter.enqueue(
+        PAPER_INDEXING_QUEUE,
+        {
+            "task_type": "paper_indexing",
+            "paper_id": 10,
+            "force_reindex": False,
+        },
+    )
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=ResultHandler(),  # type: ignore[arg-type]
+        queues=(PAPER_INDEXING_QUEUE,),
+        event_sink=sink,
+    )
+
+    assert worker.run_once() is True
+
+    completed = [
+        event for event in sink.events if event.event_type == "worker_task_completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0].payload["result"]["details"]["status"] == "skipped"
+    assert completed[0].payload["result"]["details"]["reason"] == "report_exists"
 
 
 def test_redis_worker_saves_interrupted_task_to_failed_queue() -> None:
@@ -1275,13 +1325,17 @@ def test_lmstudio_embedding_adapter_rejects_invalid_vectors() -> None:
 
 
 def test_lmstudio_chat_adapter_supports_json_response_format() -> None:
-    client = httpx.Client(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(
-                200,
-                json={"choices": [{"message": {"content": '{"summary": "ok"}'}}]},
-            )
+    captured_payload: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_payload.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"summary": "ok"}'}}]},
         )
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler)
     )
 
     result = LMStudioChatAdapter("http://lmstudio", client=client).summarize_cluster(
@@ -1290,6 +1344,8 @@ def test_lmstudio_chat_adapter_supports_json_response_format() -> None:
     )
 
     assert result == {"summary": "ok"}
+    assert captured_payload["response_format"]["type"] == "json_schema"
+    assert captured_payload["response_format"]["json_schema"]["name"] == "json_response"
 
 
 def test_lmstudio_chat_adapter_rejects_invalid_json_when_requested() -> None:

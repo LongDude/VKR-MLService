@@ -20,6 +20,7 @@ from repositories import (
     PaperGraphRepository,
     PaperRepository,
     TaxonomyRepository,
+    TopicQuarterReportRepository,
     TrackedAreaRepository,
     UserRepository,
 )
@@ -122,6 +123,14 @@ REPOSITORY_METHODS = {
         "count_papers_by_topic_and_period",
         "count_papers_by_topics_heatmap",
         "get_top_topics_by_recent_growth",
+    ],
+    TopicQuarterReportRepository: [
+        "get_by_topic_period",
+        "upsert_report",
+        "replace_items",
+        "replace_papers",
+        "list_existing_keys",
+        "to_dto",
     ],
 }
 

@@ -344,6 +344,40 @@ class PaperRepository(BaseRepository):
         stmt = stmt.limit(limit).offset(offset)
         return list(self.session.scalars(stmt).all())
 
+    def list_top_cited_by_topic_and_period(
+        self,
+        topic_id: int,
+        date_from: date,
+        date_to: date,
+        *,
+        limit: int = 5,
+        topic_match: TopicMatchMode = "soft",
+    ) -> list[Paper]:
+        """List most cited papers for a topic within a publication period."""
+        self._validate_topic_match(topic_match)
+        if limit <= 0:
+            return []
+        stmt = select(Paper)
+        if topic_match == "strict":
+            stmt = stmt.where(Paper.primary_topic_id == int(topic_id))
+        else:
+            stmt = stmt.join(PaperTopic, PaperTopic.paper_id == Paper.id).where(
+                PaperTopic.topic_id == int(topic_id)
+            )
+        stmt = (
+            stmt.where(
+                Paper.publication_date >= date_from,
+                Paper.publication_date <= date_to,
+            )
+            .order_by(
+                Paper.cited_by_count.desc().nullslast(),
+                Paper.publication_date.desc().nullslast(),
+                Paper.id.desc(),
+            )
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt).all())
+
     def list_for_keyword_extraction(
         self,
         *,

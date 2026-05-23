@@ -37,6 +37,9 @@ def test_all_migration_tables_are_registered() -> None:
         "research_cluster_period_stats",
         "openalex_montly_topic_stats",
         "openalex_yearly_topic_stats",
+        "topic_quarter_reports",
+        "topic_quarter_report_items",
+        "topic_quarter_report_papers",
     }
 
     assert models is not None

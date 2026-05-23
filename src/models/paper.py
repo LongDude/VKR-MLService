@@ -23,6 +23,7 @@ from .associations import PaperAuthor, PaperKeyword, PaperTopic
 from .base import Base
 
 if TYPE_CHECKING:
+    from .analytics import TopicQuarterReportPaper
     from .author import Author
     from .keyword import Keyword
     from .topic import Topic
@@ -81,6 +82,9 @@ class Paper(Base):
         foreign_keys=[primary_topic_id],
     )
     landings: Mapped[list["Landing"]] = relationship(
+        back_populates="paper", cascade="all, delete-orphan"
+    )
+    quarter_report_links: Mapped[list["TopicQuarterReportPaper"]] = relationship(
         back_populates="paper", cascade="all, delete-orphan"
     )
     authors: AssociationProxy[list["Author"]] = association_proxy(
