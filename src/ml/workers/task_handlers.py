@@ -6,8 +6,10 @@ from typing import Any, Callable, Literal
 
 from core.exceptions import AppError, InvalidRequestError
 from dto.common import BatchOperationResultDTO, OperationResultDTO
+from dto.keywords import PaperKeywordExtractionBatchRequestDTO
 from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.pipelines.cluster_dynamics_pipeline import ClusterDynamicsPipeline
+from ml.pipelines.keyword_extraction_pipeline import KeywordExtractionPipeline
 from ml.pipelines.paper_indexing_pipeline import PaperIndexingPipeline
 from ml.pipelines.research_entities_pipeline import ResearchEntitiesPipeline
 from ml.pipelines.trend_recompute_pipeline import TrendRecomputePipeline
@@ -22,6 +24,7 @@ class MLTaskHandler:
         self,
         *,
         session: Any | None = None,
+        keyword_extraction_pipeline: KeywordExtractionPipeline | None = None,
         paper_indexing_pipeline: PaperIndexingPipeline | None = None,
         research_entities_pipeline: ResearchEntitiesPipeline | None = None,
         trend_recompute_pipeline: TrendRecomputePipeline | None = None,
@@ -32,6 +35,7 @@ class MLTaskHandler:
         cluster_recompute_pipeline_factory: Callable[[], tuple[TrendRecomputePipeline, Any]] | None = None,
     ) -> None:
         self.session = session
+        self.keyword_extraction_pipeline = keyword_extraction_pipeline
         self.paper_indexing_pipeline = paper_indexing_pipeline
         self.research_entities_pipeline = research_entities_pipeline
         self.trend_recompute_pipeline = trend_recompute_pipeline
@@ -57,6 +61,8 @@ class MLTaskHandler:
             raise InvalidRequestError("Task message must be a JSON object")
 
         task_type = self._required_str(message, "task_type")
+        if task_type == "keyword_extraction":
+            return self._handle_keyword_extraction(message)
         if task_type == "paper_indexing":
             return self._handle_paper_indexing(message)
         if task_type in {"entity_indexing", "research_entities_indexing"}:
@@ -71,6 +77,36 @@ class MLTaskHandler:
         raise InvalidRequestError(
             "Unknown ML task type",
             details={"task_type": task_type},
+        )
+
+    def _handle_keyword_extraction(self, message: dict[str, Any]) -> OperationResultDTO:
+        pipeline = self._required_pipeline(
+            self.keyword_extraction_pipeline,
+            "keyword_extraction_pipeline",
+        )
+        if "paper_ids" in message:
+            paper_ids = self._int_list_field(message, "paper_ids")
+        elif "paper_id" in message:
+            paper_ids = [self._required_int(message, "paper_id")]
+        else:
+            raise InvalidRequestError(
+                "paper_id or paper_ids is required for keyword extraction",
+            )
+
+        top_k = self._optional_int(message, "top_k")
+        result = pipeline.run_papers(
+            PaperKeywordExtractionBatchRequestDTO(
+                paper_ids=paper_ids,
+                top_k=10 if top_k is None else top_k,
+                min_score=self._optional_float(message, "min_score"),
+                skip_processed=self._bool_field(message, "skip_processed", default=True),
+                skip_non_english=self._bool_field(message, "skip_non_english", default=False),
+            )
+        )
+        return self._batch_result(
+            result,
+            "Keyword extraction completed",
+            task_type="keyword_extraction",
         )
 
     def _handle_paper_indexing(self, message: dict[str, Any]) -> OperationResultDTO:
@@ -379,6 +415,18 @@ class MLTaskHandler:
         except (TypeError, ValueError) as exc:
             raise InvalidRequestError(
                 "Task field must be an integer",
+                details={"field": field, "value": value},
+            ) from exc
+
+    def _optional_float(self, message: dict[str, Any], field: str) -> float | None:
+        value = message.get(field)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise InvalidRequestError(
+                "Task field must be a number",
                 details={"field": field, "value": value},
             ) from exc
 

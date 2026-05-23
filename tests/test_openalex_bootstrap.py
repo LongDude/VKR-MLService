@@ -14,7 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from core.exceptions import InvalidRequestError  # noqa: E402
-from dto.external import ExternalPaperDTO, OpenAlexSearchFiltersDTO  # noqa: E402
+from dto.external import ExternalPaperDTO, ExternalTopicDTO, OpenAlexSearchFiltersDTO  # noqa: E402
 from dto.openalex import (  # noqa: E402
     BatchImportResultDTO,
     OpenAlexPlanUnitDTO,
@@ -33,6 +33,7 @@ from ingestion.openalex_bootstrap import (  # noqa: E402
 from cli.openalex import parse_args, resolve_required_openalex_api_key, run_bootstrap_papers  # noqa: E402
 from ingestion.openalex_topic_stats import OpenAlexTopicStatsCollector  # noqa: E402
 from ml.facades.openalex_papers import OpenAlexPapersFacade  # noqa: E402
+from ml.facades.papers_uploading import PaperUploaderFacade  # noqa: E402
 from ml.services.openalex_paper_downloader import OpenAlexDownloadResult  # noqa: E402
 from ml.services.openalex_paper_plan import (  # noqa: E402
     OPENALEX_MAX_SAMPLE,
@@ -477,6 +478,27 @@ class _DuplicateImporter:
         )
 
 
+class _CapturingImporter:
+    def __init__(self) -> None:
+        self.papers: list[ExternalPaperDTO] = []
+
+    async def import_papers(
+        self,
+        papers: list[ExternalPaperDTO],
+        *,
+        db_workers: int,
+        skip_existing: bool,
+        show_progress: bool,
+    ) -> BatchImportResultDTO:
+        self.papers = papers
+        return BatchImportResultDTO(
+            total=len(papers),
+            normalized=len(papers),
+            created=len(papers),
+            paper_ids=[1],
+        )
+
+
 def test_openalex_facade_runs_one_pass_and_reports_duplicate_shortfall(
     monkeypatch: Any,
 ) -> None:
@@ -508,6 +530,111 @@ def test_openalex_facade_runs_one_pass_and_reports_duplicate_shortfall(
     assert downloader.calls == 1
     assert report.duplicate_shortfall == 1
     assert len(report.rounds) == 1
+
+
+def test_openalex_facade_sets_primary_topic_from_topic_filter(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(
+        "ml.facades.openalex_papers.PaperRepository",
+        _FakeFacadePaperRepository,
+    )
+    importer = _CapturingImporter()
+    downloader = _OnePassDownloader()
+    facade = OpenAlexPapersFacade(
+        session_factory=lambda: _FakeBootstrapSession(),
+        plan_service=_OnePassPlanService(),  # type: ignore[arg-type]
+        downloader=downloader,  # type: ignore[arg-type]
+        importer=importer,  # type: ignore[arg-type]
+    )
+
+    downloader.fetch_plan = _fetch_one_topic_plan  # type: ignore[method-assign]
+    asyncio.run(
+        facade.bootstrap(
+            OpenAlexBootstrapRequestDTO(
+                target_count=1,
+                target_count_scope="month",
+                target_count_unit="topic",
+                topic_targets=[
+                    OpenAlexBootstrapTopicTargetDTO(
+                        topic_id=42,
+                        filter_part="topics.id:T42",
+                    )
+                ],
+                date_from=date(2026, 2, 1),
+                date_to=date(2026, 2, 28),
+                languages=["en"],
+                types=["article"],
+            )
+        )
+    )
+
+    assert importer.papers[0].primary_topic_id == 42
+
+
+async def _fetch_one_topic_plan(
+    plan: OpenAlexLoadPlanDTO,
+    *,
+    sample: bool,
+    per_page: int,
+    show_progress: bool,
+) -> OpenAlexDownloadResult:
+    return OpenAlexDownloadResult(
+        papers=[
+            ExternalPaperDTO(
+                external_id="https://openalex.org/W42",
+                title="Paper topic",
+                abstract="Abstract",
+            )
+        ],
+        fetched=1,
+        normalized=1,
+        unit_summaries={
+            "u42": OpenAlexUnitSummaryDTO(
+                unit_key="u42",
+                topic_id=42,
+                period="2026-02",
+                requested=1,
+                fetched=1,
+            )
+        },
+        paper_unit_keys={"external:https://openalex.org/W42": ["u42"]},
+        openalex_requests=1,
+    )
+
+
+def test_paper_uploader_falls_back_to_highest_score_primary_topic() -> None:
+    uploader = PaperUploaderFacade(
+        paper_repository=SimpleNamespace(),
+        author_repository=SimpleNamespace(),
+        institution_repository=SimpleNamespace(),
+        taxonomy_repository=SimpleNamespace(),
+        landing_repository=SimpleNamespace(),
+    )
+    paper = SimpleNamespace(id=1, primary_topic_id=None)
+
+    uploader._assign_primary_topics(
+        {
+            "paper": ExternalPaperDTO(
+                title="Paper",
+                topics=[
+                    ExternalTopicDTO(name="Low", score=0.1),
+                    ExternalTopicDTO(name="High", score=0.9),
+                ],
+            )
+        },
+        {
+            ("paper", "low"): ("paper", "low", 0.1),
+            ("paper", "high"): ("paper", "high", 0.9),
+        },
+        {"paper": paper},
+        {
+            "low": SimpleNamespace(id=10),
+            "high": SimpleNamespace(id=20),
+        },
+    )
+
+    assert paper.primary_topic_id == 20
 
 
 def test_openalex_cli_accepts_normalize_none_and_rejects_extra_rounds() -> None:

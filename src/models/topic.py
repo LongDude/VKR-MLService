@@ -110,6 +110,10 @@ class Topic(Base):
     paper_links: Mapped[list["PaperTopic"]] = relationship(
         back_populates="topic", cascade="all, delete-orphan"
     )
+    primary_papers: Mapped[list["Paper"]] = relationship(
+        back_populates="primary_topic",
+        foreign_keys="Paper.primary_topic_id",
+    )
     tracked_by_links: Mapped[list["UserTrackedTopic"]] = relationship(
         back_populates="topic", cascade="all, delete-orphan"
     )

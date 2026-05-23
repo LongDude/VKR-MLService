@@ -166,6 +166,12 @@ class PaperUploaderFacade:
             papers_by_key,
             topics_by_key,
         )
+        self._assign_primary_topics(
+            buffers["papers"],
+            buffers["paper_topic_links"],
+            papers_by_key,
+            topics_by_key,
+        )
         self._attach_paper_keywords(
             buffers["paper_keyword_links"],
             papers_by_key,
@@ -329,6 +335,34 @@ class PaperUploaderFacade:
             if paper is not None and keyword is not None:
                 pairs.append((paper.id, keyword.id, score))
         self.taxonomy_repository.attach_keywords_to_papers_bulk(pairs)
+
+    def _assign_primary_topics(
+        self,
+        papers: dict[str, ExternalPaperDTO],
+        links: dict[tuple[str, str], tuple[str, str, float | None]],
+        papers_by_key: dict[str, Any],
+        topics_by_key: dict[str, Any],
+    ) -> None:
+        best_topic_by_paper: dict[str, tuple[int, float]] = {}
+        for paper_key, topic_key, score in links.values():
+            topic = topics_by_key.get(topic_key)
+            if topic is None or getattr(topic, "id", None) is None:
+                continue
+            rank = float(score) if score is not None else float("-inf")
+            current = best_topic_by_paper.get(paper_key)
+            if current is None or rank > current[1]:
+                best_topic_by_paper[paper_key] = (int(topic.id), rank)
+
+        for paper_key, source_paper in papers.items():
+            paper = papers_by_key.get(paper_key)
+            if paper is None or getattr(paper, "id", None) is None:
+                continue
+            primary_topic_id = source_paper.primary_topic_id
+            if primary_topic_id is None:
+                best_topic = best_topic_by_paper.get(paper_key)
+                primary_topic_id = best_topic[0] if best_topic is not None else None
+            if primary_topic_id is not None:
+                paper.primary_topic_id = int(primary_topic_id)
 
     def _paper_key(self, paper: ExternalPaperDTO) -> str:
         title = self._normalize_text(paper.title)

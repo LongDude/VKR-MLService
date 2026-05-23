@@ -90,6 +90,7 @@ class OpenAlexPapersFacade:
         )
         self._merge_download(report, download)
         self._classify_unit_imports(download, request.skip_existing)
+        self._assign_filter_primary_topics(download)
 
         imported = await self.importer.import_papers(
             download.papers,
@@ -136,6 +137,7 @@ class OpenAlexPapersFacade:
             }
         download = await self.downloader.fetch_pages(pages, show_progress=show_progress)
         self._classify_unit_imports(download, skip_existing)
+        self._assign_filter_primary_topics(download)
         imported = await self.importer.import_papers(
             download.papers,
             db_workers=db_workers,
@@ -259,6 +261,44 @@ class OpenAlexPapersFacade:
                         summary.updated += 1
                 else:
                     summary.created += 1
+
+    def _assign_filter_primary_topics(self, download: OpenAlexDownloadResult) -> None:
+        if not download.papers or not download.paper_unit_keys:
+            return
+        topic_by_unit = {
+            unit_key: summary.topic_id
+            for unit_key, summary in download.unit_summaries.items()
+            if summary.topic_id is not None
+        }
+        if not topic_by_unit:
+            return
+
+        papers: list[ExternalPaperDTO] = []
+        for paper in download.papers:
+            if paper.primary_topic_id is not None:
+                papers.append(paper)
+                continue
+            topic_id = self._primary_topic_from_units(
+                download.paper_unit_keys.get(self._paper_key(paper), []),
+                topic_by_unit,
+            )
+            papers.append(
+                paper.model_copy(update={"primary_topic_id": topic_id})
+                if topic_id is not None
+                else paper
+            )
+        download.papers = papers
+
+    def _primary_topic_from_units(
+        self,
+        unit_keys: list[str],
+        topic_by_unit: dict[str, int | None],
+    ) -> int | None:
+        for unit_key in unit_keys:
+            topic_id = topic_by_unit.get(unit_key)
+            if topic_id is not None:
+                return int(topic_id)
+        return None
 
     def _finalize_unit_report(
         self,

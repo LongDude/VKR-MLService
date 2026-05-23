@@ -39,6 +39,11 @@ CLI_MODULES = [
         description="Single-paper indexing utility.",
     ),
     CliModule(
+        module="cli.extract_keywords",
+        command="python -m cli.extract_keywords",
+        description="Extract paper keyphrases into PostgreSQL or Redis tasks.",
+    ),
+    CliModule(
         module="cli.init_qdrant",
         command="python -m cli.init_qdrant",
         description="Qdrant collection initialization.",

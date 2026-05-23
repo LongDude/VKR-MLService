@@ -65,6 +65,8 @@ class ExternalPaperDTO(BaseDTO):
     is_open_access: bool | None = None
     cited_by_count: int | None = None
     references_count: int | None = None
+    primary_topic_id: int | None = None
+    extracted_keywords: list[str] | list[dict[str, Any]] | None = None
     authors: list[ExternalAuthorDTO] = Field(default_factory=list)
     institutions: list[ExternalInstitutionDTO] = Field(default_factory=list)
     topics: list[ExternalTopicDTO] = Field(default_factory=list)

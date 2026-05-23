@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -13,6 +13,7 @@ from models import (
     Domain,
     Field,
     Keyword,
+    Paper,
     PaperKeyword,
     PaperTopic,
     Subfield,
@@ -20,6 +21,9 @@ from models import (
 )
 
 from .base import BaseRepository
+
+
+TopicMatchMode = Literal["soft", "strict"]
 
 
 class TaxonomyRepository(BaseRepository):
@@ -314,8 +318,17 @@ class TaxonomyRepository(BaseRepository):
             keywords_by_paper[int(paper_id)].append(keyword)
         return dict(keywords_by_paper)
 
-    def list_paper_ids_by_topic(self, topic_id: int) -> list[int]:
-        """List paper ids attached to a topic."""
+    def list_paper_ids_by_topic(
+        self,
+        topic_id: int,
+        *,
+        topic_match: TopicMatchMode = "soft",
+    ) -> list[int]:
+        """List paper ids matching a topic in soft or strict mode."""
+        self._validate_topic_match(topic_match)
+        if topic_match == "strict":
+            stmt = select(Paper.id).where(Paper.primary_topic_id == topic_id)
+            return list(self.session.scalars(stmt).all())
         stmt = select(PaperTopic.paper_id).where(PaperTopic.topic_id == topic_id)
         return list(self.session.scalars(stmt).all())
 
@@ -792,5 +805,12 @@ class TaxonomyRepository(BaseRepository):
             )
         )
 
+    def _validate_topic_match(self, value: TopicMatchMode) -> None:
+        if value not in {"soft", "strict"}:
+            raise InvalidRequestError(
+                "Topic match mode must be 'soft' or 'strict'",
+                details={"topic_match": value},
+            )
 
-__all__ = ["TaxonomyRepository"]
+
+__all__ = ["TaxonomyRepository", "TopicMatchMode"]

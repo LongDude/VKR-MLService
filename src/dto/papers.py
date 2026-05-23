@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field
 
@@ -15,6 +15,7 @@ CachePolicy = Literal[
     "force_external_refresh",
 ]
 IndexingStatus = Literal["not_indexed", "pending", "indexed", "failed"]
+ExtractedKeywordsPayload = list[str] | list[dict[str, Any]]
 
 
 class PaperCreateDTO(BaseDTO):
@@ -28,6 +29,8 @@ class PaperCreateDTO(BaseDTO):
     cited_by_count: int | None = 0
     openalex_id: str | None = None
     references_count: int | None = 0
+    primary_topic_id: int | None = None
+    extracted_keywords: ExtractedKeywordsPayload | None = None
 
 
 class PaperUpdateDTO(BaseDTO):
@@ -41,6 +44,8 @@ class PaperUpdateDTO(BaseDTO):
     cited_by_count: int | None = None
     openalex_id: str | None = None
     references_count: int | None = None
+    primary_topic_id: int | None = None
+    extracted_keywords: ExtractedKeywordsPayload | None = None
     text_hash: str | None = None
     is_indexed: bool | None = None
     indexed_at: datetime | None = None
@@ -57,6 +62,8 @@ class PaperShortDTO(BaseDTO):
     cited_by_count: int | None = 0
     openalex_id: str | None = None
     references_count: int | None = 0
+    primary_topic_id: int | None = None
+    extracted_keywords: ExtractedKeywordsPayload | None = None
 
 
 class PaperDTO(PaperShortDTO):
@@ -112,6 +119,7 @@ class PaperBatchIndexingRequestDTO(BaseDTO):
 
 __all__ = [
     "CachePolicy",
+    "ExtractedKeywordsPayload",
     "IndexingStatus",
     "PaperBatchIndexingRequestDTO",
     "PaperCreateDTO",

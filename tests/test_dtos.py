@@ -65,6 +65,7 @@ def test_paper_resolve_contract_defaults() -> None:
 
 def test_required_dto_models_validate_minimal_payloads() -> None:
     assert PaperCreateDTO(title="A paper").cited_by_count == 0
+    assert PaperCreateDTO(title="A paper", extracted_keywords=["graph"]).extracted_keywords == ["graph"]
     assert PaperCreateDTO(title="A paper", openalex_id="W1").openalex_id == "W1"
     assert ExternalPaperDTO(title="External", references_count=3).references_count == 3
     assert EmbeddingResultDTO(vector=[0.1, 0.2], model="local", dimension=2).dimension == 2

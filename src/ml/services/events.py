@@ -64,6 +64,9 @@ class LoggingEventSink:
         self.verbosity = verbosity
 
     def emit(self, event: MLEvent) -> None:
+        if self.verbosity <= 0 and not self._should_log_default(event):
+            return
+
         progress = ""
         if event.current is not None and event.total is not None:
             progress = f" {event.current}/{event.total}"
@@ -80,7 +83,7 @@ class LoggingEventSink:
             progress,
             message,
         )
-        if self.verbosity > 0 and event.payload:
+        if self.verbosity > 1 and event.payload:
             self.logger.debug(
                 "ml_event_payload type=%s task=%s entity=%s payload=%s",
                 event.event_type,
@@ -88,6 +91,17 @@ class LoggingEventSink:
                 event.entity_id,
                 event.payload,
             )
+
+    def _should_log_default(self, event: MLEvent) -> bool:
+        if event.event_type.endswith("_progress"):
+            return False
+        return (
+            event.event_type.startswith("worker_task_")
+            or event.event_type.startswith("worker_queue_")
+            or event.event_type.endswith("_started")
+            or event.event_type.endswith("_completed")
+            or event.event_type.endswith("_failed")
+        )
 
 
 class TqdmEventSink:
@@ -111,6 +125,7 @@ class TqdmEventSink:
                     desc=self._description(event),
                     unit="item",
                     leave=self.leave,
+                    position=self._position(event),
                 )
                 self._bars[key] = bar
                 self._last_current[key] = 0
@@ -147,6 +162,13 @@ class TqdmEventSink:
         stage = event.stage or event.event_type
         return f"{event.task_type}{entity} {stage}"
 
+    def _position(self, event: MLEvent) -> int:
+        if event.stage == "queue":
+            return 0
+        if event.stage == "worker":
+            return 1
+        return 2 if event.task_type == "keyword_extraction" else 1
+
     def _is_terminal(self, event: MLEvent) -> bool:
         return event.event_type in {
             "cluster_batch_completed",
@@ -158,6 +180,9 @@ class TqdmEventSink:
             "cluster_db_sync_failed",
             "entity_indexing_completed",
             "entity_indexing_failed",
+            "keyword_extraction_batch_completed",
+            "keyword_extraction_completed",
+            "keyword_extraction_failed",
             "paper_batch_completed",
             "paper_indexing_completed",
             "paper_indexing_failed",
@@ -165,6 +190,8 @@ class TqdmEventSink:
             "user_profile_failed",
             "worker_task_completed",
             "worker_task_failed",
+            "worker_task_interrupted",
+            "worker_queue_completed",
         }
 
     def _close_related(self, event: MLEvent) -> None:
@@ -172,10 +199,9 @@ class TqdmEventSink:
         for key in list(self._bars):
             if key[0] != event.task_type:
                 continue
-            if (
-                entity not in {"run", "all", "batch", "worker_batch"}
-                and key[1] not in {entity, "run"}
-            ):
+            if entity in {"batch", "worker_batch"} and key[1] != entity:
+                continue
+            if entity not in {"run", "all", "batch", "worker_batch"} and key[1] not in {entity, "run"}:
                 continue
             self._bars.pop(key).close()
             self._last_current.pop(key, None)

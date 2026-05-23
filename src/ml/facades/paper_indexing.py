@@ -109,6 +109,10 @@ class PaperIndexingFacade:
             keyword_values = [
                 keyword.value for keyword in keywords if getattr(keyword, "value", None)
             ]
+            keyword_values = self._merge_keyword_values(
+                keyword_values,
+                getattr(paper, "extracted_keywords", None),
+            )
 
             embedding_text = self.text_preparation_service.build_paper_embedding_text(
                 title=title,
@@ -428,6 +432,10 @@ class PaperIndexingFacade:
                 for keyword in keywords
                 if getattr(keyword, "value", None)
             ]
+            keyword_values = self._merge_keyword_values(
+                keyword_values,
+                getattr(paper, "extracted_keywords", None),
+            )
             embedding_text = self.text_preparation_service.build_paper_embedding_text(
                 title=title,
                 abstract=getattr(paper, "abstract", None),
@@ -775,6 +783,38 @@ class PaperIndexingFacade:
                 details={"paper_id": paper_id},
             )
         return title.strip()
+
+    def _merge_keyword_values(
+        self,
+        taxonomy_keywords: list[str],
+        extracted_keywords: Any,
+    ) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in [*taxonomy_keywords, *self._extracted_keyword_values(extracted_keywords)]:
+            clean_value = str(value).strip()
+            if not clean_value:
+                continue
+            key = clean_value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(clean_value)
+        return result
+
+    def _extracted_keyword_values(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        result: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                result.append(item)
+                continue
+            if isinstance(item, dict):
+                keyword = item.get("keyword") or item.get("value")
+                if keyword:
+                    result.append(str(keyword))
+        return result
 
     def _error_payload(self, exc: AppError, paper_id: int) -> dict[str, Any]:
         return {

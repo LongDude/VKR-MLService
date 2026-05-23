@@ -31,12 +31,14 @@ from ml.constants import DEFAULT_EMBEDDING_MODEL
 from ml.facades import (
     ClusterAnalyticsFacade,
     ClusterDynamicsFacade,
+    KeywordExtractionFacade,
     PaperIndexingFacade,
     ResearchEntityIndexingFacade,
     SummaryFacade,
     UserProfileFacade,
 )
 from ml.pipelines.cluster_dynamics_pipeline import ClusterDynamicsPipeline
+from ml.pipelines.keyword_extraction_pipeline import KeywordExtractionPipeline
 from ml.pipelines.paper_indexing_pipeline import PaperIndexingPipeline
 from ml.pipelines.research_entities_pipeline import ResearchEntitiesPipeline
 from ml.pipelines.trend_recompute_pipeline import TrendRecomputePipeline
@@ -45,6 +47,7 @@ from ml.services.events import (
     CompositeEventSink,
     EventSink,
     LoggingEventSink,
+    MLEvent,
     NoopEventSink,
     RedisEventSink,
     TqdmEventSink,
@@ -54,6 +57,7 @@ from ml.workers.redis_worker import (
     CLUSTER_RECOMPUTE_QUEUE,
     DEFAULT_QUEUE_ORDER,
     ENTITY_INDEXING_QUEUE,
+    KEYWORD_EXTRACTION_QUEUE,
     PAPER_INDEXING_QUEUE,
     USER_PROFILE_RECOMPUTE_QUEUE,
     RedisMLWorker,
@@ -73,6 +77,7 @@ from repositories import (
 
 
 QUEUE_ALIASES = {
+    "keyword_extraction": KEYWORD_EXTRACTION_QUEUE,
     "paper_indexing": PAPER_INDEXING_QUEUE,
     "entity_indexing": ENTITY_INDEXING_QUEUE,
     "research_entities_indexing": ENTITY_INDEXING_QUEUE,
@@ -136,6 +141,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=24 * 60 * 60,
         help="TTL for Redis event status keys. Defaults to 86400.",
+    )
+    run_parser.add_argument(
+        "--keyword-extraction-batch-size",
+        type=int,
+        default=128,
+        help=(
+            "Maximum queue:keyword_extraction messages to combine into one "
+            "KeywordExtractionPipeline.run_papers call. Defaults to 128."
+        ),
+    )
+    run_parser.add_argument(
+        "--max-keyword-task-size",
+        type=int,
+        default=None,
+        help=(
+            "Maximum paper_ids per keyword_extraction handler call. Defaults to "
+            "--keyword-extraction-batch-size."
+        ),
     )
     run_parser.add_argument(
         "--paper-indexing-batch-size",
@@ -245,6 +268,10 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--max-tasks must be a positive integer.")
     if args.idle_sleep < 0:
         raise ValueError("--idle-sleep must be non-negative.")
+    if args.keyword_extraction_batch_size <= 0:
+        raise ValueError("--keyword-extraction-batch-size must be a positive integer.")
+    if args.max_keyword_task_size is not None and args.max_keyword_task_size <= 0:
+        raise ValueError("--max-keyword-task-size must be a positive integer.")
     if args.paper_indexing_batch_size <= 0:
         raise ValueError("--paper-indexing-batch-size must be a positive integer.")
     if args.max_paper_task_size is not None and args.max_paper_task_size <= 0:
@@ -257,6 +284,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--max-cluster-task-size must be a positive integer.")
     if args.event_ttl_seconds <= 0:
         raise ValueError("--event-ttl-seconds must be a positive integer.")
+    max_keyword_task_size = args.max_keyword_task_size or args.keyword_extraction_batch_size
     max_paper_task_size = args.max_paper_task_size or args.paper_indexing_batch_size
     max_cluster_task_size = (
         args.max_cluster_task_size or args.cluster_recompute_batch_size
@@ -311,10 +339,12 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 task_handler=handler,
                 queues=queue_names,
                 batch_sizes={
+                    KEYWORD_EXTRACTION_QUEUE: args.keyword_extraction_batch_size,
                     PAPER_INDEXING_QUEUE: args.paper_indexing_batch_size,
                     CLUSTER_RECOMPUTE_QUEUE: args.cluster_recompute_batch_size,
                 },
                 max_task_sizes={
+                    KEYWORD_EXTRACTION_QUEUE: max_keyword_task_size,
                     PAPER_INDEXING_QUEUE: max_paper_task_size,
                     CLUSTER_RECOMPUTE_QUEUE: max_cluster_task_size,
                 },
@@ -344,10 +374,12 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
             "queues": queue_names,
             "max_tasks": args.max_tasks,
             "batch_sizes": {
+                KEYWORD_EXTRACTION_QUEUE: args.keyword_extraction_batch_size,
                 PAPER_INDEXING_QUEUE: args.paper_indexing_batch_size,
                 CLUSTER_RECOMPUTE_QUEUE: args.cluster_recompute_batch_size,
             },
             "max_task_sizes": {
+                KEYWORD_EXTRACTION_QUEUE: max_keyword_task_size,
                 PAPER_INDEXING_QUEUE: max_paper_task_size,
                 CLUSTER_RECOMPUTE_QUEUE: max_cluster_task_size,
             },
@@ -379,6 +411,15 @@ def build_task_handler(
     paper_graph_repository = PaperGraphRepository(session)
     research_cluster_repository = ResearchClusterRepository(session)
     summary_facade = SummaryFacade(chat_adapter=chat_adapter)
+
+    keyword_extraction_pipeline = KeywordExtractionPipeline(
+        KeywordExtractionFacade(
+            paper_repository=paper_repository,
+            embedding_adapter=embedding_adapter,
+            embedding_model=embedding_model,
+            event_sink=event_sink,
+        )
+    )
 
     paper_indexing_pipeline = PaperIndexingPipeline(
         PaperIndexingFacade(
@@ -436,6 +477,7 @@ def build_task_handler(
 
     return MLTaskHandler(
         session=session,
+        keyword_extraction_pipeline=keyword_extraction_pipeline,
         paper_indexing_pipeline=paper_indexing_pipeline,
         research_entities_pipeline=research_entities_pipeline,
         trend_recompute_pipeline=trend_recompute_pipeline,
@@ -488,12 +530,45 @@ def run_limited_worker(
 ) -> int:
     """Run worker until max_tasks messages have been handled."""
     processed = 0
+    worker.event_sink.emit(
+        MLEvent(
+            event_type="worker_queue_started",
+            task_type="worker",
+            entity_id="queue",
+            stage="queue",
+            current=0,
+            total=max_tasks,
+            message="Worker queue processing started",
+        )
+    )
     while processed < max_tasks:
         handled = worker.run_once(max_messages=max_tasks - processed)
         if handled:
             processed += worker.last_processed_message_count
+            worker.event_sink.emit(
+                MLEvent(
+                    event_type="worker_queue_progress",
+                    task_type="worker",
+                    entity_id="queue",
+                    stage="queue",
+                    current=processed,
+                    total=max_tasks,
+                    message=f"Processed {processed} worker messages",
+                )
+            )
         else:
             time.sleep(idle_sleep_seconds)
+    worker.event_sink.emit(
+        MLEvent(
+            event_type="worker_queue_completed",
+            task_type="worker",
+            entity_id="queue",
+            stage="queue",
+            current=processed,
+            total=max_tasks,
+            message="Worker queue processing completed",
+        )
+    )
     return processed
 
 

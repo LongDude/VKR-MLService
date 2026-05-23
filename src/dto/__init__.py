@@ -30,6 +30,13 @@ from .external import (
 )
 from .favourites import FavouriteActionResponseDTO, FavouriteListResponseDTO
 from .institutions import InstitutionCreateDTO, InstitutionDTO
+from .keywords import (
+    KeywordExtractionBatchRequestDTO,
+    KeywordExtractionItemDTO,
+    KeywordExtractionMetadataDTO,
+    KeywordExtractionResponseDTO,
+    PaperKeywordExtractionBatchRequestDTO,
+)
 from .openalex import (
     BatchImportResultDTO,
     OpenAlexBootstrapReportDTO,
@@ -141,6 +148,10 @@ __all__: list[str] = [
     "IndexingStatus",
     "KeywordCreateDTO",
     "KeywordDTO",
+    "KeywordExtractionBatchRequestDTO",
+    "KeywordExtractionItemDTO",
+    "KeywordExtractionMetadataDTO",
+    "KeywordExtractionResponseDTO",
     "OpenAlexSearchFiltersDTO",
     "OpenAlexBootstrapReportDTO",
     "OpenAlexBootstrapRequestDTO",
@@ -159,6 +170,7 @@ __all__: list[str] = [
     "PaperIndexingRequestDTO",
     "PaperIndexingResponseDTO",
     "PaperKeywordDTO",
+    "PaperKeywordExtractionBatchRequestDTO",
     "PaperResolveRequestDTO",
     "PaperResolveResponseDTO",
     "PaperShortDTO",

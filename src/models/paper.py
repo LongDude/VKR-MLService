@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import (
     BigInteger,
@@ -15,6 +15,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.associationproxy import AssociationProxy, association_proxy
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -49,6 +50,10 @@ class Paper(Base):
     references_count: Mapped[int | None] = mapped_column(
         Integer, server_default=text("0")
     )
+    primary_topic_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("topics.id", ondelete="SET NULL")
+    )
+    extracted_keywords: Mapped[Any | None] = mapped_column(JSONB)
     text_hash: Mapped[str | None] = mapped_column(Text)
     is_indexed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
@@ -70,6 +75,10 @@ class Paper(Base):
     )
     keyword_links: Mapped[list["PaperKeyword"]] = relationship(
         back_populates="paper", cascade="all, delete-orphan"
+    )
+    primary_topic: Mapped["Topic | None"] = relationship(
+        back_populates="primary_papers",
+        foreign_keys=[primary_topic_id],
     )
     landings: Mapped[list["Landing"]] = relationship(
         back_populates="paper", cascade="all, delete-orphan"

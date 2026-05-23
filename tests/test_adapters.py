@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
+import pandas as pd
 import pytest
 
 
@@ -27,6 +28,7 @@ from core.exceptions import (
 )
 from dto.common import BatchOperationResultDTO
 from dto.external import OpenAlexSearchFiltersDTO
+from dto.keywords import KeywordExtractionMetadataDTO, KeywordExtractionResponseDTO
 from dto.papers import PaperBatchIndexingRequestDTO, PaperIndexingRequestDTO
 from dto.qdrant import QdrantPayloadIndexDTO, QdrantPointDTO
 from dto.trends import ClusterSummaryDTO
@@ -39,12 +41,16 @@ from cli.openalex import (
 from ml.constants import PAPERS_COLLECTION, TREND_CLUSTERS_COLLECTION
 from ml.facades.cluster_analytics import ClusterAnalyticsFacade
 from ml.facades.cluster_db_sync import ClusterDbSyncFacade
+from ml.facades.keyword_extraction import KeywordExtractionFacade
+from ml.facades.paper_indexing import PaperIndexingFacade
+from ml.services.events import NoopEventSink
 from ml.services.qdrant_collections import QdrantCollectionInitializer
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.events import CompositeEventSink, MLEvent, RedisEventSink
 from ml.workers.redis_worker import (
     CLUSTER_RECOMPUTE_QUEUE,
     FAILED_TASKS_QUEUE,
+    KEYWORD_EXTRACTION_QUEUE,
     PAPER_INDEXING_QUEUE,
     RedisMLWorker,
 )
@@ -439,6 +445,35 @@ def test_redis_worker_splits_oversized_paper_indexing_messages_before_handling()
     assert [len(message["paper_ids"]) for message in handler.messages] == [4, 4, 2]
 
 
+def test_redis_worker_splits_oversized_keyword_extraction_messages_before_handling() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    handler = CapturingTaskHandler()
+    adapter.enqueue(
+        KEYWORD_EXTRACTION_QUEUE,
+        {
+            "task_type": "keyword_extraction",
+            "paper_ids": list(range(10)),
+            "top_k": 5,
+            "min_score": 0.1,
+            "skip_processed": True,
+            "skip_non_english": True,
+        },
+    )
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=handler,  # type: ignore[arg-type]
+        queues=(KEYWORD_EXTRACTION_QUEUE,),
+        batch_sizes={KEYWORD_EXTRACTION_QUEUE: 1},
+        max_task_sizes={KEYWORD_EXTRACTION_QUEUE: 4},
+    )
+
+    assert worker.run_once() is True
+    assert [len(message["paper_ids"]) for message in handler.messages] == [4, 4, 2]
+    assert all(message["top_k"] == 5 for message in handler.messages)
+    assert all(message["skip_non_english"] is True for message in handler.messages)
+
+
 def test_redis_worker_splits_oversized_cluster_recompute_messages_before_handling() -> None:
     client = FakeRedisClient()
     adapter = RedisAdapter(client)
@@ -529,6 +564,41 @@ def test_task_handler_continues_cluster_batch_after_topic_error() -> None:
     assert result.details["updated"] == 2
     assert result.details["failed"] == 1
     assert result.details["errors"][0]["task_id"] == "topic:2"
+
+
+class CapturingKeywordExtractionPipeline:
+    def __init__(self) -> None:
+        self.requests: list[Any] = []
+
+    def run_papers(self, request: Any) -> BatchOperationResultDTO:
+        self.requests.append(request)
+        return BatchOperationResultDTO(total=len(request.paper_ids), updated=len(request.paper_ids))
+
+
+def test_task_handler_dispatches_keyword_extraction_batch() -> None:
+    pipeline = CapturingKeywordExtractionPipeline()
+    handler = MLTaskHandler(
+        keyword_extraction_pipeline=pipeline,  # type: ignore[arg-type]
+    )
+
+    result = handler.handle(
+        {
+            "task_type": "keyword_extraction",
+            "paper_ids": [1, 2],
+            "top_k": 7,
+            "min_score": 0.2,
+            "skip_processed": False,
+            "skip_non_english": True,
+        }
+    )
+
+    request = pipeline.requests[0]
+    assert result.success is True
+    assert request.paper_ids == [1, 2]
+    assert request.top_k == 7
+    assert request.min_score == 0.2
+    assert request.skip_processed is False
+    assert request.skip_non_english is True
 
 
 class FakeQdrantClient:
@@ -980,6 +1050,197 @@ def test_cluster_db_sync_facade_syncs_qdrant_payloads() -> None:
     assert result.success is True
     assert result.details["created"] == 2
     assert result.details["failed"] == 0
+
+
+class FakeKeywordEmbeddingAdapter:
+    def __init__(self, vectors: dict[str, list[float]]) -> None:
+        self.vectors = vectors
+        self.calls: list[tuple[list[str], str]] = []
+
+    def embed_text(self, text: str, model: str = "qwen3-embedding") -> Any:
+        self.calls.append(([text], model))
+        return SimpleNamespace(vector=self.vectors.get(text, []), model=model)
+
+    def embed_batch(self, texts: list[str], model: str = "qwen3-embedding") -> list[Any]:
+        self.calls.append((list(texts), model))
+        return [
+            SimpleNamespace(vector=self.vectors.get(text, []), model=model)
+            for text in texts
+        ]
+
+
+def test_keyword_extraction_semantic_feature_uses_lmstudio_cosine() -> None:
+    facade = object.__new__(KeywordExtractionFacade)
+    facade.embedding_adapter = FakeKeywordEmbeddingAdapter(
+        {
+            "alpha": [1.0, 0.0],
+            "beta": [0.0, 1.0],
+            "alpha.": [1.0, 0.0],
+            "beta.": [0.0, 1.0],
+        }
+    )
+    facade.embedding_model = "qwen3-embedding"
+    documents = pd.DataFrame({"id": ["doc"], "text": ["alpha. beta."]})
+    features = pd.DataFrame(
+        {
+            "doc_id": ["doc", "doc"],
+            "candidate": ["alpha", "beta"],
+        }
+    )
+
+    result = facade._add_semantic_feature(documents, features)
+
+    assert result["embedrank_best_sentence_cosine"].tolist() == [1.0, 1.0]
+    assert facade.embedding_adapter.calls == [
+        (["alpha", "beta"], "qwen3-embedding"),
+        (["alpha.", "beta."], "qwen3-embedding"),
+    ]
+
+
+def test_keyword_candidate_features_use_pke_candidates_and_filter_stopword_edges() -> None:
+    facade = object.__new__(KeywordExtractionFacade)
+    facade._english_stopwords = {"and", "the", "of"}
+    documents = pd.DataFrame(
+        {
+            "id": ["doc"],
+            "text": ["Graph neural networks cover categories and applications."],
+        }
+    )
+    pke_scores = {
+        "doc": {
+            "pke_yake_w8": [
+                ("categories , and", 0.1),
+                ("graph neural networks", 0.2),
+            ],
+            "pke_singlerank_w4": [
+                ("the method", 0.3),
+                ("applications", 0.4),
+            ],
+        }
+    }
+
+    features = facade._build_candidate_features(documents, pke_scores)
+
+    assert set(features["candidate"].tolist()) == {
+        "graph neural networks",
+        "applications",
+    }
+
+
+def test_keyword_extraction_output_filters_score_before_top_k() -> None:
+    facade = object.__new__(KeywordExtractionFacade)
+
+    result = facade._apply_output_filters(
+        [("a", 0.9), ("b", 0.2), ("c", 0.1)],
+        top_k=2,
+        min_score=0.15,
+    )
+
+    assert result == [("a", 0.9), ("b", 0.2)]
+
+
+def test_keyword_extraction_rejects_non_english_metadata() -> None:
+    facade = object.__new__(KeywordExtractionFacade)
+
+    with pytest.raises(NotImplementedError):
+        facade._resolve_english_metadata(
+            KeywordExtractionMetadataDTO(title="Заголовок", language="ru")
+        )
+
+
+class FakeKeywordPaperRepository:
+    def __init__(self) -> None:
+        self.saved: dict[int, list[str]] = {}
+
+    def save_extracted_keywords(self, keywords_by_paper_id: dict[int, list[str]]) -> None:
+        self.saved.update(keywords_by_paper_id)
+
+
+def test_keyword_extraction_batch_skips_non_english_when_requested() -> None:
+    facade = object.__new__(KeywordExtractionFacade)
+    facade.paper_repository = FakeKeywordPaperRepository()
+    facade.event_sink = NoopEventSink()
+    facade.paper_extraction_chunk_size = 25
+
+    def fake_extract_batch(request: Any) -> list[KeywordExtractionResponseDTO]:
+        return [
+            KeywordExtractionResponseDTO(
+                paper_id=metadata.paper_id,
+                keywords=["graph"],
+            )
+            for metadata in request.items
+        ]
+
+    facade.extract_batch = fake_extract_batch  # type: ignore[method-assign]
+    result = facade._extract_loaded_papers(
+        [
+            SimpleNamespace(id=1, title="English", abstract="Abstract", language="en"),
+            SimpleNamespace(id=2, title="Russian", abstract="Аннотация", language="ru"),
+        ],
+        top_k=10,
+        min_score=None,
+        skip_non_english=True,
+    )
+
+    assert result.updated == 1
+    assert result.skipped == 1
+    assert facade.paper_repository.saved == {1: ["graph"]}
+
+
+def test_keyword_extraction_loaded_papers_updates_progress_by_internal_chunks() -> None:
+    facade = object.__new__(KeywordExtractionFacade)
+    facade.paper_repository = FakeKeywordPaperRepository()
+    facade.event_sink = InMemoryEventSink()
+    facade.paper_extraction_chunk_size = 2
+    chunk_sizes: list[int] = []
+
+    def fake_extract_batch(request: Any) -> list[KeywordExtractionResponseDTO]:
+        chunk_sizes.append(len(request.items))
+        return [
+            KeywordExtractionResponseDTO(
+                paper_id=metadata.paper_id,
+                keywords=[f"kw-{metadata.paper_id}"],
+            )
+            for metadata in request.items
+        ]
+
+    facade.extract_batch = fake_extract_batch  # type: ignore[method-assign]
+    result = facade._extract_loaded_papers(
+        [
+            SimpleNamespace(id=1, title="One", abstract="Abstract", language="en"),
+            SimpleNamespace(id=2, title="Two", abstract="Abstract", language="en"),
+            SimpleNamespace(id=3, title="Three", abstract="Abstract", language="en"),
+        ],
+        top_k=10,
+        min_score=None,
+        skip_non_english=False,
+    )
+
+    progress_events = [
+        event
+        for event in facade.event_sink.events
+        if event.event_type == "keyword_extraction_progress"
+    ]
+    assert result.updated == 3
+    assert chunk_sizes == [2, 1]
+    assert [event.entity_id for event in progress_events] == ["batch", "batch"]
+    assert [event.current for event in progress_events] == [2, 3]
+    assert facade.paper_repository.saved == {
+        1: ["kw-1"],
+        2: ["kw-2"],
+        3: ["kw-3"],
+    }
+
+
+def test_paper_indexing_merges_extracted_keywords_without_keyword_ids() -> None:
+    facade = object.__new__(PaperIndexingFacade)
+
+    result = facade._merge_keyword_values(
+        ["Graph Learning", "AI"],
+        ["ai", {"keyword": "Embeddings"}, {"value": "Ranking"}],
+    )
+
+    assert result == ["Graph Learning", "AI", "Embeddings", "Ranking"]
 
 
 def test_lmstudio_embedding_adapter_validates_response() -> None:

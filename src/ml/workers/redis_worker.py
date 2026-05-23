@@ -11,6 +11,7 @@ from ml.services.events import EventSink, MLEvent, NoopEventSink, TqdmEventSink
 from ml.workers.task_handlers import MLTaskHandler
 
 
+KEYWORD_EXTRACTION_QUEUE = "queue:keyword_extraction"
 PAPER_INDEXING_QUEUE = "queue:paper_indexing"
 ENTITY_INDEXING_QUEUE = "queue:entity_indexing"
 CLUSTER_RECOMPUTE_QUEUE = "queue:cluster_recompute"
@@ -19,6 +20,7 @@ USER_PROFILE_RECOMPUTE_QUEUE = "queue:user_profile_recompute"
 FAILED_TASKS_QUEUE = "queue:failed_tasks"
 
 DEFAULT_QUEUE_ORDER = (
+    KEYWORD_EXTRACTION_QUEUE,
     PAPER_INDEXING_QUEUE,
     ENTITY_INDEXING_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
@@ -148,6 +150,8 @@ class RedisMLWorker:
     ) -> list[dict[str, Any]]:
         if queue_name == PAPER_INDEXING_QUEUE:
             return self._coalesce_paper_indexing_messages(messages)
+        if queue_name == KEYWORD_EXTRACTION_QUEUE:
+            return self._coalesce_keyword_extraction_messages(messages)
         if queue_name == CLUSTER_RECOMPUTE_QUEUE:
             return self._coalesce_cluster_recompute_messages(messages)
         return messages
@@ -179,6 +183,41 @@ class RedisMLWorker:
                         "task_type": "paper_indexing",
                         "paper_ids": paper_ids,
                         "force_reindex": force_reindex,
+                    }
+                )
+        return result
+
+    def _coalesce_keyword_extraction_messages(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        grouped_ids: dict[tuple[int | None, float | None, bool, bool], list[int]] = defaultdict(list)
+        seen_by_options: dict[tuple[int | None, float | None, bool, bool], set[int]] = defaultdict(set)
+        result: list[dict[str, Any]] = []
+
+        for message in messages:
+            if not self._is_simple_keyword_extraction_message(message):
+                result.append(message)
+                continue
+
+            options = self._keyword_extraction_options(message)
+            for paper_id in self._paper_ids_from_message(message):
+                if paper_id in seen_by_options[options]:
+                    continue
+                grouped_ids[options].append(paper_id)
+                seen_by_options[options].add(paper_id)
+
+        for options, paper_ids in grouped_ids.items():
+            top_k, min_score, skip_processed, skip_non_english = options
+            if paper_ids:
+                result.append(
+                    {
+                        "task_type": "keyword_extraction",
+                        "paper_ids": paper_ids,
+                        "top_k": top_k,
+                        "min_score": min_score,
+                        "skip_processed": skip_processed,
+                        "skip_non_english": skip_non_english,
                     }
                 )
         return result
@@ -294,6 +333,8 @@ class RedisMLWorker:
     ) -> list[dict[str, Any]]:
         if queue_name == PAPER_INDEXING_QUEUE:
             return self._split_oversized_paper_indexing_message(queue_name, message)
+        if queue_name == KEYWORD_EXTRACTION_QUEUE:
+            return self._split_oversized_keyword_extraction_message(queue_name, message)
         if queue_name == CLUSTER_RECOMPUTE_QUEUE:
             return self._split_oversized_cluster_recompute_message(queue_name, message)
         return [message]
@@ -319,6 +360,34 @@ class RedisMLWorker:
                 "task_type": "paper_indexing",
                 "paper_ids": paper_ids[index : index + max_task_size],
                 "force_reindex": force_reindex,
+            }
+            for index in range(0, len(paper_ids), max_task_size)
+        ]
+
+    def _split_oversized_keyword_extraction_message(
+        self,
+        queue_name: str,
+        message: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if message.get("task_type") != "keyword_extraction":
+            return [message]
+        max_task_size = self.max_task_sizes.get(queue_name)
+        if max_task_size is None:
+            return [message]
+
+        paper_ids = self._paper_ids_from_message(message)
+        if len(paper_ids) <= max_task_size:
+            return [message]
+
+        top_k, min_score, skip_processed, skip_non_english = self._keyword_extraction_options(message)
+        return [
+            {
+                "task_type": "keyword_extraction",
+                "paper_ids": paper_ids[index : index + max_task_size],
+                "top_k": top_k,
+                "min_score": min_score,
+                "skip_processed": skip_processed,
+                "skip_non_english": skip_non_english,
             }
             for index in range(0, len(paper_ids), max_task_size)
         ]
@@ -356,6 +425,35 @@ class RedisMLWorker:
         if set(message) - allowed_keys:
             return False
         return bool(self._paper_ids_from_message(message))
+
+    def _is_simple_keyword_extraction_message(self, message: dict[str, Any]) -> bool:
+        if message.get("task_type") != "keyword_extraction":
+            return False
+        allowed_keys = {
+            "task_type",
+            "paper_id",
+            "paper_ids",
+            "top_k",
+            "min_score",
+            "skip_processed",
+            "skip_non_english",
+        }
+        if set(message) - allowed_keys:
+            return False
+        return bool(self._paper_ids_from_message(message))
+
+    def _keyword_extraction_options(
+        self,
+        message: dict[str, Any],
+    ) -> tuple[int | None, float | None, bool, bool]:
+        top_k = message.get("top_k")
+        min_score = message.get("min_score")
+        return (
+            int(top_k) if top_k is not None else None,
+            float(min_score) if min_score is not None else None,
+            bool(message.get("skip_processed", True)),
+            bool(message.get("skip_non_english", False)),
+        )
 
     def _is_simple_cluster_recompute_message(self, message: dict[str, Any]) -> bool:
         if message.get("task_type") not in {"cluster_recompute", "recompute_topic_clusters"}:
@@ -577,6 +675,7 @@ __all__ = [
     "DEFAULT_QUEUE_ORDER",
     "ENTITY_INDEXING_QUEUE",
     "FAILED_TASKS_QUEUE",
+    "KEYWORD_EXTRACTION_QUEUE",
     "PAPER_INDEXING_QUEUE",
     "RedisMLWorker",
     "USER_PROFILE_RECOMPUTE_QUEUE",

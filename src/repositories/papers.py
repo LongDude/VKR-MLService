@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -13,6 +13,9 @@ from dto.papers import PaperCreateDTO, PaperUpdateDTO
 from models import Paper, PaperTopic, Subfield, Topic
 
 from .base import BaseRepository
+
+
+TopicMatchMode = Literal["soft", "strict"]
 
 
 class PaperRepository(BaseRepository):
@@ -82,16 +85,20 @@ class PaperRepository(BaseRepository):
         *,
         field_ids: list[int] | None = None,
         subfield_ids: list[int] | None = None,
+        topic_match: TopicMatchMode = "soft",
     ) -> int:
         """Return distinct paper count in a period filtered by topic field/subfield."""
+        self._validate_topic_match(topic_match)
         if not field_ids and not subfield_ids:
             return self.count_by_period(date_from, date_to)
-        stmt = (
-            select(func.count(func.distinct(Paper.id)))
-            .select_from(Paper)
-            .join(PaperTopic, PaperTopic.paper_id == Paper.id)
-            .join(Topic, Topic.id == PaperTopic.topic_id)
-        )
+        stmt = select(func.count(func.distinct(Paper.id))).select_from(Paper)
+        if topic_match == "strict":
+            stmt = stmt.join(Topic, Topic.id == Paper.primary_topic_id)
+        else:
+            stmt = stmt.join(PaperTopic, PaperTopic.paper_id == Paper.id).join(
+                Topic,
+                Topic.id == PaperTopic.topic_id,
+            )
         if date_from is not None:
             stmt = stmt.where(Paper.publication_date >= date_from)
         if date_to is not None:
@@ -109,14 +116,18 @@ class PaperRepository(BaseRepository):
         date_from: date | None,
         date_to: date | None,
         topic_id: int,
+        *,
+        topic_match: TopicMatchMode = "soft",
     ) -> int:
         """Return distinct paper count in a period filtered by topic."""
-        stmt = (
-            select(func.count(func.distinct(Paper.id)))
-            .select_from(Paper)
-            .join(PaperTopic, PaperTopic.paper_id == Paper.id)
-            .where(PaperTopic.topic_id == topic_id)
-        )
+        self._validate_topic_match(topic_match)
+        stmt = select(func.count(func.distinct(Paper.id))).select_from(Paper)
+        if topic_match == "strict":
+            stmt = stmt.where(Paper.primary_topic_id == topic_id)
+        else:
+            stmt = stmt.join(PaperTopic, PaperTopic.paper_id == Paper.id).where(
+                PaperTopic.topic_id == topic_id,
+            )
         if date_from is not None:
             stmt = stmt.where(Paper.publication_date >= date_from)
         if date_to is not None:
@@ -282,13 +293,24 @@ class PaperRepository(BaseRepository):
         date_to: date | None,
         limit: int,
         offset: int,
+        *,
+        topic_id: int | None = None,
+        topic_match: TopicMatchMode = "soft",
     ) -> list[Paper]:
         """List papers whose publication_date falls within the optional period."""
+        self._validate_topic_match(topic_match)
         stmt = select(Paper).order_by(Paper.publication_date.desc().nullslast(), Paper.id.desc())
         if date_from is not None:
             stmt = stmt.where(Paper.publication_date >= date_from)
         if date_to is not None:
             stmt = stmt.where(Paper.publication_date <= date_to)
+        if topic_id is not None:
+            if topic_match == "strict":
+                stmt = stmt.where(Paper.primary_topic_id == topic_id)
+            else:
+                stmt = stmt.join(PaperTopic, PaperTopic.paper_id == Paper.id).where(
+                    PaperTopic.topic_id == topic_id,
+                )
         stmt = stmt.limit(limit).offset(offset)
         return list(self.session.scalars(stmt).all())
 
@@ -298,8 +320,12 @@ class PaperRepository(BaseRepository):
         date_to: date | None,
         limit: int,
         offset: int,
+        *,
+        topic_id: int | None = None,
+        topic_match: TopicMatchMode = "soft",
     ) -> list[int]:
         """List paper ids whose publication_date falls within the optional period."""
+        self._validate_topic_match(topic_match)
         stmt = select(Paper.id).order_by(
             Paper.publication_date.desc().nullslast(),
             Paper.id.desc(),
@@ -308,8 +334,81 @@ class PaperRepository(BaseRepository):
             stmt = stmt.where(Paper.publication_date >= date_from)
         if date_to is not None:
             stmt = stmt.where(Paper.publication_date <= date_to)
+        if topic_id is not None:
+            if topic_match == "strict":
+                stmt = stmt.where(Paper.primary_topic_id == topic_id)
+            else:
+                stmt = stmt.join(PaperTopic, PaperTopic.paper_id == Paper.id).where(
+                    PaperTopic.topic_id == topic_id,
+                )
         stmt = stmt.limit(limit).offset(offset)
         return list(self.session.scalars(stmt).all())
+
+    def list_for_keyword_extraction(
+        self,
+        *,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        topic_id: int | None = None,
+        field_id: int | None = None,
+        skip_processed: bool = True,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[Paper]:
+        """List papers eligible for keyword extraction using metadata filters."""
+        stmt = select(Paper).order_by(
+            Paper.publication_date.desc().nullslast(),
+            Paper.id.desc(),
+        )
+        stmt = self._apply_keyword_extraction_filters(
+            stmt,
+            date_from=date_from,
+            date_to=date_to,
+            topic_id=topic_id,
+            field_id=field_id,
+            skip_processed=skip_processed,
+        )
+        stmt = stmt.limit(limit).offset(offset)
+        return list(self.session.scalars(stmt).all())
+
+    def list_ids_for_keyword_extraction(
+        self,
+        *,
+        paper_ids: list[int] | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        topic_id: int | None = None,
+        field_id: int | None = None,
+        skip_processed: bool = True,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[int]:
+        """List paper ids eligible for keyword extraction."""
+        unique_ids = self._unique_ids(paper_ids or [])
+        stmt = select(Paper.id)
+        if unique_ids:
+            stmt = stmt.where(Paper.id.in_(unique_ids))
+        else:
+            stmt = stmt.order_by(
+                Paper.publication_date.desc().nullslast(),
+                Paper.id.desc(),
+            )
+        stmt = self._apply_keyword_extraction_filters(
+            stmt,
+            date_from=date_from,
+            date_to=date_to,
+            topic_id=topic_id,
+            field_id=field_id,
+            skip_processed=skip_processed,
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        stmt = stmt.offset(offset)
+        ids = [int(paper_id) for paper_id in self.session.scalars(stmt).all()]
+        if not unique_ids:
+            return ids
+        id_set = set(ids)
+        return [paper_id for paper_id in unique_ids if paper_id in id_set]
 
     def list_recent(self, date_from: date, limit: int) -> list[Paper]:
         """List recent papers from the supplied publication date."""
@@ -391,6 +490,29 @@ class PaperRepository(BaseRepository):
             is_indexed=False,
             updated_at=self._now(),
         )
+
+    def save_extracted_keywords(
+        self,
+        keywords_by_paper_id: dict[int, list[str]],
+    ) -> None:
+        """Persist extracted keyword strings into papers.extracted_keywords."""
+        if not keywords_by_paper_id:
+            return
+        now = self._now()
+        for paper_id, keywords in keywords_by_paper_id.items():
+            clean_keywords = [
+                str(keyword).strip()
+                for keyword in keywords
+                if str(keyword).strip()
+            ]
+            self.session.execute(
+                update(Paper)
+                .where(Paper.id == int(paper_id))
+                .values(
+                    extracted_keywords=clean_keywords,
+                    updated_at=now,
+                )
+            )
 
     def _normalize_title(self, title: str) -> str:
         return " ".join(title.strip().lower().split())
@@ -474,6 +596,14 @@ class PaperRepository(BaseRepository):
                             stmt.excluded.references_count,
                             Paper.references_count,
                         ),
+                        "primary_topic_id": func.coalesce(
+                            stmt.excluded.primary_topic_id,
+                            Paper.primary_topic_id,
+                        ),
+                        "extracted_keywords": func.coalesce(
+                            stmt.excluded.extracted_keywords,
+                            Paper.extracted_keywords,
+                        ),
                         "updated_at": func.now(),
                     },
                 )
@@ -539,6 +669,8 @@ class PaperRepository(BaseRepository):
             "cited_by_count": item.cited_by_count,
             "openalex_id": item.external_id,
             "references_count": item.references_count,
+            "primary_topic_id": item.primary_topic_id,
+            "extracted_keywords": self._extracted_keywords_payload(item),
         }
 
     def _apply_external_values(
@@ -562,6 +694,56 @@ class PaperRepository(BaseRepository):
     def _update_papers(self, paper_ids: list[int], **values: Any) -> None:
         self.session.execute(update(Paper).where(Paper.id.in_(paper_ids)).values(**values))
 
+    def _apply_keyword_extraction_filters(
+        self,
+        stmt: Any,
+        *,
+        date_from: date | None,
+        date_to: date | None,
+        topic_id: int | None,
+        field_id: int | None,
+        skip_processed: bool,
+    ) -> Any:
+        if date_from is not None:
+            stmt = stmt.where(Paper.publication_date >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(Paper.publication_date <= date_to)
+        if skip_processed:
+            stmt = stmt.where(Paper.extracted_keywords.is_(None))
+        if topic_id is not None or field_id is not None:
+            paper_ids = select(PaperTopic.paper_id).join(
+                Topic,
+                Topic.id == PaperTopic.topic_id,
+            )
+            if topic_id is not None:
+                paper_ids = paper_ids.where(PaperTopic.topic_id == int(topic_id))
+            if field_id is not None:
+                paper_ids = paper_ids.join(
+                    Subfield,
+                    Subfield.id == Topic.subfield_id,
+                ).where(Subfield.field_id == int(field_id))
+            stmt = stmt.where(Paper.id.in_(paper_ids))
+        return stmt
+
+    def _extracted_keywords_payload(
+        self,
+        item: ExternalPaperDTO,
+    ) -> list[str] | list[dict[str, Any]] | None:
+        if item.extracted_keywords is not None:
+            return item.extracted_keywords
+        if not item.keywords:
+            return None
+        payload: list[dict[str, Any]] = []
+        for keyword in item.keywords:
+            value = keyword.value.strip() if keyword.value else ""
+            if not value:
+                continue
+            item_payload: dict[str, Any] = {"keyword": value}
+            if keyword.score is not None:
+                item_payload["score"] = float(keyword.score)
+            payload.append(item_payload)
+        return payload or None
+
     def _unique_ids(self, paper_ids: Iterable[int]) -> list[int]:
         return list(dict.fromkeys(int(paper_id) for paper_id in paper_ids))
 
@@ -575,5 +757,12 @@ class PaperRepository(BaseRepository):
                 details={"source_name": source_name},
             )
 
+    def _validate_topic_match(self, value: TopicMatchMode) -> None:
+        if value not in {"soft", "strict"}:
+            raise InvalidRequestError(
+                "Topic match mode must be 'soft' or 'strict'",
+                details={"topic_match": value},
+            )
 
-__all__ = ["PaperRepository"]
+
+__all__ = ["PaperRepository", "TopicMatchMode"]
