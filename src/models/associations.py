@@ -11,8 +11,6 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     Numeric,
-    Text,
-    UniqueConstraint,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -23,8 +21,8 @@ if TYPE_CHECKING:
     from .author import Author
     from .institution import Institution
     from .keyword import Keyword
-    from .paper import MetaSource, Paper
-    from .topic import Domain, Subfield, Topic
+    from .paper import Paper
+    from .topic import Domain, Field, Subfield, Topic
     from .user import User
 
 
@@ -86,28 +84,6 @@ class AuthorInstitution(Base):
 
     author: Mapped["Author"] = relationship(back_populates="institution_links")
     institution: Mapped["Institution"] = relationship(back_populates="author_links")
-
-
-class PaperMetaSource(Base):
-    __tablename__ = "paper_meta_sources"
-    __table_args__ = (
-        UniqueConstraint("meta_source_id", "external_id"),
-    )
-
-    paper_id: Mapped[int] = mapped_column(
-        BigInteger,
-        ForeignKey("papers.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    meta_source_id: Mapped[int] = mapped_column(
-        BigInteger,
-        ForeignKey("meta_sources.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    external_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
-
-    paper: Mapped["Paper"] = relationship(back_populates="meta_source_links")
-    meta_source: Mapped["MetaSource"] = relationship(back_populates="paper_links")
 
 
 class PaperTopic(Base):
@@ -178,6 +154,23 @@ class UserTrackedDomain(Base):
 
     user: Mapped["User"] = relationship(back_populates="tracked_domain_links")
     domain: Mapped["Domain"] = relationship(back_populates="tracked_by_links")
+
+
+class UserTrackedField(Base):
+    __tablename__ = "user_tracked_fields"
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    field_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("fields.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    user: Mapped["User"] = relationship(back_populates="tracked_field_links")
+    field: Mapped["Field"] = relationship(back_populates="tracked_by_links")
 
 
 class UserTrackedSubfield(Base):

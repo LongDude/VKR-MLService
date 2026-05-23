@@ -29,16 +29,22 @@ from dto.common import BatchOperationResultDTO
 from dto.external import OpenAlexSearchFiltersDTO
 from dto.papers import PaperBatchIndexingRequestDTO, PaperIndexingRequestDTO
 from dto.qdrant import QdrantPayloadIndexDTO, QdrantPointDTO
-from dto.search import SemanticSearchRequestDTO
 from dto.trends import ClusterSummaryDTO
 from ingestion.openalex_bootstrap.monthly_counts import MonthlyCount, MonthlyCountsLoader
-from cli.openalex import default_stats_redis_key, resolve_target_count
+from cli.openalex import (
+    default_stats_redis_key,
+    resolve_bootstrap_target_unit,
+    resolve_target_count,
+)
 from ml.constants import PAPERS_COLLECTION, TREND_CLUSTERS_COLLECTION
 from ml.facades.cluster_analytics import ClusterAnalyticsFacade
 from ml.facades.cluster_db_sync import ClusterDbSyncFacade
+from ml.services.qdrant_collections import QdrantCollectionInitializer
+from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.events import CompositeEventSink, MLEvent, RedisEventSink
 from ml.workers.redis_worker import (
     CLUSTER_RECOMPUTE_QUEUE,
+    FAILED_TASKS_QUEUE,
     PAPER_INDEXING_QUEUE,
     RedisMLWorker,
 )
@@ -207,10 +213,50 @@ def test_monthly_counts_loader_reads_and_detects_missing_redis_periods() -> None
 
 
 def test_resolve_target_count_supports_period_scope() -> None:
+    assert resolve_target_count(100, "period") == (100, "period")
+    assert resolve_target_count(50, "year") == (50, "year")
+    assert resolve_target_count(25, "month") == (25, "month")
+    assert resolve_target_count(200, "total") == (200, "total")
     assert resolve_target_count(None, 100) == (100, "period")
-    assert resolve_target_count(200, None) == (200, "total")
     with pytest.raises(ValueError):
-        resolve_target_count(200, 100)
+        resolve_target_count(200, "total", 100)
+
+
+def test_resolve_bootstrap_target_unit_auto_uses_topic_for_monthly_taxonomy() -> None:
+    assert (
+        resolve_bootstrap_target_unit(
+            "auto",
+            "month",
+            field_ids=[1],
+            subfield_ids=None,
+        )
+        == "topic"
+    )
+    assert (
+        resolve_bootstrap_target_unit(
+            "auto",
+            "period",
+            field_ids=[1],
+            subfield_ids=None,
+        )
+        == "aggregate"
+    )
+    assert (
+        resolve_bootstrap_target_unit(
+            "aggregate",
+            "month",
+            field_ids=[1],
+            subfield_ids=None,
+        )
+        == "aggregate"
+    )
+    with pytest.raises(ValueError):
+        resolve_bootstrap_target_unit(
+            "topic",
+            "month",
+            field_ids=None,
+            subfield_ids=None,
+        )
 
 
 def test_failed_task_restorer_splits_large_paper_indexing_batches() -> None:
@@ -418,6 +464,47 @@ def test_redis_worker_splits_oversized_cluster_recompute_messages_before_handlin
     assert all(message["force_summary"] is True for message in handler.messages)
 
 
+def test_redis_worker_saves_interrupted_task_to_failed_queue() -> None:
+    class InterruptingHandler:
+        def __init__(self) -> None:
+            self.session = SimpleNamespace(rollbacks=0)
+
+            def rollback() -> None:
+                self.session.rollbacks += 1
+
+            self.session.rollback = rollback
+
+        def handle(self, _message: dict[str, Any]) -> None:
+            raise KeyboardInterrupt()
+
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    adapter.enqueue(
+        PAPER_INDEXING_QUEUE,
+        {
+            "task_type": "paper_indexing",
+            "paper_id": 10,
+            "force_reindex": False,
+        },
+    )
+    handler = InterruptingHandler()
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=handler,  # type: ignore[arg-type]
+        queues=(PAPER_INDEXING_QUEUE,),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        worker.run_once()
+
+    failed = adapter.dequeue_nowait(FAILED_TASKS_QUEUE)
+    assert failed is not None
+    assert failed["source_queue"] == PAPER_INDEXING_QUEUE
+    assert failed["message"]["paper_ids"] == [10]
+    assert failed["error"]["code"] == "Interrupt"
+    assert handler.session.rollbacks == 1
+
+
 class PartiallyFailingTrendPipeline:
     def recompute_cluster(self, cluster_id: str, force_summary: bool = False) -> dict[str, Any]:
         if cluster_id == "topic:2":
@@ -563,6 +650,37 @@ def test_qdrant_adapter_uses_client_without_hardcoded_collection() -> None:
     assert adapter.exists("papers", 1) is True
     assert adapter.retrieve("papers", [1], with_vectors=True)[0].vector == [0.1, 0.2, 0.3]
     assert adapter.search("papers", [0.1, 0.2, 0.3], top_k=1)[0].payload == {"paper_id": 1}
+
+
+def test_qdrant_paper_payload_uses_paper_openalex_fields() -> None:
+    payload = QdrantPayloadBuilder().build_paper_payload(
+        SimpleNamespace(
+            id=1,
+            title="Demo",
+            doi="10.1/demo",
+            openalex_id="https://openalex.org/W1",
+            references_count=12,
+            type="article",
+            created_by_user_id=7,
+        ),
+        text_hash="hash",
+        external_ids={"openalex": "https://openalex.org/W1"},
+    )
+
+    assert payload["openalex_id"] == "https://openalex.org/W1"
+    assert payload["references_count"] == 12
+    assert payload["text_hash"] == "hash"
+    assert "type" not in payload
+    assert "created_by_user_id" not in payload
+    assert "external_ids" not in payload
+
+
+def test_qdrant_paper_indexes_match_new_paper_payload_fields() -> None:
+    indexes = dict(QdrantCollectionInitializer.PAPERS_INDEXES)
+
+    assert indexes["openalex_id"] == "keyword"
+    assert indexes["references_count"] == "integer"
+    assert "type" not in indexes
 
 
 def test_qdrant_adapter_maps_application_string_ids_to_uuid_points() -> None:
@@ -728,7 +846,7 @@ class FakeSummaryFacade:
         abstracts: list[str],
         top_keywords: list[str],
     ) -> ClusterSummaryDTO:
-        return ClusterSummaryDTO(title=cluster_name, summary="summary")
+        return ClusterSummaryDTO(title="Semantic Cluster Name", summary="summary")
 
 
 class FakeResearchClusterRepository:
@@ -762,9 +880,11 @@ def test_cluster_analytics_retrieves_qdrant_vectors_in_chunks() -> None:
     ]
 
     assert cluster.cluster_key == "topic:1"
+    assert cluster.name == "Semantic Cluster Name"
     assert len(paper_retrieve_sizes) > 1
     assert max(paper_retrieve_sizes) <= 256
     assert qdrant_adapter.upserts[0][3]["indexed_paper_count"] == len(paper_ids)
+    assert qdrant_adapter.upserts[0][3]["source_topic_name"] == "Topic 1"
     assert cluster_repository.cluster_payloads[0]["cluster_key"] == "topic:1"
 
 
@@ -960,6 +1080,7 @@ def test_openalex_adapter_normalizes_work_response() -> None:
                 },
                 "open_access": {"is_oa": True},
                 "cited_by_count": 5,
+                "referenced_works_count": 9,
             },
         )
 
@@ -978,6 +1099,7 @@ def test_openalex_adapter_normalizes_work_response() -> None:
     assert paper.topics[0].domain_name == "Computer Science"
     assert paper.keywords[0].value == "embeddings"
     assert paper.landings[0].landing_url == "https://example.test/paper"
+    assert paper.references_count == 9
     assert paper.raw is not None
 
 
@@ -1031,7 +1153,7 @@ def test_openalex_adapter_adds_openalex_auth_params() -> None:
     assert adapter.count_works(OpenAlexSearchFiltersDTO(type="article")) == 1
 
 
-def test_openalex_adapter_maps_429_to_rate_limit() -> None:
+def test_openalex_adapter_count_maps_429_to_rate_limit() -> None:
     adapter = OpenAlexAdapter(
         "https://openalex.test",
         client=httpx.Client(
@@ -1040,4 +1162,4 @@ def test_openalex_adapter_maps_429_to_rate_limit() -> None:
     )
 
     with pytest.raises(ExternalServiceRateLimitError):
-        adapter.search_works("x", OpenAlexSearchFiltersDTO())
+        adapter.count_works(OpenAlexSearchFiltersDTO())

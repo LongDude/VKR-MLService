@@ -64,6 +64,7 @@ class ExternalPaperDTO(BaseDTO):
     language: str | None = None
     is_open_access: bool | None = None
     cited_by_count: int | None = None
+    references_count: int | None = None
     authors: list[ExternalAuthorDTO] = Field(default_factory=list)
     institutions: list[ExternalInstitutionDTO] = Field(default_factory=list)
     topics: list[ExternalTopicDTO] = Field(default_factory=list)
@@ -84,20 +85,12 @@ class OpenAlexSearchFiltersDTO(BaseDTO):
     pagination: PaginationDTO = Field(default_factory=PaginationDTO)
 
 
-class ExternalSearchResultDTO(BaseDTO):
-    source_name: str = "openalex"
-    total: int | None = None
-    items: list[ExternalPaperDTO] = Field(default_factory=list)
-    raw: dict[str, Any] | None = None
-
-
 __all__ = [
     "ExternalAuthorDTO",
     "ExternalInstitutionDTO",
     "ExternalKeywordDTO",
     "ExternalLandingDTO",
     "ExternalPaperDTO",
-    "ExternalSearchResultDTO",
     "ExternalTopicDTO",
     "OpenAlexSearchFiltersDTO",
 ]

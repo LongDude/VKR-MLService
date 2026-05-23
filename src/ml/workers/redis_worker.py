@@ -63,6 +63,8 @@ class RedisMLWorker:
         )
         self.logger = logger or logging.getLogger(__name__)
         self._stop_requested = False
+        self._current_queue_name: str | None = None
+        self._current_message: dict[str, Any] | None = None
         self.last_processed_message_count = 0
 
     def run_forever(self) -> None:
@@ -227,6 +229,8 @@ class RedisMLWorker:
             extra=task_summary,
         )
         started_at = time.monotonic()
+        self._current_queue_name = queue_name
+        self._current_message = message
         self._emit_worker_event(
             "worker_task_started",
             task_summary,
@@ -236,6 +240,18 @@ class RedisMLWorker:
         )
         try:
             self.task_handler.handle(message)
+        except KeyboardInterrupt as exc:
+            self._rollback_handler_session()
+            self._emit_worker_event(
+                "worker_task_interrupted",
+                task_summary,
+                current=task_summary["item_count"],
+                total=task_summary["item_count"],
+                message="Task interrupted",
+                payload={"error_type": "Interrupt"},
+            )
+            self._handle_task_interrupt(queue_name, message, exc)
+            raise
         except Exception as exc:
             self._emit_worker_event(
                 "worker_task_failed",
@@ -267,6 +283,9 @@ class RedisMLWorker:
                     "elapsed_seconds": elapsed_seconds,
                 },
             )
+        finally:
+            self._current_queue_name = None
+            self._current_message = None
 
     def _split_oversized_message(
         self,
@@ -465,6 +484,50 @@ class RedisMLWorker:
                 "Failed to enqueue failed ML task",
                 extra={"failed_queue": self.failed_queue},
             )
+
+    def _handle_task_interrupt(
+        self,
+        queue_name: str,
+        message: dict[str, Any],
+        exc: KeyboardInterrupt,
+    ) -> None:
+        self.logger.warning(
+            "ML task interrupted",
+            extra={
+                "queue_name": queue_name,
+                "task_type": message.get("task_type"),
+            },
+        )
+        try:
+            self.redis_adapter.enqueue(
+                self.failed_queue,
+                {
+                    "source_queue": queue_name,
+                    "message": message,
+                    "error": {
+                        "code": "Interrupt",
+                        "message": "Task interrupted",
+                        "details": {
+                            "reason": exc.__class__.__name__,
+                            "source_queue": queue_name,
+                        },
+                    },
+                },
+            )
+        except Exception:
+            self.logger.exception(
+                "Failed to enqueue interrupted ML task",
+                extra={"failed_queue": self.failed_queue},
+            )
+
+    def _rollback_handler_session(self) -> None:
+        session = getattr(self.task_handler, "session", None)
+        if session is None:
+            return
+        try:
+            session.rollback()
+        except Exception:
+            self.logger.exception("Failed to rollback interrupted ML task session")
 
     def _error_payload(self, exc: Exception) -> dict:
         if isinstance(exc, AppError):

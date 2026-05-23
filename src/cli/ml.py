@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -137,6 +138,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=50,
         help="Topic page size for recomputation. Defaults to 50.",
+    )
+    trends_parser.add_argument(
+        "--cluster-workers",
+        type=int,
+        default=1,
+        help="Parallel topic cluster recompute workers. Defaults to 1.",
     )
     add_runtime_args(trends_parser)
     add_common_connection_args(trends_parser)
@@ -356,8 +363,11 @@ def run_recompute_trends(args: argparse.Namespace) -> dict[str, Any]:
             "limit": args.limit,
             "batch_size": args.batch_size,
             "force_summary": bool(args.force_summary),
+            "cluster_workers": args.cluster_workers,
         }
         return enqueue_messages(args, CLUSTER_RECOMPUTE_QUEUE, [message])
+    if args.cluster_workers <= 0:
+        raise ValueError("--cluster-workers must be a positive integer.")
 
     database_url = args.database_url or Settings.from_env().database_url
     engine = create_db_engine(database_url, echo=False)
@@ -386,18 +396,36 @@ def run_recompute_trends(args: argparse.Namespace) -> dict[str, Any]:
                 research_cluster_repository=ResearchClusterRepository(session),
                 event_sink=event_sink,
             )
-            result = facade.recompute_all_clusters(
-                date_from=args.date_from,
-                date_to=args.date_to,
-                limit=args.limit,
-                force_summary=args.force_summary,
-                batch_size=args.batch_size,
-            )
+            if args.cluster_workers == 1:
+                result = facade.recompute_all_clusters(
+                    date_from=args.date_from,
+                    date_to=args.date_to,
+                    limit=args.limit,
+                    force_summary=args.force_summary,
+                    batch_size=args.batch_size,
+                )
+            else:
+                topic_ids = list(
+                    facade._iter_topic_ids(
+                        args.date_from,
+                        args.date_to,
+                        args.limit,
+                        args.batch_size,
+                    )
+                )
+                result = recompute_trends_parallel(
+                    topic_ids,
+                    args=args,
+                    session_factory=SessionLocal,
+                    redis_adapter=redis_adapter,
+                    event_sink=event_sink,
+                )
             session.commit()
         return {
             "command": "recompute-trends",
             "date_from": args.date_from,
             "date_to": args.date_to,
+            "cluster_workers": args.cluster_workers,
             "result": result.model_dump(mode="json"),
         }
     finally:
@@ -694,6 +722,81 @@ def recompute_cluster_dynamics_batch(
         "failed": failed,
         "errors": errors,
     }
+
+
+def recompute_trends_parallel(
+    topic_ids: list[int],
+    *,
+    args: argparse.Namespace,
+    session_factory: Any,
+    redis_adapter: RedisAdapter,
+    event_sink: EventSink,
+) -> Any:
+    """Recompute topic clusters concurrently with one DB session per task."""
+    from dto.common import BatchOperationResultDTO
+
+    result = BatchOperationResultDTO(total=len(topic_ids))
+    if not topic_ids:
+        return result
+
+    def run_one(topic_id: int) -> tuple[int, bool, dict[str, Any] | None]:
+        with session_factory() as session:
+            facade = ClusterAnalyticsFacade(
+                taxonomy_repository=TaxonomyRepository(session),
+                paper_repository=PaperRepository(session),
+                paper_graph_repository=PaperGraphRepository(session),
+                qdrant_adapter=build_qdrant_adapter(args),
+                redis_adapter=redis_adapter,
+                summary_facade=SummaryFacade(
+                    chat_adapter=LMStudioChatAdapter(
+                        base_url=args.lmstudio_url
+                        or os.getenv("LMSTUDIO_BASE_URL")
+                        or "http://localhost:1234",
+                    )
+                ),
+                research_cluster_repository=ResearchClusterRepository(session),
+                event_sink=event_sink,
+            )
+            try:
+                facade.recompute_cluster(
+                    f"topic:{topic_id}",
+                    force_summary=args.force_summary,
+                )
+            except AppError as exc:
+                session.rollback()
+                details = exc.details or {}
+                if details.get("reason") in {
+                    "insufficient_indexed_papers",
+                    "no_indexed_vectors",
+                }:
+                    return topic_id, False, None
+                return (
+                    topic_id,
+                    False,
+                    {
+                        "cluster_id": f"topic:{topic_id}",
+                        "topic_id": topic_id,
+                        "code": exc.code,
+                        "message": exc.message,
+                        "details": details,
+                    },
+                )
+            session.commit()
+            return topic_id, True, None
+
+    with ThreadPoolExecutor(max_workers=max(1, args.cluster_workers)) as executor:
+        futures = [executor.submit(run_one, topic_id) for topic_id in topic_ids]
+        for future in as_completed(futures):
+            topic_id, updated, error = future.result()
+            if updated:
+                result.updated += 1
+            elif error is None:
+                result.skipped += 1
+            else:
+                result.failed += 1
+                result.errors.append(error)
+
+    return result
 
 
 def recompute_user_profiles_batch(

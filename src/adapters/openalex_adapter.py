@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import date
 from decimal import Decimal
 from typing import Any
 from urllib.parse import quote
@@ -18,7 +17,6 @@ from dto.external import (
     ExternalKeywordDTO,
     ExternalLandingDTO,
     ExternalPaperDTO,
-    ExternalSearchResultDTO,
     ExternalTopicDTO,
     OpenAlexSearchFiltersDTO,
 )
@@ -55,28 +53,6 @@ class OpenAlexAdapter:
         if payload is None:
             return None
         return self._normalize_work(payload)
-
-    def search_works(
-        self,
-        query: str,
-        filters: OpenAlexSearchFiltersDTO,
-        page: int = 1,
-        per_page: int = 25,
-        sample: int = -1,
-        seed: int = 42,
-    ) -> ExternalSearchResultDTO:
-        params: dict[str, Any] = {"page": page, "per-page": per_page}
-        search_query = query or filters.query
-        if search_query:
-            params["search"] = search_query
-        filter_value = self._build_filter_param(filters)
-        if filter_value:
-            params["filter"] = filter_value
-        if sample >= 0:
-            params["sample"] = sample
-            params["seed"] = seed
-        payload = self._get_json("/works", params=params, allow_not_found=False)
-        return self._normalize_search_result(payload)
 
     def count_works(
         self,
@@ -147,16 +123,6 @@ class OpenAlexAdapter:
             str(next_cursor) if next_cursor else None
         )
 
-    def list_recent_works(
-        self,
-        date_from: date,
-        date_to: date,
-        page: int = 1,
-        per_page: int = 25,
-    ) -> ExternalSearchResultDTO:
-        filters = OpenAlexSearchFiltersDTO(date_from=date_from, date_to=date_to)
-        return self.search_works("", filters, page=page, per_page=per_page)
-
     def _get_json(
         self,
         path: str,
@@ -220,41 +186,6 @@ class OpenAlexAdapter:
             result.setdefault("mailto", self._mailto)
         return result
 
-    def _normalize_search_result(
-        self,
-        payload: dict[str, Any] | list[Any] | None,
-    ) -> ExternalSearchResultDTO:
-        if isinstance(payload, list):
-            results = payload
-            total = len(results)
-        elif isinstance(payload, dict):
-            results = payload.get("results") or payload.get("items") or []
-            meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-            total = (
-                meta.get("count")
-                or payload.get("total")
-                or payload.get("total_count")
-                or len(results)
-            )
-        else:
-            raise ExternalResponseFormatError("OpenAlex/OpenAlex search response is empty")
-
-        if not isinstance(results, list):
-            raise ExternalResponseFormatError(
-                "OpenAlex/OpenAlex search results are not a list"
-            )
-
-        return ExternalSearchResultDTO(
-            source_name="openalex",
-            total=int(total) if isinstance(total, int) else None,
-            items=[
-                self._normalize_work(item)
-                for item in results
-                if isinstance(item, dict)
-            ],
-            raw=payload if isinstance(payload, dict) else {"results": payload},
-        )
-
     def _normalize_work(self, data: dict[str, Any]) -> ExternalPaperDTO:
         authors, institutions_from_authors = self._normalize_authors(data)
         institutions = self._dedupe_institutions(
@@ -281,6 +212,14 @@ class OpenAlexAdapter:
             language=self._string_or_none(data.get("language")),
             is_open_access=self._normalize_open_access(data),
             cited_by_count=self._int_or_none(data.get("cited_by_count")),
+            references_count=self._int_or_none(
+                self._first_present(
+                    data,
+                    "referenced_works_count",
+                    "references_count",
+                    "referencesCount",
+                )
+            ),
             authors=authors,
             institutions=institutions,
             topics=self._normalize_topics(data.get("topics")),
@@ -521,6 +460,12 @@ class OpenAlexAdapter:
         if value is None:
             return None
         return str(value)
+
+    def _first_present(self, data: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in data:
+                return data.get(key)
+        return None
 
     def _int_or_none(self, value: Any) -> int | None:
         if isinstance(value, bool) or value is None:

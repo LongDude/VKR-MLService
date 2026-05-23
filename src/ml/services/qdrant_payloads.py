@@ -19,13 +19,13 @@ class QdrantPayloadBuilder:
             "embedding_model": data.get("embedding_model"),
             "title": data.get("title"),
             "doi": data.get("doi"),
+            "openalex_id": data.get("openalex_id"),
             "publication_year": data.get("publication_year"),
             "publication_date": data.get("publication_date"),
-            "type": data.get("type"),
             "language": data.get("language"),
             "is_open_access": data.get("is_open_access"),
             "cited_by_count": data.get("cited_by_count"),
-            "created_by_user_id": data.get("created_by_user_id"),
+            "references_count": data.get("references_count"),
             "topic_ids": data.get("topic_ids")
             or self._extract_related_ids(topics, "topic_id", "topic"),
             "topic_names": data.get("topic_names")
@@ -39,7 +39,6 @@ class QdrantPayloadBuilder:
             "author_names": data.get("author_names"),
             "institution_ids": data.get("institution_ids"),
             "institution_names": data.get("institution_names"),
-            "external_ids": data.get("external_ids"),
         }
         return self._compact_json_dict(payload)
 
@@ -94,6 +93,7 @@ class QdrantPayloadBuilder:
             "summary": data.get("summary"),
             "status": data.get("status"),
             "source_topic_id": data.get("source_topic_id"),
+            "source_topic_name": data.get("source_topic_name"),
             "paper_count": self._first(data, "paper_count", source=metrics),
             "paper_count_total": data.get("paper_count_total"),
             "paper_count_30d": data.get("paper_count_30d"),
@@ -168,6 +168,7 @@ class QdrantPayloadBuilder:
             "source": data.get("source"),
             "source_counts": data.get("source_counts"),
             "tracked_domain_ids": data.get("tracked_domain_ids"),
+            "tracked_field_ids": data.get("tracked_field_ids"),
             "tracked_subfield_ids": data.get("tracked_subfield_ids"),
             "tracked_topic_ids": data.get("tracked_topic_ids"),
             "tracked_keyword_ids": data.get("tracked_keyword_ids"),

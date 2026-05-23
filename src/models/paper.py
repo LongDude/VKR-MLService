@@ -18,39 +18,14 @@ from sqlalchemy import (
 from sqlalchemy.ext.associationproxy import AssociationProxy, association_proxy
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from .associations import PaperAuthor, PaperKeyword, PaperMetaSource, PaperTopic
+from .associations import PaperAuthor, PaperKeyword, PaperTopic
 from .base import Base
 
 if TYPE_CHECKING:
-    from .analytics import PaperProcessingState
     from .author import Author
     from .keyword import Keyword
     from .topic import Topic
     from .associations import UserFavouritePaper
-    from .user import User
-
-
-class MetaSource(Base):
-    __tablename__ = "meta_sources"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
-    prefix: Mapped[str] = mapped_column(Text, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
-    )
-
-    paper_links: Mapped[list["PaperMetaSource"]] = relationship(
-        back_populates="meta_source", cascade="all, delete-orphan"
-    )
-    papers: AssociationProxy[list["Paper"]] = association_proxy(
-        "paper_links",
-        "paper",
-        creator=lambda paper: PaperMetaSource(paper=paper),
-    )
-
-    def __repr__(self) -> str:
-        return f"MetaSource(id={self.id!r}, name={self.name!r})"
 
 
 class Paper(Base):
@@ -61,22 +36,28 @@ class Paper(Base):
     doi: Mapped[str | None] = mapped_column(Text, unique=True)
     publication_year: Mapped[int | None] = mapped_column(SmallInteger, index=True)
     publication_date: Mapped[date | None] = mapped_column(Date)
-    type: Mapped[str | None] = mapped_column(Text)
     language: Mapped[str | None] = mapped_column(Text)
     abstract: Mapped[str | None] = mapped_column(Text)
     is_open_access: Mapped[bool | None] = mapped_column(Boolean)
     cited_by_count: Mapped[int | None] = mapped_column(
         Integer, server_default=text("0")
     )
-    created_by_user_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("users.id", ondelete="SET NULL")
-    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
-
-    created_by_user: Mapped["User | None"] = relationship(
-        back_populates="created_papers"
+    openalex_id: Mapped[str | None] = mapped_column(Text)
+    references_count: Mapped[int | None] = mapped_column(
+        Integer, server_default=text("0")
+    )
+    text_hash: Mapped[str | None] = mapped_column(Text)
+    is_indexed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+    indexed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
     favourited_by_links: Mapped[list["UserFavouritePaper"]] = relationship(
         back_populates="paper", cascade="all, delete-orphan"
@@ -90,14 +71,8 @@ class Paper(Base):
     keyword_links: Mapped[list["PaperKeyword"]] = relationship(
         back_populates="paper", cascade="all, delete-orphan"
     )
-    meta_source_links: Mapped[list["PaperMetaSource"]] = relationship(
-        back_populates="paper", cascade="all, delete-orphan"
-    )
     landings: Mapped[list["Landing"]] = relationship(
         back_populates="paper", cascade="all, delete-orphan"
-    )
-    processing_state: Mapped["PaperProcessingState | None"] = relationship(
-        back_populates="paper", cascade="all, delete-orphan", uselist=False
     )
     authors: AssociationProxy[list["Author"]] = association_proxy(
         "author_links",
@@ -113,11 +88,6 @@ class Paper(Base):
         "keyword_links",
         "keyword",
         creator=lambda keyword: PaperKeyword(keyword=keyword),
-    )
-    meta_sources: AssociationProxy[list["MetaSource"]] = association_proxy(
-        "meta_source_links",
-        "meta_source",
-        creator=lambda meta_source: PaperMetaSource(meta_source=meta_source),
     )
 
     def __repr__(self) -> str:

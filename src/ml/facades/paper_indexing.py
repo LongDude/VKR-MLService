@@ -22,8 +22,6 @@ from dto.papers import (
 from dto.qdrant import QdrantPointDTO
 from repositories.authors import AuthorRepository
 from repositories.institutions import InstitutionRepository
-from repositories.paper_meta_sources import PaperMetaSourceRepository
-from repositories.paper_processing_states import PaperProcessingStateRepository
 from repositories.papers import PaperRepository
 from repositories.taxonomy import TaxonomyRepository
 from utils.hashing import calculate_text_hash
@@ -53,11 +51,9 @@ class PaperIndexingFacade:
         taxonomy_repository: TaxonomyRepository,
         author_repository: AuthorRepository,
         institution_repository: InstitutionRepository,
-        paper_meta_source_repository: PaperMetaSourceRepository,
         embedding_adapter: LMStudioEmbeddingAdapter,
         qdrant_adapter: QdrantAdapter,
         redis_adapter: RedisAdapter,
-        processing_state_repository: PaperProcessingStateRepository | None = None,
         text_preparation_service: TextPreparationService | None = None,
         payload_builder: QdrantPayloadBuilder | None = None,
         event_sink: EventSink | None = None,
@@ -68,11 +64,6 @@ class PaperIndexingFacade:
         self.taxonomy_repository = taxonomy_repository
         self.author_repository = author_repository
         self.institution_repository = institution_repository
-        self.paper_meta_source_repository = paper_meta_source_repository
-        self.processing_state_repository = (
-            processing_state_repository
-            or PaperProcessingStateRepository(self.paper_repository.session)
-        )
         self.embedding_adapter = embedding_adapter
         self.qdrant_adapter = qdrant_adapter
         self.redis_adapter = redis_adapter
@@ -172,9 +163,6 @@ class PaperIndexingFacade:
 
             authors = self.author_repository.list_by_paper(request.paper_id)
             institution_payload = self._build_institution_payload(authors)
-            external_ids = self.paper_meta_source_repository.list_external_ids(
-                request.paper_id
-            )
 
             payload = self.payload_builder.build_paper_payload(
                 paper,
@@ -204,7 +192,6 @@ class PaperIndexingFacade:
                 ],
                 institution_ids=institution_payload["institution_ids"],
                 institution_names=institution_payload["institution_names"],
-                external_ids=external_ids,
             )
 
             self.qdrant_adapter.upsert_point(
@@ -413,9 +400,6 @@ class PaperIndexingFacade:
         keywords_by_paper = self.taxonomy_repository.list_keywords_by_papers(paper_ids)
         authors_by_paper = self.author_repository.list_by_papers(paper_ids)
         institutions_by_paper = self.institution_repository.list_by_papers(paper_ids)
-        external_ids_by_paper = (
-            self.paper_meta_source_repository.list_external_ids_by_papers(paper_ids)
-        )
         existing_hashes = self._existing_text_hashes(paper_ids, force_reindex)
 
         pending_records: list[dict[str, Any]] = []
@@ -469,7 +453,6 @@ class PaperIndexingFacade:
                     "keyword_values": keyword_values,
                     "authors": authors_by_paper.get(paper_id, []),
                     "institutions": institutions_by_paper.get(paper_id, []),
-                    "external_ids": external_ids_by_paper.get(paper_id, {}),
                 }
             )
 
@@ -588,7 +571,6 @@ class PaperIndexingFacade:
                     for institution in record["institutions"]
                     if getattr(institution, "display_name", None)
                 ],
-                external_ids=record["external_ids"],
             )
             points.append(
                 QdrantPointDTO(
@@ -647,7 +629,7 @@ class PaperIndexingFacade:
     ) -> dict[int, str]:
         if force_reindex or not paper_ids:
             return {}
-        result = self.processing_state_repository.get_indexed_text_hashes(paper_ids)
+        result = self.paper_repository.get_indexed_text_hashes(paper_ids)
         missing_ids = [paper_id for paper_id in paper_ids if paper_id not in result]
         if not missing_ids:
             return result
@@ -675,7 +657,7 @@ class PaperIndexingFacade:
     ) -> bool:
         if force_reindex:
             return False
-        indexed_hashes = self.processing_state_repository.get_indexed_text_hashes(
+        indexed_hashes = self.paper_repository.get_indexed_text_hashes(
             [paper_id]
         )
         if indexed_hashes.get(paper_id) == text_hash:
@@ -695,17 +677,17 @@ class PaperIndexingFacade:
         return points[0].payload.get("text_hash") == text_hash
 
     def _mark_processing_started(self, paper_ids: Iterable[int]) -> None:
-        self.processing_state_repository.mark_indexing_started(paper_ids)
+        self.paper_repository.mark_indexing_started(paper_ids)
 
     def _mark_processing_indexed(self, text_hashes_by_paper_id: dict[int, str]) -> None:
-        self.processing_state_repository.mark_indexed(text_hashes_by_paper_id)
+        self.paper_repository.mark_indexed(text_hashes_by_paper_id)
 
     def _mark_processing_failed(
         self,
         paper_ids: Iterable[int],
         error_message: str,
     ) -> None:
-        self.processing_state_repository.mark_failed(paper_ids, error_message)
+        self.paper_repository.mark_failed(paper_ids, error_message)
 
     def _enqueue_cluster_recompute(
         self,

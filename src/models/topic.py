@@ -9,6 +9,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .associations import (
     PaperTopic,
     UserTrackedDomain,
+    UserTrackedField,
     UserTrackedSubfield,
     UserTrackedTopic,
 )
@@ -57,6 +58,14 @@ class Field(Base):
 
     domain: Mapped["Domain | None"] = relationship(back_populates="fields")
     subfields: Mapped[list["Subfield"]] = relationship(back_populates="field")
+    tracked_by_links: Mapped[list["UserTrackedField"]] = relationship(
+        back_populates="field", cascade="all, delete-orphan"
+    )
+    tracked_by_users: AssociationProxy[list["User"]] = association_proxy(
+        "tracked_by_links",
+        "user",
+        creator=lambda user: UserTrackedField(user=user),
+    )
 
     def __repr__(self) -> str:
         return f"Field(id={self.id!r}, name={self.name!r})"

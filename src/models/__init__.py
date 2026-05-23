@@ -2,10 +2,10 @@ from .associations import (
     AuthorInstitution,
     PaperAuthor,
     PaperKeyword,
-    PaperMetaSource,
     PaperTopic,
     UserFavouritePaper,
     UserTrackedDomain,
+    UserTrackedField,
     UserTrackedKeyword,
     UserTrackedSubfield,
     UserTrackedTopic,
@@ -13,7 +13,6 @@ from .associations import (
 from .analytics import (
     OpenAlexMonthlyTopicStat,
     OpenAlexYearlyTopicStat,
-    PaperProcessingState,
     ResearchCluster,
     ResearchClusterPeriodStat,
 )
@@ -21,7 +20,7 @@ from .author import Author
 from .base import Base
 from .institution import Institution
 from .keyword import Keyword
-from .paper import Landing, MetaSource, Paper
+from .paper import Landing, Paper
 from .topic import Domain, Field, Subfield, Topic
 from .user import User
 
@@ -34,14 +33,11 @@ __all__ = [
     "Institution",
     "Keyword",
     "Landing",
-    "MetaSource",
     "OpenAlexMonthlyTopicStat",
     "OpenAlexYearlyTopicStat",
     "Paper",
     "PaperAuthor",
     "PaperKeyword",
-    "PaperMetaSource",
-    "PaperProcessingState",
     "PaperTopic",
     "ResearchCluster",
     "ResearchClusterPeriodStat",
@@ -50,6 +46,7 @@ __all__ = [
     "User",
     "UserFavouritePaper",
     "UserTrackedDomain",
+    "UserTrackedField",
     "UserTrackedKeyword",
     "UserTrackedSubfield",
     "UserTrackedTopic",

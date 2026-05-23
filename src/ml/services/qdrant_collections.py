@@ -16,10 +16,10 @@ class QdrantCollectionInitializer:
     PAPERS_INDEXES = [
         ("paper_id", "integer"),
         ("doi", "keyword"),
+        ("openalex_id", "keyword"),
         ("publication_year", "integer"),
         ("publication_date", "datetime"),
         ("language", "keyword"),
-        ("type", "keyword"),
         ("is_open_access", "bool"),
         ("domain_ids", "integer"),
         ("field_ids", "integer"),
@@ -27,6 +27,7 @@ class QdrantCollectionInitializer:
         ("topic_ids", "integer"),
         ("keyword_ids", "integer"),
         ("cited_by_count", "integer"),
+        ("references_count", "integer"),
     ]
     RESEARCH_ENTITIES_INDEXES = [
         ("entity_type", "keyword"),

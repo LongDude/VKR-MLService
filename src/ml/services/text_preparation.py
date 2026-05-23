@@ -77,8 +77,11 @@ class TextPreparationService:
                 "content": (
                     "You summarize research clusters. Return only a compact JSON "
                     "object with keys: title, summary, key_methods, "
-                    "key_applications, limitations. Use short strings and arrays "
-                    "of short strings."
+                    "key_applications, limitations. The title must be a semantic "
+                    "research-theme name, 4-8 words, not a comma-separated keyword "
+                    "list. The summary must be 2-4 sentences describing the focus, "
+                    "common methods or approaches, and application context. Use "
+                    "short arrays of short strings for the list fields."
                 ),
             },
             {

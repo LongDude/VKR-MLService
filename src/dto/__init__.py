@@ -25,12 +25,22 @@ from .external import (
     ExternalKeywordDTO,
     ExternalLandingDTO,
     ExternalPaperDTO,
-    ExternalSearchResultDTO,
     ExternalTopicDTO,
     OpenAlexSearchFiltersDTO,
 )
 from .favourites import FavouriteActionResponseDTO, FavouriteListResponseDTO
 from .institutions import InstitutionCreateDTO, InstitutionDTO
+from .openalex import (
+    BatchImportResultDTO,
+    OpenAlexBootstrapReportDTO,
+    OpenAlexBootstrapRequestDTO,
+    OpenAlexBootstrapTopicTargetDTO,
+    OpenAlexLoadPlanDTO,
+    OpenAlexLoadPlanItemDTO,
+    OpenAlexPendingPageDTO,
+    OpenAlexPlanUnitDTO,
+    OpenAlexUnitSummaryDTO,
+)
 from .papers import (
     CachePolicy,
     IndexingStatus,
@@ -56,14 +66,6 @@ from .recommendations import (
     RecommendationResponseDTO,
     RecommendationScoreDetailsDTO,
     UserProfileDTO,
-)
-from .search import (
-    SearchFiltersDTO,
-    SemanticSearchHitDTO,
-    SemanticSearchMLHitDTO,
-    SemanticSearchMLResponseDTO,
-    SemanticSearchRequestDTO,
-    SemanticSearchResponseDTO,
 )
 from .taxonomy import (
     DomainCreateDTO,
@@ -104,6 +106,7 @@ __all__: list[str] = [
     "AuthorCreateDTO",
     "AuthorDTO",
     "BaseDTO",
+    "BatchImportResultDTO",
     "BatchOperationResultDTO",
     "CachePolicy",
     "ChartAxisDTO",
@@ -128,7 +131,6 @@ __all__: list[str] = [
     "ExternalKeywordDTO",
     "ExternalLandingDTO",
     "ExternalPaperDTO",
-    "ExternalSearchResultDTO",
     "ExternalTopicDTO",
     "FavouriteActionResponseDTO",
     "FavouriteListResponseDTO",
@@ -140,6 +142,14 @@ __all__: list[str] = [
     "KeywordCreateDTO",
     "KeywordDTO",
     "OpenAlexSearchFiltersDTO",
+    "OpenAlexBootstrapReportDTO",
+    "OpenAlexBootstrapRequestDTO",
+    "OpenAlexBootstrapTopicTargetDTO",
+    "OpenAlexLoadPlanDTO",
+    "OpenAlexLoadPlanItemDTO",
+    "OpenAlexPendingPageDTO",
+    "OpenAlexPlanUnitDTO",
+    "OpenAlexUnitSummaryDTO",
     "OperationResultDTO",
     "PaginationDTO",
     "PaperAuthorDTO",
@@ -164,12 +174,6 @@ __all__: list[str] = [
     "RecommendationResponseDTO",
     "RecommendationScoreDetailsDTO",
     "RemoveTrackedEntityRequestDTO",
-    "SearchFiltersDTO",
-    "SemanticSearchHitDTO",
-    "SemanticSearchMLHitDTO",
-    "SemanticSearchMLResponseDTO",
-    "SemanticSearchRequestDTO",
-    "SemanticSearchResponseDTO",
     "SortDTO",
     "SubfieldCreateDTO",
     "SubfieldDTO",

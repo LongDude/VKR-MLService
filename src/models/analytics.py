@@ -21,36 +21,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .base import Base
 
 if TYPE_CHECKING:
-    from .paper import Paper
     from .topic import Topic
-
-
-class PaperProcessingState(Base):
-    __tablename__ = "paper_processing_states"
-
-    paper_id: Mapped[int] = mapped_column(
-        BigInteger,
-        ForeignKey("papers.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    text_hash: Mapped[str | None] = mapped_column(Text)
-    embedding_status: Mapped[str] = mapped_column(
-        Text, nullable=False, server_default=text("'pending'")
-    )
-    embedding_error: Mapped[str | None] = mapped_column(Text)
-    qdrant_indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
-    )
-
-    paper: Mapped["Paper"] = relationship(back_populates="processing_state")
-
-    def __repr__(self) -> str:
-        return f"PaperProcessingState(paper_id={self.paper_id!r})"
 
 
 class ResearchCluster(Base):

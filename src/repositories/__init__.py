@@ -6,8 +6,6 @@ from .favourites import FavouriteRepository
 from .graph import PaperGraphRepository
 from .institutions import InstitutionRepository
 from .landings import LandingRepository
-from .paper_meta_sources import PaperMetaSourceRepository
-from .paper_processing_states import PaperProcessingStateRepository
 from .papers import PaperRepository
 from .openalex_topic_stats import OpenAlexTopicMonthlyCount, OpenAlexTopicStatsRepository
 from .openalex_yearly_topic_stats import (
@@ -32,8 +30,6 @@ __all__ = [
     "OpenAlexTopicYearlyCount",
     "OpenAlexYearlyTopicStatsRepository",
     "PaperGraphRepository",
-    "PaperMetaSourceRepository",
-    "PaperProcessingStateRepository",
     "PaperRepository",
     "ResearchClusterRepository",
     "TaxonomyRepository",

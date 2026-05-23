@@ -27,7 +27,6 @@ from models.session import create_db_engine, create_session_factory
 from repositories import (
     AuthorRepository,
     InstitutionRepository,
-    PaperMetaSourceRepository,
     PaperRepository,
     TaxonomyRepository,
 )
@@ -178,7 +177,6 @@ def main(argv: list[str] | None = None) -> int:
                 taxonomy_repository=TaxonomyRepository(session),
                 author_repository=AuthorRepository(session),
                 institution_repository=InstitutionRepository(session),
-                paper_meta_source_repository=PaperMetaSourceRepository(session),
                 embedding_adapter=embedding_adapter,
                 qdrant_adapter=qdrant_adapter,
                 redis_adapter=redis_adapter,

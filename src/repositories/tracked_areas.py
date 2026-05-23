@@ -7,10 +7,12 @@ from sqlalchemy import delete, select
 from dto.tracked import TrackedEntityDTO, UserTrackedEntitiesDTO
 from models import (
     Domain,
+    Field,
     Keyword,
     Subfield,
     Topic,
     UserTrackedDomain,
+    UserTrackedField,
     UserTrackedKeyword,
     UserTrackedSubfield,
     UserTrackedTopic,
@@ -27,6 +29,14 @@ class TrackedAreaRepository(BaseRepository):
     def remove_domain(self, user_id: int, domain_id: int) -> None:
         """Stop tracking a domain for a user idempotently."""
         self._remove(UserTrackedDomain, user_id, domain_id, UserTrackedDomain.domain_id)
+
+    def add_field(self, user_id: int, field_id: int) -> None:
+        """Track a field for a user idempotently."""
+        self._add(UserTrackedField, user_id, field_id, "field_id")
+
+    def remove_field(self, user_id: int, field_id: int) -> None:
+        """Stop tracking a field for a user idempotently."""
+        self._remove(UserTrackedField, user_id, field_id, UserTrackedField.field_id)
 
     def add_subfield(self, user_id: int, subfield_id: int) -> None:
         """Track a subfield for a user idempotently."""
@@ -66,6 +76,10 @@ class TrackedAreaRepository(BaseRepository):
         """List tracked domain ids for a user."""
         return self._list_ids(UserTrackedDomain, user_id, UserTrackedDomain.domain_id)
 
+    def list_field_ids(self, user_id: int) -> list[int]:
+        """List tracked field ids for a user."""
+        return self._list_ids(UserTrackedField, user_id, UserTrackedField.field_id)
+
     def list_subfield_ids(self, user_id: int) -> list[int]:
         """List tracked subfield ids for a user."""
         return self._list_ids(
@@ -94,6 +108,15 @@ class TrackedAreaRepository(BaseRepository):
                 Domain.id,
                 Domain.name,
                 "domain",
+            ),
+            fields=self._list_tracked_entities(
+                user_id,
+                UserTrackedField,
+                Field,
+                UserTrackedField.field_id,
+                Field.id,
+                Field.name,
+                "field",
             ),
             subfields=self._list_tracked_entities(
                 user_id,

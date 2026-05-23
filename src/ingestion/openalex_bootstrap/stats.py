@@ -40,6 +40,8 @@ class OpenAlexMonthlyStatsCollector:
         max_retries: int = 5,
         timeout_seconds: float = 30.0,
         ttl_seconds: int | None = None,
+        api_key: str | None = None,
+        mailto: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         monthly_counts_loader: MonthlyCountsLoader | None = None,
     ) -> None:
@@ -51,6 +53,8 @@ class OpenAlexMonthlyStatsCollector:
         self.max_retries = max(0, max_retries)
         self.timeout_seconds = timeout_seconds
         self.ttl_seconds = ttl_seconds
+        self.api_key = api_key.strip() if api_key and api_key.strip() else None
+        self.mailto = mailto.strip() if mailto and mailto.strip() else None
         self.transport = transport
         self.monthly_counts_loader = monthly_counts_loader or MonthlyCountsLoader()
 
@@ -198,6 +202,7 @@ class OpenAlexMonthlyStatsCollector:
             "per-page": 1,
             "select": "id",
         }
+        params = self._with_auth_params(params)
         requests = 0
         for attempt in range(self.max_retries + 1):
             await self.rate_limiter.acquire()
@@ -305,6 +310,14 @@ class OpenAlexMonthlyStatsCollector:
 
     def _backoff_seconds(self, attempt: int) -> float:
         return min(30.0, 0.5 * (2 ** attempt))
+
+    def _with_auth_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        result = dict(params)
+        if self.api_key:
+            result.setdefault("api_key", self.api_key)
+        if self.mailto:
+            result.setdefault("mailto", self.mailto)
+        return result
 
 
 __all__ = ["OpenAlexMonthlyStatsCollector", "OpenAlexStatsCollectionResult"]

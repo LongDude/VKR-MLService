@@ -118,9 +118,17 @@ class SummaryFacade:
         title = self._fallback_title(keywords)
         keyword_text = ", ".join(keywords[:5])
         if keyword_text:
-            summary = f"The cluster focuses on research related to {keyword_text}."
+            summary = (
+                "This cluster groups papers with a shared technical direction around "
+                f"{keyword_text}. The records should be reviewed with representative "
+                "papers to refine the methods, applications, and limitations."
+            )
         else:
-            summary = "The cluster groups related research papers around a shared trend."
+            summary = (
+                "This cluster groups related research papers around a shared trend. "
+                "Representative papers should be reviewed to identify the dominant "
+                "methods, applications, and limitations."
+            )
         return ClusterSummaryDTO(
             title=title,
             summary=summary,
@@ -203,6 +211,8 @@ class SummaryFacade:
 
     def _fallback_title(self, top_keywords: list[str]) -> str:
         keywords = self._clean_list(top_keywords)
+        if len(keywords) >= 2:
+            return " ".join(keywords[:4])
         return keywords[0] if keywords else "Research trend"
 
     def _fallback_explanation(

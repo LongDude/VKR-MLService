@@ -22,12 +22,12 @@ class PaperCreateDTO(BaseDTO):
     doi: str | None = None
     publication_year: int | None = None
     publication_date: date | None = None
-    type: str | None = None
     language: str | None = None
     abstract: str | None = None
     is_open_access: bool | None = None
     cited_by_count: int | None = 0
-    created_by_user_id: int | None = None
+    openalex_id: str | None = None
+    references_count: int | None = 0
 
 
 class PaperUpdateDTO(BaseDTO):
@@ -35,12 +35,15 @@ class PaperUpdateDTO(BaseDTO):
     doi: str | None = None
     publication_year: int | None = None
     publication_date: date | None = None
-    type: str | None = None
     language: str | None = None
     abstract: str | None = None
     is_open_access: bool | None = None
     cited_by_count: int | None = None
-    created_by_user_id: int | None = None
+    openalex_id: str | None = None
+    references_count: int | None = None
+    text_hash: str | None = None
+    is_indexed: bool | None = None
+    indexed_at: datetime | None = None
 
 
 class PaperShortDTO(BaseDTO):
@@ -49,16 +52,20 @@ class PaperShortDTO(BaseDTO):
     doi: str | None = None
     publication_year: int | None = None
     publication_date: date | None = None
-    type: str | None = None
     language: str | None = None
     is_open_access: bool | None = None
     cited_by_count: int | None = 0
+    openalex_id: str | None = None
+    references_count: int | None = 0
 
 
 class PaperDTO(PaperShortDTO):
     abstract: str | None = None
-    created_by_user_id: int | None = None
     created_at: datetime | None = None
+    updated_at: datetime | None = None
+    text_hash: str | None = None
+    is_indexed: bool = False
+    indexed_at: datetime | None = None
     authors: list[PaperAuthorDTO] = Field(default_factory=list)
     topics: list[PaperTopicDTO] = Field(default_factory=list)
     keywords: list[PaperKeywordDTO] = Field(default_factory=list)

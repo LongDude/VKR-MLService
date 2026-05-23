@@ -23,6 +23,7 @@ from ml.services.vector_math import VectorMathService
 
 FAVOURITE_PAPER_WEIGHT = 0.45
 TRACKED_TOPIC_WEIGHT = 0.25
+TRACKED_FIELD_WEIGHT = 0.10
 TRACKED_SUBFIELD_WEIGHT = 0.15
 TRACKED_KEYWORD_WEIGHT = 0.10
 TRACKED_DOMAIN_WEIGHT = 0.05
@@ -136,6 +137,7 @@ class UserProfileFacade:
             vector_dimension=len(profile_vector),
             source="ml_service",
             tracked_domain_ids=sources["tracked_domain_ids"],
+            tracked_field_ids=sources["tracked_field_ids"],
             tracked_subfield_ids=sources["tracked_subfield_ids"],
             tracked_topic_ids=sources["tracked_topic_ids"],
             tracked_keyword_ids=sources["tracked_keyword_ids"],
@@ -202,6 +204,7 @@ class UserProfileFacade:
         return {
             "favourite_paper_ids": self.favourite_repository.list_paper_ids(user_id),
             "tracked_domain_ids": self.tracked_area_repository.list_domain_ids(user_id),
+            "tracked_field_ids": self.tracked_area_repository.list_field_ids(user_id),
             "tracked_subfield_ids": self.tracked_area_repository.list_subfield_ids(user_id),
             "tracked_topic_ids": self.tracked_area_repository.list_topic_ids(user_id),
             "tracked_keyword_ids": self.tracked_area_repository.list_keyword_ids(user_id),
@@ -218,6 +221,10 @@ class UserProfileFacade:
             "tracked_domains": self._entity_vectors(
                 "domain",
                 sources["tracked_domain_ids"],
+            ),
+            "tracked_fields": self._entity_vectors(
+                "field",
+                sources["tracked_field_ids"],
             ),
             "tracked_subfields": self._entity_vectors(
                 "subfield",
@@ -267,6 +274,7 @@ class UserProfileFacade:
         category_weights = {
             "favourite_papers": FAVOURITE_PAPER_WEIGHT,
             "tracked_topics": TRACKED_TOPIC_WEIGHT,
+            "tracked_fields": TRACKED_FIELD_WEIGHT,
             "tracked_subfields": TRACKED_SUBFIELD_WEIGHT,
             "tracked_keywords": TRACKED_KEYWORD_WEIGHT,
             "tracked_domains": TRACKED_DOMAIN_WEIGHT,

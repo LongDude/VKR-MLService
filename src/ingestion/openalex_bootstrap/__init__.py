@@ -5,8 +5,12 @@ from .dto import (
     BatchImportResultDTO,
     OpenAlexBootstrapReportDTO,
     OpenAlexBootstrapRequestDTO,
+    OpenAlexBootstrapTopicTargetDTO,
     OpenAlexLoadPlanDTO,
     OpenAlexLoadPlanItemDTO,
+    OpenAlexPendingPageDTO,
+    OpenAlexPlanUnitDTO,
+    OpenAlexUnitSummaryDTO,
 )
 from .importer import OpenAlexBatchImporter
 from .load_plan import OpenAlexLoadPlanBuilder
@@ -25,10 +29,14 @@ __all__ = [
     "OpenAlexBootstrapReportDTO",
     "OpenAlexBootstrapRequestDTO",
     "OpenAlexBootstrapRunner",
+    "OpenAlexBootstrapTopicTargetDTO",
     "OpenAlexDownloadResult",
     "OpenAlexLoadPlanBuilder",
     "OpenAlexLoadPlanDTO",
     "OpenAlexLoadPlanItemDTO",
+    "OpenAlexPendingPageDTO",
+    "OpenAlexPlanUnitDTO",
+    "OpenAlexUnitSummaryDTO",
     "OpenAlexMonthlyStatsCollector",
     "OpenAlexStatsCollectionResult",
 ]

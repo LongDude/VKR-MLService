@@ -61,6 +61,11 @@ services:
     networks:
       - ml_network
       - vkr-outer-network
+    deploy:
+      resources:
+        limits:
+          cpus: 4
+          memory: 8G
 
   ml-console:
     build: 

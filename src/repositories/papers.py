@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from datetime import date
+from collections.abc import Iterable
+from datetime import date, datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.exceptions import EntityNotFoundError, InvalidRequestError
 from dto.external import ExternalPaperDTO
 from dto.papers import PaperCreateDTO, PaperUpdateDTO
-from models import MetaSource, Paper, PaperMetaSource
+from models import Paper, PaperTopic, Subfield, Topic
 
 from .base import BaseRepository
 
@@ -31,22 +32,19 @@ class PaperRepository(BaseRepository):
         stmt = select(Paper).where(Paper.doi == doi)
         return self.session.scalar(stmt)
 
+    def get_by_openalex_id(self, openalex_id: str) -> Paper | None:
+        """Return a paper by its OpenAlex id stored on papers.openalex_id."""
+        stmt = select(Paper).where(Paper.openalex_id == openalex_id).limit(1)
+        return self.session.scalar(stmt)
+
     def get_by_external_id(
         self,
         source_name: str,
         external_id: str,
     ) -> Paper | None:
-        """Return a paper linked to an external metadata source id."""
-        stmt = (
-            select(Paper)
-            .join(PaperMetaSource, PaperMetaSource.paper_id == Paper.id)
-            .join(MetaSource, MetaSource.id == PaperMetaSource.meta_source_id)
-            .where(
-                MetaSource.name == source_name,
-                PaperMetaSource.external_id == external_id,
-            )
-        )
-        return self.session.scalar(stmt)
+        """Compatibility wrapper for OpenAlex external id lookup."""
+        self._require_openalex_source(source_name)
+        return self.get_by_openalex_id(external_id)
 
     def get_by_title_normalized(
         self,
@@ -77,13 +75,62 @@ class PaperRepository(BaseRepository):
             stmt = stmt.where(Paper.publication_date <= date_to)
         return int(self.session.scalar(stmt) or 0)
 
+    def count_by_period_and_taxonomy(
+        self,
+        date_from: date | None,
+        date_to: date | None,
+        *,
+        field_ids: list[int] | None = None,
+        subfield_ids: list[int] | None = None,
+    ) -> int:
+        """Return distinct paper count in a period filtered by topic field/subfield."""
+        if not field_ids and not subfield_ids:
+            return self.count_by_period(date_from, date_to)
+        stmt = (
+            select(func.count(func.distinct(Paper.id)))
+            .select_from(Paper)
+            .join(PaperTopic, PaperTopic.paper_id == Paper.id)
+            .join(Topic, Topic.id == PaperTopic.topic_id)
+        )
+        if date_from is not None:
+            stmt = stmt.where(Paper.publication_date >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(Paper.publication_date <= date_to)
+        if subfield_ids:
+            stmt = stmt.where(Topic.subfield_id.in_(sorted(set(subfield_ids))))
+        if field_ids:
+            stmt = stmt.join(Subfield, Subfield.id == Topic.subfield_id).where(
+                Subfield.field_id.in_(sorted(set(field_ids)))
+            )
+        return int(self.session.scalar(stmt) or 0)
+
+    def count_by_period_and_topic(
+        self,
+        date_from: date | None,
+        date_to: date | None,
+        topic_id: int,
+    ) -> int:
+        """Return distinct paper count in a period filtered by topic."""
+        stmt = (
+            select(func.count(func.distinct(Paper.id)))
+            .select_from(Paper)
+            .join(PaperTopic, PaperTopic.paper_id == Paper.id)
+            .where(PaperTopic.topic_id == topic_id)
+        )
+        if date_from is not None:
+            stmt = stmt.where(Paper.publication_date >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(Paper.publication_date <= date_to)
+        return int(self.session.scalar(stmt) or 0)
+
     def existing_external_paper_keys(
         self,
         items: list[ExternalPaperDTO],
         source_name: str = "openalex",
     ) -> set[str]:
         """Return stable external-paper keys that already exist in PostgreSQL."""
-        external_ids = {item.external_id for item in items if item.external_id}
+        self._require_openalex_source(source_name)
+        openalex_ids = {item.external_id for item in items if item.external_id}
         dois = {item.doi for item in items if item.doi}
         title_years = {
             (self._normalize_title(item.title), item.publication_year)
@@ -94,18 +141,11 @@ class PaperRepository(BaseRepository):
         titles_any_year = {title for title, year in title_years if year is None}
         existing: set[str] = set()
 
-        if external_ids:
-            stmt = (
-                select(PaperMetaSource.external_id)
-                .join(MetaSource, MetaSource.id == PaperMetaSource.meta_source_id)
-                .where(
-                    MetaSource.name == source_name,
-                    PaperMetaSource.external_id.in_(external_ids),
-                )
-            )
+        if openalex_ids:
+            stmt = select(Paper.openalex_id).where(Paper.openalex_id.in_(openalex_ids))
             existing.update(
-                f"external:{external_id}"
-                for external_id in self.session.scalars(stmt).all()
+                f"external:{openalex_id}"
+                for openalex_id in self.session.scalars(stmt).all()
             )
 
         if dois:
@@ -131,11 +171,12 @@ class PaperRepository(BaseRepository):
         source_name: str = "openalex",
     ) -> list[int]:
         """Resolve database paper ids for imported external papers."""
+        self._require_openalex_source(source_name)
         paper_ids: list[int] = []
         seen: set[int] = set()
         for item in items:
             paper = (
-                self.get_by_external_id(source_name, item.external_id)
+                self.get_by_openalex_id(item.external_id)
                 if item.external_id
                 else None
             )
@@ -170,88 +211,53 @@ class PaperRepository(BaseRepository):
     def upsert_from_external(
         self,
         data: ExternalPaperDTO,
-        created_by_user_id: int | None = None,
         source_name: str = "openalex",
     ) -> Paper:
-        """Create or update a paper from normalized external data."""
+        """Create or update a paper from normalized OpenAlex data."""
+        self._require_openalex_source(source_name)
         paper = (
-            self.get_by_external_id(source_name, data.external_id)
+            self.get_by_openalex_id(data.external_id)
             if data.external_id
             else None
         )
-        if paper is None:
-            paper = self.get_by_doi(data.doi) if data.doi else None
+        if paper is None and data.doi:
+            paper = self.get_by_doi(data.doi)
         if paper is None:
             paper = self.get_by_title_normalized(data.title, data.publication_year)
 
-        values = {
-            "title": data.title,
-            "doi": data.doi,
-            "publication_year": data.publication_year,
-            "publication_date": data.publication_date,
-            "type": data.type,
-            "language": data.language,
-            "abstract": data.abstract,
-            "is_open_access": data.is_open_access,
-            "cited_by_count": data.cited_by_count,
-        }
-
+        values = self._external_values(data)
         if paper is None:
-            paper = Paper(
-                **values,
-                created_by_user_id=created_by_user_id,
-            )
+            paper = Paper(**values)
             self.session.add(paper)
             return paper
 
-        for field, value in values.items():
-            if value is not None:
-                setattr(paper, field, value)
-        if paper.created_by_user_id is None and created_by_user_id is not None:
-            paper.created_by_user_id = created_by_user_id
+        self._apply_external_values(paper, data)
         return paper
 
     def upsert(
         self,
         data: ExternalPaperDTO,
-        created_by_user_id: int | None = None,
         source_name: str = "openalex",
     ) -> Paper:
-        """Insert or update a paper from an external API paper DTO.
-
-        Matching uses external source id first, DOI second, then normalized title
-        with publication year. Existing rows receive non-null fields from the
-        supplied DTO. The transaction is intentionally not committed here.
-        """
+        """Insert or update a paper from an external API paper DTO."""
         return self.upsert_from_external(
             data,
-            created_by_user_id=created_by_user_id,
             source_name=source_name,
         )
 
     def upsert_bulk(
         self,
         items: list[ExternalPaperDTO],
-        created_by_user_id: int | None = None,
         source_name: str = "openalex",
     ) -> list[Paper]:
-        """Insert or update many external papers and return ORM instances.
-
-        Duplicates inside the batch are collapsed by DOI, external id, or
-        normalized title/year. The session is flushed so ids are available for
-        relationship repositories.
-        """
+        """Insert or update many external papers and return ORM instances."""
+        self._require_openalex_source(source_name)
         deduplicated = list(self._deduplicate_external_papers(items).values())
         if self._is_postgresql():
-            return self._upsert_bulk_postgresql(
-                deduplicated,
-                created_by_user_id=created_by_user_id,
-                source_name=source_name,
-            )
+            return self._upsert_bulk_postgresql(deduplicated)
         papers = [
             self.upsert(
                 item,
-                created_by_user_id=created_by_user_id,
                 source_name=source_name,
             )
             for item in deduplicated
@@ -262,13 +268,11 @@ class PaperRepository(BaseRepository):
     def upsertBulk(
         self,
         items: list[ExternalPaperDTO],
-        created_by_user_id: int | None = None,
         source_name: str = "openalex",
     ) -> list[Paper]:
         """Compatibility wrapper for callers that use camelCase naming."""
         return self.upsert_bulk(
             items,
-            created_by_user_id=created_by_user_id,
             source_name=source_name,
         )
 
@@ -317,6 +321,77 @@ class PaperRepository(BaseRepository):
         )
         return list(self.session.scalars(stmt).all())
 
+    def get_indexed_text_hashes(self, paper_ids: list[int]) -> dict[int, str]:
+        """Return text hashes for papers currently marked as indexed."""
+        if not paper_ids:
+            return {}
+        stmt = select(Paper.id, Paper.text_hash).where(
+            Paper.id.in_(set(paper_ids)),
+            Paper.is_indexed.is_(True),
+            Paper.text_hash.is_not(None),
+        )
+        return {
+            int(paper_id): str(text_hash)
+            for paper_id, text_hash in self.session.execute(stmt)
+            if text_hash
+        }
+
+    def mark_loaded(self, paper_ids: Iterable[int]) -> None:
+        """Mark successfully loaded papers as waiting for embedding/indexing."""
+        unique_ids = self._unique_ids(paper_ids)
+        if not unique_ids:
+            return
+        self._update_papers(
+            unique_ids,
+            is_indexed=False,
+            text_hash=None,
+            updated_at=self._now(),
+        )
+
+    def mark_indexing_started(self, paper_ids: Iterable[int]) -> None:
+        """Mark papers as actively being embedded or indexed."""
+        unique_ids = self._unique_ids(paper_ids)
+        if not unique_ids:
+            return
+        self._update_papers(
+            unique_ids,
+            is_indexed=False,
+            updated_at=self._now(),
+        )
+
+    def mark_indexed(self, text_hashes_by_paper_id: dict[int, str]) -> None:
+        """Mark papers as successfully indexed in Qdrant."""
+        if not text_hashes_by_paper_id:
+            return
+        now = self._now()
+        for paper_id, text_hash in text_hashes_by_paper_id.items():
+            self.session.execute(
+                update(Paper)
+                .where(Paper.id == int(paper_id))
+                .values(
+                    text_hash=text_hash,
+                    is_indexed=True,
+                    indexed_at=now,
+                    updated_at=now,
+                )
+            )
+
+    def mark_failed(
+        self,
+        paper_ids: Iterable[int],
+        error_message: str,
+    ) -> None:
+        """Mark papers whose embedding or Qdrant indexing failed."""
+        _ = error_message
+        unique_ids = self._unique_ids(paper_ids)
+        if not unique_ids:
+            return
+        self._update_papers(
+            unique_ids,
+            is_indexed=False,
+            updated_at=self._now(),
+        )
+
     def _normalize_title(self, title: str) -> str:
         return " ".join(title.strip().lower().split())
 
@@ -327,9 +402,11 @@ class PaperRepository(BaseRepository):
         deduplicated: dict[str, ExternalPaperDTO] = {}
         for item in items:
             key = (
-                item.doi
-                or item.external_id
-                or f"{self._normalize_title(item.title)}:{item.publication_year or ''}"
+                f"external:{item.external_id}"
+                if item.external_id
+                else f"doi:{item.doi}"
+                if item.doi
+                else f"title:{self._normalize_title(item.title)}:{item.publication_year or ''}"
             )
             deduplicated[key] = item
         return deduplicated
@@ -337,38 +414,29 @@ class PaperRepository(BaseRepository):
     def _upsert_bulk_postgresql(
         self,
         items: list[ExternalPaperDTO],
-        *,
-        created_by_user_id: int | None,
-        source_name: str,
     ) -> list[Paper]:
-        existing_by_external = self._papers_by_external_ids(
+        existing_by_openalex = self._papers_by_openalex_ids(
             [item.external_id for item in items if item.external_id],
-            source_name=source_name,
         )
-        with_doi_values: list[dict[str, Any]] = []
+        with_doi_values_by_doi: dict[str, dict[str, Any]] = {}
         fallback_items: list[ExternalPaperDTO] = []
 
         for item in items:
             paper = (
-                existing_by_external.get(item.external_id)
+                existing_by_openalex.get(item.external_id)
                 if item.external_id
                 else None
             )
             if paper is not None:
-                self._apply_external_values(paper, item, created_by_user_id)
+                self._apply_external_values(paper, item)
                 continue
             if item.doi:
-                with_doi_values.append(
-                    {
-                        **self._external_values(item),
-                        "created_by_user_id": created_by_user_id,
-                    }
-                )
+                with_doi_values_by_doi[item.doi] = self._external_values(item)
             else:
                 fallback_items.append(item)
 
-        if with_doi_values:
-            stmt = pg_insert(Paper).values(with_doi_values)
+        if with_doi_values_by_doi:
+            stmt = pg_insert(Paper).values(list(with_doi_values_by_doi.values()))
             self.session.execute(
                 stmt.on_conflict_do_update(
                     index_elements=[Paper.doi],
@@ -382,7 +450,6 @@ class PaperRepository(BaseRepository):
                             stmt.excluded.publication_date,
                             Paper.publication_date,
                         ),
-                        "type": func.coalesce(stmt.excluded.type, Paper.type),
                         "language": func.coalesce(
                             stmt.excluded.language,
                             Paper.language,
@@ -399,30 +466,31 @@ class PaperRepository(BaseRepository):
                             stmt.excluded.cited_by_count,
                             Paper.cited_by_count,
                         ),
-                        "created_by_user_id": func.coalesce(
-                            Paper.created_by_user_id,
-                            stmt.excluded.created_by_user_id,
+                        "openalex_id": func.coalesce(
+                            stmt.excluded.openalex_id,
+                            Paper.openalex_id,
                         ),
+                        "references_count": func.coalesce(
+                            stmt.excluded.references_count,
+                            Paper.references_count,
+                        ),
+                        "updated_at": func.now(),
                     },
                 )
             )
 
         for item in fallback_items:
-            self.upsert_from_external(
-                item,
-                created_by_user_id=created_by_user_id,
-                source_name=source_name,
-            )
+            self.upsert_from_external(item)
 
         self.session.flush()
         papers: list[Paper] = []
         for item in items:
-            paper = self._resolve_external_paper(item, source_name)
+            paper = self._resolve_external_paper(item)
             if paper is None:
                 raise InvalidRequestError(
                     "Paper could not be resolved after conflict-safe upsert",
                     details={
-                        "external_id": item.external_id,
+                        "openalex_id": item.external_id,
                         "doi": item.doi,
                         "title": item.title,
                         "publication_year": item.publication_year,
@@ -431,32 +499,25 @@ class PaperRepository(BaseRepository):
             papers.append(paper)
         return papers
 
-    def _papers_by_external_ids(
+    def _papers_by_openalex_ids(
         self,
-        external_ids: list[str],
-        *,
-        source_name: str,
+        openalex_ids: list[str],
     ) -> dict[str, Paper]:
-        if not external_ids:
+        if not openalex_ids:
             return {}
-        stmt = (
-            select(PaperMetaSource.external_id, Paper)
-            .join(Paper, Paper.id == PaperMetaSource.paper_id)
-            .join(MetaSource, MetaSource.id == PaperMetaSource.meta_source_id)
-            .where(
-                MetaSource.name == source_name,
-                PaperMetaSource.external_id.in_(set(external_ids)),
-            )
-        )
-        return {external_id: paper for external_id, paper in self.session.execute(stmt)}
+        stmt = select(Paper).where(Paper.openalex_id.in_(set(openalex_ids)))
+        return {
+            str(paper.openalex_id): paper
+            for paper in self.session.scalars(stmt)
+            if paper.openalex_id
+        }
 
     def _resolve_external_paper(
         self,
         item: ExternalPaperDTO,
-        source_name: str,
     ) -> Paper | None:
         paper = (
-            self.get_by_external_id(source_name, item.external_id)
+            self.get_by_openalex_id(item.external_id)
             if item.external_id
             else None
         )
@@ -472,32 +533,47 @@ class PaperRepository(BaseRepository):
             "doi": item.doi,
             "publication_year": item.publication_year,
             "publication_date": item.publication_date,
-            "type": item.type,
             "language": item.language,
             "abstract": item.abstract,
             "is_open_access": item.is_open_access,
             "cited_by_count": item.cited_by_count,
+            "openalex_id": item.external_id,
+            "references_count": item.references_count,
         }
 
     def _apply_external_values(
         self,
         paper: Paper,
         item: ExternalPaperDTO,
-        created_by_user_id: int | None,
     ) -> None:
         for field, value in self._external_values(item).items():
             if value is not None:
                 if field == "doi" and not self._can_assign_doi(paper, value):
                     continue
                 setattr(paper, field, value)
-        if paper.created_by_user_id is None and created_by_user_id is not None:
-            paper.created_by_user_id = created_by_user_id
+        paper.updated_at = self._now()
 
     def _can_assign_doi(self, paper: Paper, doi: str) -> bool:
         if paper.doi == doi:
             return True
         existing = self.get_by_doi(doi)
         return existing is None or existing.id == paper.id
+
+    def _update_papers(self, paper_ids: list[int], **values: Any) -> None:
+        self.session.execute(update(Paper).where(Paper.id.in_(paper_ids)).values(**values))
+
+    def _unique_ids(self, paper_ids: Iterable[int]) -> list[int]:
+        return list(dict.fromkeys(int(paper_id) for paper_id in paper_ids))
+
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _require_openalex_source(self, source_name: str) -> None:
+        if source_name.strip().lower() != "openalex":
+            raise InvalidRequestError(
+                "Only OpenAlex paper external ids are stored on papers.openalex_id",
+                details={"source_name": source_name},
+            )
 
 
 __all__ = ["PaperRepository"]

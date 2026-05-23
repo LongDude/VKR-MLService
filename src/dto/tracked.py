@@ -7,7 +7,7 @@ from pydantic import Field
 
 from .common import BaseDTO
 
-TrackedEntityType = Literal["domain", "subfield", "topic", "keyword"]
+TrackedEntityType = Literal["domain", "field", "subfield", "topic", "keyword"]
 
 
 class AddTrackedEntityRequestDTO(BaseDTO):
@@ -30,6 +30,7 @@ class TrackedEntityDTO(BaseDTO):
 class UserTrackedEntitiesDTO(BaseDTO):
     user_id: int
     domains: list[TrackedEntityDTO] = Field(default_factory=list)
+    fields: list[TrackedEntityDTO] = Field(default_factory=list)
     subfields: list[TrackedEntityDTO] = Field(default_factory=list)
     topics: list[TrackedEntityDTO] = Field(default_factory=list)
     keywords: list[TrackedEntityDTO] = Field(default_factory=list)

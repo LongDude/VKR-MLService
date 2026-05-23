@@ -65,7 +65,6 @@ from repositories import (
     FavouriteRepository,
     InstitutionRepository,
     PaperGraphRepository,
-    PaperMetaSourceRepository,
     PaperRepository,
     ResearchClusterRepository,
     TaxonomyRepository,
@@ -166,6 +165,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     run_parser.add_argument(
+        "--cluster-recompute-workers",
+        type=int,
+        default=1,
+        help="Parallel workers inside one cluster recompute batch. Defaults to 1.",
+    )
+    run_parser.add_argument(
         "--max-cluster-task-size",
         type=int,
         default=None,
@@ -246,6 +251,8 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--max-paper-task-size must be a positive integer.")
     if args.cluster_recompute_batch_size <= 0:
         raise ValueError("--cluster-recompute-batch-size must be a positive integer.")
+    if args.cluster_recompute_workers <= 0:
+        raise ValueError("--cluster-recompute-workers must be a positive integer.")
     if args.max_cluster_task_size is not None and args.max_cluster_task_size <= 0:
         raise ValueError("--max-cluster-task-size must be a positive integer.")
     if args.event_ttl_seconds <= 0:
@@ -287,6 +294,17 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 or os.getenv("EMBEDDING_MODEL")
                 or DEFAULT_EMBEDDING_MODEL,
                 event_sink=event_sink,
+                cluster_recompute_workers=args.cluster_recompute_workers,
+                cluster_recompute_pipeline_factory=(
+                    build_cluster_recompute_pipeline_factory(
+                        args=args,
+                        session_factory=SessionLocal,
+                        redis_adapter=redis_adapter,
+                        event_sink=event_sink,
+                    )
+                    if args.cluster_recompute_workers > 1
+                    else None
+                ),
             )
             worker = RedisMLWorker(
                 redis_adapter=redis_adapter,
@@ -337,6 +355,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
             "event_redis": bool(args.event_redis),
             "verbosity": args.verbose,
             "processed": processed,
+            "cluster_recompute_workers": args.cluster_recompute_workers,
         }
     finally:
         engine.dispose()
@@ -351,6 +370,8 @@ def build_task_handler(
     chat_adapter: LMStudioChatAdapter,
     embedding_model: str,
     event_sink: EventSink,
+    cluster_recompute_workers: int = 1,
+    cluster_recompute_pipeline_factory: Any | None = None,
 ) -> MLTaskHandler:
     """Build task handler with all ML pipelines configured."""
     taxonomy_repository = TaxonomyRepository(session)
@@ -365,7 +386,6 @@ def build_task_handler(
             taxonomy_repository=taxonomy_repository,
             author_repository=AuthorRepository(session),
             institution_repository=InstitutionRepository(session),
-            paper_meta_source_repository=PaperMetaSourceRepository(session),
             embedding_adapter=embedding_adapter,
             qdrant_adapter=qdrant_adapter,
             redis_adapter=redis_adapter,
@@ -422,7 +442,42 @@ def build_task_handler(
         cluster_dynamics_pipeline=cluster_dynamics_pipeline,
         user_profile_pipeline=user_profile_pipeline,
         event_sink=event_sink,
+        cluster_recompute_workers=cluster_recompute_workers,
+        cluster_recompute_pipeline_factory=cluster_recompute_pipeline_factory,
     )
+
+
+def build_cluster_recompute_pipeline_factory(
+    *,
+    args: argparse.Namespace,
+    session_factory: Any,
+    redis_adapter: RedisAdapter,
+    event_sink: EventSink,
+) -> Any:
+    """Build isolated cluster recompute pipelines for parallel worker batches."""
+
+    def factory() -> tuple[TrendRecomputePipeline, Any]:
+        session = session_factory()
+        chat_adapter = LMStudioChatAdapter(
+            base_url=args.lmstudio_url
+            or os.getenv("LMSTUDIO_BASE_URL")
+            or "http://localhost:1234",
+        )
+        pipeline = TrendRecomputePipeline(
+            ClusterAnalyticsFacade(
+                taxonomy_repository=TaxonomyRepository(session),
+                paper_repository=PaperRepository(session),
+                paper_graph_repository=PaperGraphRepository(session),
+                qdrant_adapter=build_qdrant_adapter(args),
+                redis_adapter=redis_adapter,
+                summary_facade=SummaryFacade(chat_adapter=chat_adapter),
+                research_cluster_repository=ResearchClusterRepository(session),
+                event_sink=event_sink,
+            )
+        )
+        return pipeline, session
+
+    return factory
 
 
 def run_limited_worker(

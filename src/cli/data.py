@@ -26,10 +26,8 @@ from models import (
     Domain,
     Field,
     Keyword,
-    MetaSource,
     OpenAlexYearlyTopicStat,
     Paper,
-    PaperMetaSource,
     PaperTopic,
     Subfield,
     Topic,
@@ -75,7 +73,6 @@ class LocalDataValidator:
         self._delete_empty_keywords(fixes)
         self._normalize_keyword_values(fixes)
         self._trim_unique_strings(fixes)
-        self._trim_paper_meta_external_ids(fixes)
         return fixes
 
     def _check_papers_empty_title(self) -> dict[str, Any]:
@@ -101,14 +98,10 @@ class LocalDataValidator:
         )
 
     def _check_papers_without_doi_and_external_id(self) -> dict[str, Any]:
-        has_external_id = exists().where(
-            PaperMetaSource.paper_id == Paper.id,
-            self._is_not_blank(PaperMetaSource.external_id),
-        )
         stmt = select(
             Paper.id.label("paper_id"),
             Paper.title.label("title"),
-        ).where(self._is_blank(Paper.doi), ~has_external_id)
+        ).where(self._is_blank(Paper.doi), self._is_blank(Paper.openalex_id))
         return self._query_check(
             "papers_without_doi_and_external_id",
             "Papers without DOI and external_id.",
@@ -200,16 +193,11 @@ class LocalDataValidator:
 
     def _check_duplicate_openalex_external_id(self) -> dict[str, Any]:
         groups: dict[str, list[int]] = defaultdict(list)
-        stmt = (
-            select(PaperMetaSource.paper_id, PaperMetaSource.external_id)
-            .join(MetaSource, PaperMetaSource.meta_source_id == MetaSource.id)
-            .where(
-                func.lower(func.trim(MetaSource.name)) == "openalex",
-                self._is_not_blank(PaperMetaSource.external_id),
-            )
+        stmt = select(Paper.id, Paper.openalex_id).where(
+            self._is_not_blank(Paper.openalex_id),
         )
-        for paper_id, external_id in self.session.execute(stmt):
-            normalized = normalize_external_id(external_id)
+        for paper_id, openalex_id in self.session.execute(stmt):
+            normalized = normalize_external_id(openalex_id)
             if normalized:
                 groups[normalized].append(int(paper_id))
 
@@ -239,13 +227,12 @@ class LocalDataValidator:
     def _trim_non_unique_strings(self, fixes: dict[str, list[dict[str, Any]]]) -> None:
         columns = [
             (Paper, Paper.title, "papers.title"),
-            (Paper, Paper.type, "papers.type"),
             (Paper, Paper.language, "papers.language"),
             (Paper, Paper.abstract, "papers.abstract"),
+            (Paper, Paper.openalex_id, "papers.openalex_id"),
             (Field, Field.name, "fields.name"),
             (Subfield, Subfield.name, "subfields.name"),
             (Topic, Topic.name, "topics.name"),
-            (MetaSource, MetaSource.prefix, "meta_sources.prefix"),
         ]
         for model, column, label in columns:
             result = self.session.execute(
@@ -362,7 +349,6 @@ class LocalDataValidator:
             (Field, Field.id, Field.openalex_id, "fields.openalex_id"),
             (Subfield, Subfield.id, Subfield.openalex_id, "subfields.openalex_id"),
             (Topic, Topic.id, Topic.openalex_id, "topics.openalex_id"),
-            (MetaSource, MetaSource.id, MetaSource.name, "meta_sources.name"),
         ]
         for model, id_column, value_column, label in specs:
             self._apply_unique_string_normalization(
@@ -373,68 +359,6 @@ class LocalDataValidator:
                 normalize=normalize_nullable_trim,
                 action="trim_strings",
                 target=label,
-            )
-
-    def _trim_paper_meta_external_ids(
-        self,
-        fixes: dict[str, list[dict[str, Any]]],
-    ) -> None:
-        rows = list(
-            self.session.execute(
-                select(
-                    PaperMetaSource.paper_id,
-                    PaperMetaSource.meta_source_id,
-                    PaperMetaSource.external_id,
-                )
-            )
-        )
-        groups: dict[tuple[int, str], list[tuple[int, int]]] = defaultdict(list)
-        normalized_by_key: dict[tuple[int, int], str | None] = {}
-
-        for paper_id, meta_source_id, external_id in rows:
-            key = (int(paper_id), int(meta_source_id))
-            normalized = normalize_nullable_trim(external_id)
-            normalized_by_key[key] = normalized
-            if normalized:
-                groups[(int(meta_source_id), normalized)].append(key)
-
-        updated = 0
-        skipped = 0
-        for paper_id, meta_source_id, external_id in rows:
-            row_key = (int(paper_id), int(meta_source_id))
-            normalized = normalized_by_key[row_key]
-            if normalized == external_id:
-                continue
-            if not normalized:
-                skipped += 1
-                continue
-            if len(groups[(int(meta_source_id), normalized)]) > 1:
-                skipped += 1
-                continue
-            self.session.execute(
-                update(PaperMetaSource)
-                .where(
-                    PaperMetaSource.paper_id == int(paper_id),
-                    PaperMetaSource.meta_source_id == int(meta_source_id),
-                )
-                .values(external_id=normalized)
-            )
-            updated += 1
-
-        self._append_applied(
-            fixes,
-            "trim_strings",
-            "paper_meta_sources.external_id",
-            updated,
-        )
-        if skipped:
-            fixes["skipped"].append(
-                {
-                    "action": "trim_strings",
-                    "target": "paper_meta_sources.external_id",
-                    "count": skipped,
-                    "reason": "trimmed external_id would be empty or conflict in source scope",
-                }
             )
 
     def _apply_unique_string_normalization(

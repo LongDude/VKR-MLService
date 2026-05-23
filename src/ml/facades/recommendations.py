@@ -291,7 +291,6 @@ class RecommendationFacade:
             doi=payload.get("doi"),
             publication_year=self._payload_int(payload.get("publication_year")),
             publication_date=self._payload_date(payload.get("publication_date")),
-            type=payload.get("type"),
             language=payload.get("language"),
             is_open_access=payload.get("is_open_access"),
             cited_by_count=self._payload_int(payload.get("cited_by_count")) or 0,
@@ -311,7 +310,6 @@ class RecommendationFacade:
             or self._payload_int(payload.get("publication_year")),
             publication_date=getattr(paper, "publication_date", None)
             or self._payload_date(payload.get("publication_date")),
-            type=getattr(paper, "type", None) or payload.get("type"),
             language=getattr(paper, "language", None) or payload.get("language"),
             is_open_access=getattr(paper, "is_open_access", None)
             if getattr(paper, "is_open_access", None) is not None

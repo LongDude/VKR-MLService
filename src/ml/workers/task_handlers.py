@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from core.exceptions import AppError, InvalidRequestError
 from dto.common import BatchOperationResultDTO, OperationResultDTO
@@ -27,6 +28,8 @@ class MLTaskHandler:
         cluster_dynamics_pipeline: ClusterDynamicsPipeline | None = None,
         user_profile_pipeline: UserProfilePipeline | None = None,
         event_sink: EventSink | None = None,
+        cluster_recompute_workers: int = 1,
+        cluster_recompute_pipeline_factory: Callable[[], tuple[TrendRecomputePipeline, Any]] | None = None,
     ) -> None:
         self.session = session
         self.paper_indexing_pipeline = paper_indexing_pipeline
@@ -35,6 +38,8 @@ class MLTaskHandler:
         self.cluster_dynamics_pipeline = cluster_dynamics_pipeline
         self.user_profile_pipeline = user_profile_pipeline
         self.event_sink = event_sink or NoopEventSink()
+        self.cluster_recompute_workers = max(1, int(cluster_recompute_workers))
+        self.cluster_recompute_pipeline_factory = cluster_recompute_pipeline_factory
 
     def handle(self, message: dict) -> OperationResultDTO:
         try:
@@ -136,6 +141,8 @@ class MLTaskHandler:
         topic_ids = self._topic_ids_from_message(message)
         if topic_ids:
             result = BatchOperationResultDTO(total=len(topic_ids))
+            cluster_workers = self._optional_int(message, "cluster_workers") or self.cluster_recompute_workers
+            cluster_workers = max(1, cluster_workers)
             self._emit(
                 "cluster_batch_started",
                 "cluster_recompute",
@@ -145,34 +152,38 @@ class MLTaskHandler:
                 total=len(topic_ids),
                 message=f"Recomputing {len(topic_ids)} topic clusters",
             )
-            for index, topic_id in enumerate(topic_ids, start=1):
-                cluster_id = f"topic:{topic_id}"
-                try:
-                    pipeline.recompute_cluster(
-                        cluster_id,
+            if cluster_workers == 1:
+                for index, topic_id in enumerate(topic_ids, start=1):
+                    self._recompute_one_topic_cluster(
+                        pipeline,
+                        topic_id,
                         force_summary=force_summary,
+                        result=result,
                     )
-                except Exception as exc:
-                    if self.session is not None:
-                        self.session.rollback()
-                    result.failed += 1
-                    result.errors.append(
-                        self._task_error_payload(cluster_id, exc)
-                    )
-                else:
-                    result.updated += 1
-                self._emit(
-                    "cluster_batch_progress",
-                    "cluster_recompute",
-                    entity_id="worker_batch",
-                    stage="topics",
-                    current=index,
-                    total=len(topic_ids),
-                    message=(
-                        f"topic={topic_id} updated={result.updated} "
-                        f"failed={result.failed}"
-                    ),
-                )
+                    self._emit_cluster_batch_progress(index, len(topic_ids), topic_id, result)
+            else:
+                with ThreadPoolExecutor(max_workers=cluster_workers) as executor:
+                    futures = {
+                        executor.submit(
+                            self._recompute_one_topic_cluster_isolated,
+                            pipeline,
+                            topic_id,
+                            force_summary=force_summary,
+                        ): topic_id
+                        for topic_id in topic_ids
+                    }
+                    for index, future in enumerate(as_completed(futures), start=1):
+                        topic_id = futures[future]
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            result.failed += 1
+                            result.errors.append(
+                                self._task_error_payload(f"topic:{topic_id}", exc)
+                            )
+                        else:
+                            result.updated += 1
+                        self._emit_cluster_batch_progress(index, len(topic_ids), topic_id, result)
             self._emit(
                 "cluster_batch_completed",
                 "cluster_recompute",
@@ -203,6 +214,78 @@ class MLTaskHandler:
             result,
             "All clusters recompute completed",
             task_type="cluster_recompute",
+        )
+
+    def _recompute_one_topic_cluster(
+        self,
+        pipeline: TrendRecomputePipeline,
+        topic_id: int,
+        *,
+        force_summary: bool,
+        result: BatchOperationResultDTO,
+    ) -> None:
+        cluster_id = f"topic:{topic_id}"
+        try:
+            pipeline.recompute_cluster(
+                cluster_id,
+                force_summary=force_summary,
+            )
+        except Exception as exc:
+            if self.session is not None:
+                self.session.rollback()
+            result.failed += 1
+            result.errors.append(self._task_error_payload(cluster_id, exc))
+        else:
+            result.updated += 1
+
+    def _recompute_one_topic_cluster_isolated(
+        self,
+        fallback_pipeline: TrendRecomputePipeline,
+        topic_id: int,
+        *,
+        force_summary: bool,
+    ) -> None:
+        if self.cluster_recompute_pipeline_factory is None:
+            fallback_pipeline.recompute_cluster(
+                f"topic:{topic_id}",
+                force_summary=force_summary,
+            )
+            return
+
+        pipeline, session = self.cluster_recompute_pipeline_factory()
+        try:
+            pipeline.recompute_cluster(
+                f"topic:{topic_id}",
+                force_summary=force_summary,
+            )
+            if session is not None:
+                session.commit()
+        except Exception:
+            if session is not None:
+                session.rollback()
+            raise
+        finally:
+            if session is not None:
+                session.close()
+
+    def _emit_cluster_batch_progress(
+        self,
+        index: int,
+        total: int,
+        topic_id: int,
+        result: BatchOperationResultDTO,
+    ) -> None:
+        self._emit(
+            "cluster_batch_progress",
+            "cluster_recompute",
+            entity_id="worker_batch",
+            stage="topics",
+            current=index,
+            total=total,
+            message=(
+                f"topic={topic_id} updated={result.updated} "
+                f"failed={result.failed}"
+            ),
         )
 
     def _handle_cluster_dynamics_recompute(

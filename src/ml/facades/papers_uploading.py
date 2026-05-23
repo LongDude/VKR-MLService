@@ -17,8 +17,6 @@ from dto.external import (
 from repositories.authors import AuthorRepository
 from repositories.institutions import InstitutionRepository
 from repositories.landings import LandingRepository
-from repositories.paper_meta_sources import PaperMetaSourceRepository
-from repositories.paper_processing_states import PaperProcessingStateRepository
 from repositories.papers import PaperRepository
 from repositories.taxonomy import TaxonomyRepository
 
@@ -33,7 +31,7 @@ class PaperUploaderFacade:
     The facade expands every ``ExternalPaperDTO`` into atomic entities, deduplicates
     each buffer, upserts parent entities before dependent entities, and then
     restores all paper-author, author-institution, paper-topic, paper-keyword,
-    landing, and external-id links. It does not commit the database transaction;
+    and landing links. It does not commit the database transaction;
     the caller owns transaction boundaries.
     """
 
@@ -45,26 +43,18 @@ class PaperUploaderFacade:
         institution_repository: InstitutionRepository,
         taxonomy_repository: TaxonomyRepository,
         landing_repository: LandingRepository,
-        paper_meta_source_repository: PaperMetaSourceRepository,
-        processing_state_repository: PaperProcessingStateRepository | None = None,
         paper_batch_size: int = 100,
         author_batch_size: int = 300,
         institution_batch_size: int = 300,
         taxonomy_batch_size: int = 500,
         landing_batch_size: int = 500,
         source_name: str = "openalex",
-        source_prefix: str = "https://openalex.org/",
     ) -> None:
         self.paper_repository = paper_repository
         self.author_repository = author_repository
         self.institution_repository = institution_repository
         self.taxonomy_repository = taxonomy_repository
         self.landing_repository = landing_repository
-        self.paper_meta_source_repository = paper_meta_source_repository
-        self.processing_state_repository = (
-            processing_state_repository
-            or PaperProcessingStateRepository(self.paper_repository.session)
-        )
         self.paper_batch_size = self._validate_batch_size(
             paper_batch_size,
             "paper_batch_size",
@@ -86,31 +76,17 @@ class PaperUploaderFacade:
             "landing_batch_size",
         )
         self.source_name = source_name
-        self.source_prefix = source_prefix
 
-    def import_one(
-        self,
-        paper: ExternalPaperDTO,
-        *,
-        created_by_user_id: int | None = None,
-    ) -> OperationResultDTO:
+    def import_one(self, paper: ExternalPaperDTO) -> OperationResultDTO:
         """Import one external paper and all nested entities and links."""
-        result = self.import_batch(
-            [paper],
-            created_by_user_id=created_by_user_id,
-        )
+        result = self.import_batch([paper])
         return OperationResultDTO(
             success=result.failed == 0,
             message="External paper import completed",
             details=result.model_dump(mode="json"),
         )
 
-    def import_batch(
-        self,
-        papers: list[ExternalPaperDTO],
-        *,
-        created_by_user_id: int | None = None,
-    ) -> BatchOperationResultDTO:
+    def import_batch(self, papers: list[ExternalPaperDTO]) -> BatchOperationResultDTO:
         """Import external papers in dependency-aware batches.
 
         Papers are processed in chunks of ``paper_batch_size``. Inside every
@@ -125,7 +101,6 @@ class PaperUploaderFacade:
             try:
                 imported_count = self._import_chunk(
                     chunk,
-                    created_by_user_id=created_by_user_id,
                 )
             except AppError as exc:
                 result.failed += len(chunk)
@@ -142,12 +117,7 @@ class PaperUploaderFacade:
             result.skipped += len(chunk) - imported_count
         return result
 
-    def _import_chunk(
-        self,
-        papers: list[ExternalPaperDTO],
-        *,
-        created_by_user_id: int | None,
-    ) -> int:
+    def _import_chunk(self, papers: list[ExternalPaperDTO]) -> int:
         buffers = self._build_buffers(papers)
 
         institutions_by_key = self._upsert_keyed_buffer(
@@ -181,14 +151,9 @@ class PaperUploaderFacade:
             buffers["papers"],
             lambda items: self.paper_repository.upsert_bulk(
                 items,
-                created_by_user_id=created_by_user_id,
                 source_name=self.source_name,
             ),
             self.paper_batch_size,
-        )
-        self._attach_paper_external_ids(
-            buffers["paper_external_ids"],
-            papers_by_key,
         )
         self._upsert_landings(buffers["landings"], papers_by_key)
         self._attach_paper_authors(
@@ -206,7 +171,7 @@ class PaperUploaderFacade:
             papers_by_key,
             keywords_by_key,
         )
-        self.processing_state_repository.mark_loaded(
+        self.paper_repository.mark_loaded(
             paper.id
             for paper in papers_by_key.values()
             if getattr(paper, "id", None) is not None
@@ -222,7 +187,6 @@ class PaperUploaderFacade:
             "topics": {},
             "keywords": {},
             "landings": {},
-            "paper_external_ids": {},
             "author_institution_links": set(),
             "paper_author_links": {},
             "paper_topic_links": {},
@@ -237,8 +201,6 @@ class PaperUploaderFacade:
 
             paper_key = self._paper_key(paper)
             buffers["papers"][paper_key] = paper
-            if paper.external_id:
-                buffers["paper_external_ids"][paper_key] = paper.external_id
 
             for institution in paper.institutions:
                 institution_key = self._institution_key(institution)
@@ -325,23 +287,6 @@ class PaperUploaderFacade:
             if author is not None and institution is not None:
                 pairs.append((author.id, institution.id))
         self.institution_repository.attach_to_author_bulk(pairs)
-
-    def _attach_paper_external_ids(
-        self,
-        external_ids: dict[str, str],
-        papers_by_key: dict[str, Any],
-    ) -> None:
-        pairs: list[tuple[int, str]] = []
-        for paper_key, external_id in external_ids.items():
-            paper = papers_by_key.get(paper_key)
-            if paper is None:
-                continue
-            pairs.append((paper.id, external_id))
-        self.paper_meta_source_repository.attach_external_ids_bulk(
-            pairs,
-            self.source_name,
-            self.source_prefix,
-        )
 
     def _attach_paper_authors(
         self,

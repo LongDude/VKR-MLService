@@ -256,6 +256,11 @@ class ClusterAnalyticsFacade:
 
             existing_cluster = self.get_cluster(cluster_id)
             summary = existing_cluster.summary if existing_cluster is not None else None
+            cluster_name = (
+                existing_cluster.name
+                if existing_cluster is not None and existing_cluster.name
+                else self._topic_name(topic)
+            )
             summary_degraded = False
             if force_summary or not summary:
                 self._emit(
@@ -272,6 +277,8 @@ class ClusterAnalyticsFacade:
                 )
                 summary = cluster_summary.summary
                 summary_degraded = cluster_summary.degraded
+                if not summary_degraded:
+                    cluster_name = cluster_summary.title
                 self._emit(
                     "summary_completed",
                     entity_id=cluster_id,
@@ -288,7 +295,7 @@ class ClusterAnalyticsFacade:
                 id=topic_id,
                 cluster_key=cluster_id,
                 cluster_type="topic",
-                name=self._topic_name(topic),
+                name=cluster_name,
                 summary=summary,
                 status=metrics_payload["status"],
                 source_topic_id=topic_id,
@@ -308,6 +315,7 @@ class ClusterAnalyticsFacade:
                 trend_cluster,
                 cluster_id=cluster_id,
                 **metrics_payload,
+                source_topic_name=self._topic_name(topic),
                 indexed_paper_count=vector_data.indexed_paper_count,
                 vector_retrieve_batch_size=QDRANT_VECTOR_RETRIEVE_BATCH_SIZE,
                 representative_candidate_count=len(vector_data.representative_candidates),

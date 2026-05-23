@@ -20,8 +20,6 @@ def test_all_migration_tables_are_registered() -> None:
         "institutions",
         "paper_authors",
         "author_institutions",
-        "meta_sources",
-        "paper_meta_sources",
         "landings",
         "domains",
         "fields",
@@ -31,17 +29,18 @@ def test_all_migration_tables_are_registered() -> None:
         "keywords",
         "paper_keywords",
         "user_tracked_domains",
+        "user_tracked_fields",
         "user_tracked_keywords",
         "user_tracked_topics",
         "user_tracked_subfields",
-        "paper_processing_states",
         "research_clusters",
         "research_cluster_period_stats",
         "openalex_montly_topic_stats",
+        "openalex_yearly_topic_stats",
     }
 
     assert models is not None
-    assert expected_tables <= set(Base.metadata.tables)
+    assert expected_tables == set(Base.metadata.tables)
 
 
 def test_sqlalchemy_mappers_are_configurable() -> None:
