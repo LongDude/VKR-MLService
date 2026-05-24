@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     command: server /data --console-address ":9001"
     ports:
-      - 9000:9000  # API порт
+      - 9001:9000  # API порт
       - 8083:9001  # Console порт - 
     volumes:
       - minio_data:/data
