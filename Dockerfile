@@ -1,19 +1,27 @@
 FROM python:3.11-slim
-WORKDIR /
 
-# Стандартные утилиты и update
-RUN apt-get update --yes && \
-    apt-get upgrade --yes --no-install-recommends \
-    git wget curl
-# RUN apt-get install --yes --no-install-recommends \
-    # software-properties-common
-
-# Work dependencies
-RUN apt-get update --yes && apt-get install --yes --no-install-recommends \
-    postgresql libpq-dev
-
-# Чистка
-RUN apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/src
 
 WORKDIR /app
+
+RUN apt-get update --yes && \
+    apt-get install --yes --no-install-recommends \
+      build-essential \
+      curl \
+      git \
+      libpq-dev \
+      postgresql-client \
+      wget && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r /app/requirements.txt
+
+COPY . /app
+
+EXPOSE 8000
+
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

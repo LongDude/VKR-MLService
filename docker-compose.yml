@@ -5,14 +5,14 @@ services:
     restart: unless-stopped
     command: server /data --console-address ":9001"
     ports:
-      - 9001:9000  # API порт
-      - 8083:9001  # Console порт - 
+      - 9001:9000
+      - 8083:9001
     volumes:
       - minio_data:/data
       - ./scripts/minio-setup.sh:/etc/minio-setup.sh
     networks:
-      - ml_network # В остальном пусть не мешает
-      - vkr-outer-network # открываем доступ вовне для console
+      - ml_network
+      - vkr-outer-network
 
   redis:
     image: redis:7-alpine
@@ -20,7 +20,7 @@ services:
     restart: unless-stopped
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-redis123}
-    command: ["/bin/sh",  "-c",  "redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru --requirepass \"$${REDIS_PASSWORD:-redis123}\""]
+    command: ["/bin/sh", "-c", "redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru --requirepass \"$${REDIS_PASSWORD:-redis123}\""]
     ports:
       - 6379:6379
     volumes:
@@ -67,12 +67,34 @@ services:
           cpus: 4
           memory: 8G
 
+  vkr-ml-api:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    container_name: vkr-ml-api
+    restart: unless-stopped
+    networks:
+      - ml_network
+      - vkr-inner-network
+      - vkr-outer-network
+    environment:
+      - PYTHONPATH=/app/src
+      - PYTHONUNBUFFERED=1
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-gresP0st}@vkr-database:5432/${POSTGRES_DB:-vkr-db}
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+    volumes:
+      - ./:/app
+    ports:
+      - 8000:8000
+
   ml-console:
-    build: 
+    build:
       context: .
       dockerfile: ./Dockerfile
     container_name: vkr-ml-console
-    restart: unless-stopped
+    profiles: ["console"]
     depends_on:
       redis:
         condition: service_healthy
@@ -85,25 +107,26 @@ services:
     environment:
       - PYTHONPATH=/app/src
       - PYTHONUNBUFFERED=1
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-gresP0st}@vkr-database:5432/${POSTGRES_DB:-vkr-db}
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
     volumes:
       - ./:/app
     stdin_open: true
     tty: true
-    command: ["/bin/bash", "-c", "/app/scripts/update-venv.sh && exec /bin/bash"]
-    ports:
-      - 8000:8000  # FastAPI порт
+    command: ["/bin/bash"]
 
 volumes:
   redis_data:
     name: "vkr-volume-redis"
   minio_data:
-    name: "vkr-volume-minio" 
+    name: "vkr-volume-minio"
   qdrant_data:
     name: "vkr-volume-qdrant"
 
-
 networks:
-  ml_network: # Локальная сеть для данного контейнера
+  ml_network:
     name: vkr-scinside-ml-network
     driver: bridge
     internal: true
