@@ -92,6 +92,7 @@ class TopicAnalyticsFacade:
                 )
                 SELECT
                     m.period_start,
+                    (sc.period_start IS NOT NULL) AS is_observed,
                     COALESCE(tc.topic_count, 0)::bigint AS topic_count,
                     COALESCE(sc.subfield_count, 0)::bigint AS subfield_count
                 FROM months m
@@ -113,6 +114,7 @@ class TopicAnalyticsFacade:
             result.append(
                 {
                     "period_start": row["period_start"],
+                    "is_observed": bool(row["is_observed"]),
                     "topic_count": topic_count,
                     "subfield_count": subfield_count,
                     "share": topic_count / subfield_count if subfield_count > 0 else 0.0,
@@ -121,16 +123,17 @@ class TopicAnalyticsFacade:
         return result
 
     def _forecast(self, rows: list[dict[str, Any]], horizon: int) -> list[TopicForecastPointDTO]:
-        if not rows:
+        observed_rows = [row for row in rows if row.get("is_observed", True)]
+        if not observed_rows:
             return []
         pd = self._import_pandas()
         share_series = pd.Series(
-            [float(row["share"]) for row in rows],
-            index=pd.to_datetime([row["period_start"] for row in rows]),
+            [float(row["share"]) for row in observed_rows],
+            index=pd.to_datetime([row["period_start"] for row in observed_rows]),
         )
         subfield_series = pd.Series(
-            [float(row["subfield_count"]) for row in rows],
-            index=pd.to_datetime([row["period_start"] for row in rows]),
+            [float(row["subfield_count"]) for row in observed_rows],
+            index=pd.to_datetime([row["period_start"] for row in observed_rows]),
         )
         share_forecast = self._forecast_series(share_series, horizon)
         subfield_forecast = self._forecast_series(subfield_series, horizon)
