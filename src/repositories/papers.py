@@ -49,18 +49,6 @@ class PaperRepository(BaseRepository):
         self._require_openalex_source(source_name)
         return self.get_by_openalex_id(external_id)
 
-    def get_by_title_normalized(
-        self,
-        title: str,
-        publication_year: int | None = None,
-    ) -> Paper | None:
-        """Return a paper by normalized title and optional publication year."""
-        normalized = self._normalize_title(title)
-        stmt = select(Paper).where(func.lower(func.trim(Paper.title)) == normalized)
-        if publication_year is not None:
-            stmt = stmt.where(Paper.publication_year == publication_year)
-        return self.session.scalar(stmt.limit(1))
-
     def count_all(self) -> int:
         """Return total paper count."""
         return int(self.session.scalar(select(func.count()).select_from(Paper)) or 0)
@@ -141,15 +129,7 @@ class PaperRepository(BaseRepository):
     ) -> set[str]:
         """Return stable external-paper keys that already exist in PostgreSQL."""
         self._require_openalex_source(source_name)
-        openalex_ids = {item.external_id for item in items if item.external_id}
-        dois = {item.doi for item in items if item.doi}
-        title_years = {
-            (self._normalize_title(item.title), item.publication_year)
-            for item in items
-            if item.title and item.title.strip()
-        }
-        normalized_titles = {title for title, _ in title_years}
-        titles_any_year = {title for title, year in title_years if year is None}
+        openalex_ids = {self._require_external_id(item) for item in items}
         existing: set[str] = set()
 
         if openalex_ids:
@@ -158,21 +138,6 @@ class PaperRepository(BaseRepository):
                 f"external:{openalex_id}"
                 for openalex_id in self.session.scalars(stmt).all()
             )
-
-        if dois:
-            stmt = select(Paper.doi).where(Paper.doi.in_(dois))
-            existing.update(f"doi:{doi}" for doi in self.session.scalars(stmt).all())
-
-        if normalized_titles:
-            stmt = select(Paper.title, Paper.publication_year).where(
-                func.lower(func.trim(Paper.title)).in_(normalized_titles)
-            )
-            for title, publication_year in self.session.execute(stmt):
-                key = (self._normalize_title(title), publication_year)
-                if key in title_years:
-                    existing.add(f"title:{key[0]}:{key[1] or ''}")
-                if key[0] in titles_any_year:
-                    existing.add(f"title:{key[0]}:")
 
         return existing
 
@@ -183,18 +148,12 @@ class PaperRepository(BaseRepository):
     ) -> list[int]:
         """Resolve database paper ids for imported external papers."""
         self._require_openalex_source(source_name)
+        openalex_ids = [self._require_external_id(item) for item in items]
+        papers_by_openalex = self._papers_by_openalex_ids(openalex_ids)
         paper_ids: list[int] = []
         seen: set[int] = set()
-        for item in items:
-            paper = (
-                self.get_by_openalex_id(item.external_id)
-                if item.external_id
-                else None
-            )
-            if paper is None and item.doi:
-                paper = self.get_by_doi(item.doi)
-            if paper is None and item.title:
-                paper = self.get_by_title_normalized(item.title, item.publication_year)
+        for openalex_id in openalex_ids:
+            paper = papers_by_openalex.get(openalex_id)
             if paper is None or paper.id in seen:
                 continue
             paper_ids.append(int(paper.id))
@@ -226,15 +185,8 @@ class PaperRepository(BaseRepository):
     ) -> Paper:
         """Create or update a paper from normalized OpenAlex data."""
         self._require_openalex_source(source_name)
-        paper = (
-            self.get_by_openalex_id(data.external_id)
-            if data.external_id
-            else None
-        )
-        if paper is None and data.doi:
-            paper = self.get_by_doi(data.doi)
-        if paper is None:
-            paper = self.get_by_title_normalized(data.title, data.publication_year)
+        external_id = self._require_external_id(data)
+        paper = self.get_by_openalex_id(external_id)
 
         values = self._external_values(data)
         if paper is None:
@@ -557,13 +509,7 @@ class PaperRepository(BaseRepository):
     ) -> dict[str, ExternalPaperDTO]:
         deduplicated: dict[str, ExternalPaperDTO] = {}
         for item in items:
-            key = (
-                f"external:{item.external_id}"
-                if item.external_id
-                else f"doi:{item.doi}"
-                if item.doi
-                else f"title:{self._normalize_title(item.title)}:{item.publication_year or ''}"
-            )
+            key = f"external:{self._require_external_id(item)}"
             deduplicated[key] = item
         return deduplicated
 
@@ -571,85 +517,63 @@ class PaperRepository(BaseRepository):
         self,
         items: list[ExternalPaperDTO],
     ) -> list[Paper]:
-        existing_by_openalex = self._papers_by_openalex_ids(
-            [item.external_id for item in items if item.external_id],
+        if not items:
+            return []
+
+        openalex_ids = [self._require_external_id(item) for item in items]
+        stmt = pg_insert(Paper).values([self._external_values(item) for item in items])
+        self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[Paper.openalex_id],
+                set_={
+                    "title": stmt.excluded.title,
+                    "doi": func.coalesce(stmt.excluded.doi, Paper.doi),
+                    "publication_year": func.coalesce(
+                        stmt.excluded.publication_year,
+                        Paper.publication_year,
+                    ),
+                    "publication_date": func.coalesce(
+                        stmt.excluded.publication_date,
+                        Paper.publication_date,
+                    ),
+                    "language": func.coalesce(
+                        stmt.excluded.language,
+                        Paper.language,
+                    ),
+                    "abstract": func.coalesce(
+                        stmt.excluded.abstract,
+                        Paper.abstract,
+                    ),
+                    "is_open_access": func.coalesce(
+                        stmt.excluded.is_open_access,
+                        Paper.is_open_access,
+                    ),
+                    "cited_by_count": func.coalesce(
+                        stmt.excluded.cited_by_count,
+                        Paper.cited_by_count,
+                    ),
+                    "references_count": func.coalesce(
+                        stmt.excluded.references_count,
+                        Paper.references_count,
+                    ),
+                    "primary_topic_id": func.coalesce(
+                        stmt.excluded.primary_topic_id,
+                        Paper.primary_topic_id,
+                    ),
+                    "extracted_keywords": func.coalesce(
+                        stmt.excluded.extracted_keywords,
+                        Paper.extracted_keywords,
+                    ),
+                    "updated_at": func.now(),
+                },
+            )
         )
-        with_doi_values_by_doi: dict[str, dict[str, Any]] = {}
-        fallback_items: list[ExternalPaperDTO] = []
-
-        for item in items:
-            paper = (
-                existing_by_openalex.get(item.external_id)
-                if item.external_id
-                else None
-            )
-            if paper is not None:
-                self._apply_external_values(paper, item)
-                continue
-            if item.doi:
-                with_doi_values_by_doi[item.doi] = self._external_values(item)
-            else:
-                fallback_items.append(item)
-
-        if with_doi_values_by_doi:
-            stmt = pg_insert(Paper).values(list(with_doi_values_by_doi.values()))
-            self.session.execute(
-                stmt.on_conflict_do_update(
-                    index_elements=[Paper.doi],
-                    set_={
-                        "title": stmt.excluded.title,
-                        "publication_year": func.coalesce(
-                            stmt.excluded.publication_year,
-                            Paper.publication_year,
-                        ),
-                        "publication_date": func.coalesce(
-                            stmt.excluded.publication_date,
-                            Paper.publication_date,
-                        ),
-                        "language": func.coalesce(
-                            stmt.excluded.language,
-                            Paper.language,
-                        ),
-                        "abstract": func.coalesce(
-                            stmt.excluded.abstract,
-                            Paper.abstract,
-                        ),
-                        "is_open_access": func.coalesce(
-                            stmt.excluded.is_open_access,
-                            Paper.is_open_access,
-                        ),
-                        "cited_by_count": func.coalesce(
-                            stmt.excluded.cited_by_count,
-                            Paper.cited_by_count,
-                        ),
-                        "openalex_id": func.coalesce(
-                            stmt.excluded.openalex_id,
-                            Paper.openalex_id,
-                        ),
-                        "references_count": func.coalesce(
-                            stmt.excluded.references_count,
-                            Paper.references_count,
-                        ),
-                        "primary_topic_id": func.coalesce(
-                            stmt.excluded.primary_topic_id,
-                            Paper.primary_topic_id,
-                        ),
-                        "extracted_keywords": func.coalesce(
-                            stmt.excluded.extracted_keywords,
-                            Paper.extracted_keywords,
-                        ),
-                        "updated_at": func.now(),
-                    },
-                )
-            )
-
-        for item in fallback_items:
-            self.upsert_from_external(item)
 
         self.session.flush()
+        papers_by_openalex = self._papers_by_openalex_ids(openalex_ids)
         papers: list[Paper] = []
-        for item in items:
-            paper = self._resolve_external_paper(item)
+        for item, openalex_id in zip(items, openalex_ids, strict=True):
+            paper = papers_by_openalex.get(openalex_id)
             if paper is None:
                 raise InvalidRequestError(
                     "Paper could not be resolved after conflict-safe upsert",
@@ -675,21 +599,6 @@ class PaperRepository(BaseRepository):
             for paper in self.session.scalars(stmt)
             if paper.openalex_id
         }
-
-    def _resolve_external_paper(
-        self,
-        item: ExternalPaperDTO,
-    ) -> Paper | None:
-        paper = (
-            self.get_by_openalex_id(item.external_id)
-            if item.external_id
-            else None
-        )
-        if paper is None and item.doi:
-            paper = self.get_by_doi(item.doi)
-        if paper is None and item.title:
-            paper = self.get_by_title_normalized(item.title, item.publication_year)
-        return paper
 
     def _external_values(self, item: ExternalPaperDTO) -> dict[str, Any]:
         return {
@@ -724,6 +633,11 @@ class PaperRepository(BaseRepository):
             return True
         existing = self.get_by_doi(doi)
         return existing is None or existing.id == paper.id
+
+    def _require_external_id(self, item: ExternalPaperDTO) -> str:
+        if not item.external_id or not item.external_id.strip():
+            raise InvalidRequestError("OpenAlex paper external_id is required")
+        return item.external_id.strip()
 
     def _update_papers(self, paper_ids: list[int], **values: Any) -> None:
         self.session.execute(update(Paper).where(Paper.id.in_(paper_ids)).values(**values))

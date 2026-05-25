@@ -687,7 +687,8 @@ def build_openalex_bootstrap_request(
         local_subfield_ids=subfield_ids or [],
         batch_size=int(message.get("batch_size") or 500),
         request_workers=int(message.get("request_workers") or 8),
-        db_workers=int(message.get("db_workers") or 2),
+        db_workers=1, #! TEMPORAL PATCH
+        # db_workers=int(message.get("db_workers") or 2),
         rate_limit_rps=float(message.get("rate_limit_rps") or 70.0),
         seed=int(message.get("seed") or 42),
         max_rounds=1,

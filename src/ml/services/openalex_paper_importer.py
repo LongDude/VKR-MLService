@@ -247,23 +247,12 @@ class OpenAlexPaperImporter:
         )
 
     def paper_key(self, paper: ExternalPaperDTO) -> str:
-        if paper.external_id:
-            return f"external:{paper.external_id}"
-        if paper.doi:
-            return f"doi:{paper.doi}"
-        return f"title:{self._normalize_title(paper.title)}:{paper.publication_year or ''}"
+        if not paper.external_id or not paper.external_id.strip():
+            raise ValueError("OpenAlex paper external_id is required")
+        return f"external:{paper.external_id.strip()}"
 
     def paper_keys(self, paper: ExternalPaperDTO) -> set[str]:
-        keys: set[str] = set()
-        if paper.external_id:
-            keys.add(f"external:{paper.external_id}")
-        if paper.doi:
-            keys.add(f"doi:{paper.doi}")
-        if paper.title:
-            keys.add(
-                f"title:{self._normalize_title(paper.title)}:{paper.publication_year or ''}"
-            )
-        return keys
+        return {self.paper_key(paper)}
 
     def _normalize_title(self, title: str) -> str:
         return " ".join(title.strip().lower().split())

@@ -370,24 +370,12 @@ class OpenAlexPapersFacade:
         return payload
 
     def _paper_key(self, paper: ExternalPaperDTO) -> str:
-        if paper.external_id:
-            return f"external:{paper.external_id}"
-        if paper.doi:
-            return f"doi:{paper.doi}"
-        return f"title:{' '.join(paper.title.strip().lower().split())}:{paper.publication_year or ''}"
+        if not paper.external_id or not paper.external_id.strip():
+            raise ValueError("OpenAlex paper external_id is required")
+        return f"external:{paper.external_id.strip()}"
 
     def _paper_keys(self, paper: ExternalPaperDTO) -> set[str]:
-        keys: set[str] = set()
-        if paper.external_id:
-            keys.add(f"external:{paper.external_id}")
-        if paper.doi:
-            keys.add(f"doi:{paper.doi}")
-        if paper.title:
-            keys.add(
-                f"title:{' '.join(paper.title.strip().lower().split())}:"
-                f"{paper.publication_year or ''}"
-            )
-        return keys
+        return {self._paper_key(paper)}
 
 
 __all__ = ["OpenAlexPapersFacade"]
