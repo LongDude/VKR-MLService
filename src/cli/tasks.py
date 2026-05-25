@@ -27,6 +27,7 @@ from ml.workers.redis_worker import (
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
     FAILED_TASKS_QUEUE,
+    OPENALEX_TOPIC_STATS_QUEUE,
     PAPER_INDEXING_QUEUE,
     TOPIC_QUARTER_REPORT_QUEUE,
 )
@@ -277,6 +278,213 @@ class TopicQuarterReportTaskEnqueuer:
         }
 
 
+class OpenAlexTopicStatsTaskEnqueuer:
+    """Create high-priority Redis tasks for OpenAlex topic stats collection."""
+
+    def __init__(
+        self,
+        *,
+        redis_adapter: RedisAdapter | None,
+        queue_name: str = OPENALEX_TOPIC_STATS_QUEUE,
+    ) -> None:
+        self.redis_adapter = redis_adapter
+        self.queue_name = queue_name
+
+    def enqueue(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        topic_ids: list[int] | None = None,
+        field_ids: list[int] | None = None,
+        subfield_ids: list[int] | None = None,
+        taxonomy_scope: str = "topic",
+        languages: list[str] | None = None,
+        types: list[str] | None = None,
+        batch_size: int = 500,
+        task_batch_size: int = 100,
+        request_workers: int = 8,
+        rate_limit_rps: float = 10.0,
+        max_retries: int = 5,
+        group_by_page_size: int = 200,
+        normalize_january_first: bool = True,
+        primary_topic_only: bool = True,
+        openalex_url: str | None = None,
+        openalex_api_key: str | None = None,
+        openalex_mailto: str | None = None,
+        dry_run: bool = False,
+        show_progress: bool = True,
+    ) -> dict[str, Any]:
+        """Build collect-topic-stats worker messages and optionally enqueue them."""
+        self._validate(
+            date_from=date_from,
+            date_to=date_to,
+            topic_ids=topic_ids,
+            field_ids=field_ids,
+            subfield_ids=subfield_ids,
+            taxonomy_scope=taxonomy_scope,
+            batch_size=batch_size,
+            task_batch_size=task_batch_size,
+            request_workers=request_workers,
+            rate_limit_rps=rate_limit_rps,
+            max_retries=max_retries,
+            group_by_page_size=group_by_page_size,
+        )
+        messages = self._messages(
+            date_from=date_from,
+            date_to=date_to,
+            topic_ids=topic_ids or [],
+            field_ids=field_ids or [],
+            subfield_ids=subfield_ids or [],
+            taxonomy_scope=taxonomy_scope,
+            languages=languages or ["en", "ru"],
+            types=types or ["article"],
+            batch_size=batch_size,
+            task_batch_size=task_batch_size,
+            request_workers=request_workers,
+            rate_limit_rps=rate_limit_rps,
+            max_retries=max_retries,
+            group_by_page_size=group_by_page_size,
+            normalize_january_first=normalize_january_first,
+            primary_topic_only=primary_topic_only,
+            openalex_url=openalex_url,
+            openalex_api_key=openalex_api_key,
+            openalex_mailto=openalex_mailto,
+            show_progress=show_progress,
+        )
+        if not dry_run:
+            if self.redis_adapter is None:
+                raise ValueError("Redis adapter is required unless --dry-run is used.")
+            progress = None
+            if show_progress:
+                from tqdm.auto import tqdm
+
+                progress = tqdm(total=len(messages), desc="Enqueue topic stats", unit="task")
+            try:
+                for message in messages:
+                    self.redis_adapter.enqueue(self.queue_name, message)
+                    if progress is not None:
+                        progress.update(1)
+            finally:
+                if progress is not None:
+                    progress.close()
+        return {
+            "queue": self.queue_name,
+            "priority": "max",
+            "dry_run": dry_run,
+            "taxonomy_scope": taxonomy_scope,
+            "topic_count": len(set(topic_ids or [])),
+            "field_ids": sorted(set(field_ids or [])),
+            "subfield_ids": sorted(set(subfield_ids or [])),
+            "messages": len(messages),
+            "task_batch_size": task_batch_size,
+            "date_from": date_from,
+            "date_to": date_to,
+            "sample": messages[:3],
+        }
+
+    def _messages(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        topic_ids: list[int],
+        field_ids: list[int],
+        subfield_ids: list[int],
+        taxonomy_scope: str,
+        languages: list[str],
+        types: list[str],
+        batch_size: int,
+        task_batch_size: int,
+        request_workers: int,
+        rate_limit_rps: float,
+        max_retries: int,
+        group_by_page_size: int,
+        normalize_january_first: bool,
+        primary_topic_only: bool,
+        openalex_url: str | None,
+        openalex_api_key: str | None,
+        openalex_mailto: str | None,
+        show_progress: bool,
+    ) -> list[dict[str, Any]]:
+        base = {
+            "task_type": "collect_topic_stats",
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "taxonomy_scope": taxonomy_scope,
+            "languages": languages,
+            "types": types,
+            "batch_size": batch_size,
+            "request_workers": request_workers,
+            "rate_limit_rps": rate_limit_rps,
+            "max_retries": max_retries,
+            "group_by_page_size": group_by_page_size,
+            "normalize_january_first": bool(normalize_january_first),
+            "primary_topic_only": bool(primary_topic_only),
+            "show_progress": bool(show_progress),
+            **({"openalex_url": openalex_url} if openalex_url else {}),
+            **({"openalex_api_key": openalex_api_key} if openalex_api_key else {}),
+            **({"openalex_mailto": openalex_mailto} if openalex_mailto else {}),
+        }
+        if taxonomy_scope == "topic":
+            return [
+                {
+                    **base,
+                    "topic_ids": chunk,
+                }
+                for chunk in chunked(topic_ids, task_batch_size)
+            ]
+        return [
+            {
+                **base,
+                **({"field_ids": field_ids} if field_ids else {}),
+                **({"subfield_ids": subfield_ids} if subfield_ids else {}),
+            }
+        ]
+
+    def _validate(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        topic_ids: list[int] | None,
+        field_ids: list[int] | None,
+        subfield_ids: list[int] | None,
+        taxonomy_scope: str,
+        batch_size: int,
+        task_batch_size: int,
+        request_workers: int,
+        rate_limit_rps: float,
+        max_retries: int,
+        group_by_page_size: int,
+    ) -> None:
+        if date_from > date_to:
+            raise ValueError("--date-from must be before or equal to --date-to.")
+        if taxonomy_scope not in {"topic", "field", "subfield"}:
+            raise ValueError("--taxonomy-scope must be one of: topic, field, subfield.")
+        if batch_size <= 0 or batch_size > 500:
+            raise ValueError("--batch-size must be between 1 and 500.")
+        if task_batch_size <= 0:
+            raise ValueError("--task-batch-size must be a positive integer.")
+        if request_workers <= 0:
+            raise ValueError("--request-workers must be a positive integer.")
+        if rate_limit_rps <= 0:
+            raise ValueError("--rate-limit-rps must be positive.")
+        if max_retries < 0:
+            raise ValueError("--max-retries must be non-negative.")
+        if group_by_page_size <= 0 or group_by_page_size > 200:
+            raise ValueError("--group-by-page-size must be between 1 and 200.")
+        scopes = sum(bool(value) for value in (topic_ids, field_ids, subfield_ids))
+        if scopes != 1:
+            raise ValueError("Provide exactly one of --topic-ids, --field-ids, --subfield-ids.")
+        if taxonomy_scope == "topic" and not topic_ids:
+            raise ValueError("--taxonomy-scope topic requires --topic-ids.")
+        if taxonomy_scope == "field" and not field_ids:
+            raise ValueError("--taxonomy-scope field requires --field-ids.")
+        if taxonomy_scope == "subfield" and not subfield_ids:
+            raise ValueError("--taxonomy-scope subfield requires --subfield-ids.")
+
+
 class PaperIndexingTaskEnqueuer:
     """Create Redis paper indexing tasks without running embedding generation."""
 
@@ -442,6 +650,137 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_database_args(enqueue_parser)
     add_redis_args(enqueue_parser)
     add_qdrant_args(enqueue_parser)
+
+    stats_parser = subparsers.add_parser(
+        "enqueue-topic-stats",
+        aliases=["enqueue-collect-topic-stats"],
+        help="Enqueue high-priority OpenAlex collect-topic-stats worker tasks.",
+    )
+    stats_scope = stats_parser.add_mutually_exclusive_group(required=True)
+    stats_scope.add_argument(
+        "--topic-ids",
+        default=None,
+        help="Comma-separated local topic ids to collect with taxonomy-scope topic.",
+    )
+    stats_scope.add_argument(
+        "--field-ids",
+        default=None,
+        help="Comma-separated local field ids to collect with taxonomy-scope field.",
+    )
+    stats_scope.add_argument(
+        "--subfield-ids",
+        default=None,
+        help="Comma-separated local subfield ids to collect with taxonomy-scope subfield.",
+    )
+    stats_parser.add_argument(
+        "--date-from",
+        type=parse_iso_date,
+        required=True,
+        help="Publication period lower bound in YYYY-MM-DD format.",
+    )
+    stats_parser.add_argument(
+        "--date-to",
+        type=parse_iso_date,
+        required=True,
+        help="Publication period upper bound in YYYY-MM-DD format.",
+    )
+    stats_parser.add_argument(
+        "--taxonomy-scope",
+        choices=["topic", "field", "subfield"],
+        default=None,
+        help="OpenAlex collection strategy. Defaults to the provided id scope.",
+    )
+    stats_parser.add_argument(
+        "--languages",
+        default="en,ru",
+        help="Comma-separated OpenAlex languages. Defaults to en,ru.",
+    )
+    stats_parser.add_argument(
+        "--types",
+        default="article",
+        help="Comma-separated OpenAlex work types. Defaults to article.",
+    )
+    stats_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="PostgreSQL upsert batch size used by worker. Defaults to 500.",
+    )
+    stats_parser.add_argument(
+        "--task-batch-size",
+        type=int,
+        default=100,
+        help="Maximum topic ids per Redis task for topic scope. Defaults to 100.",
+    )
+    stats_parser.add_argument(
+        "--request-workers",
+        type=int,
+        default=8,
+        help="Concurrent OpenAlex request workers used by worker. Defaults to 8.",
+    )
+    stats_parser.add_argument(
+        "--rate-limit-rps",
+        type=float,
+        default=10.0,
+        help="OpenAlex request rate used by worker. Defaults to 10.",
+    )
+    stats_parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="Retries for rate-limit/service/network errors. Defaults to 5.",
+    )
+    stats_parser.add_argument(
+        "--group-by-page-size",
+        type=int,
+        default=200,
+        help="OpenAlex group_by page size for field/subfield scope, max 200.",
+    )
+    stats_parser.add_argument(
+        "--normalize-january-first",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Estimate and remove January-1 artificial publication dates. "
+            "Enabled by default; use --no-normalize-january-first to disable."
+        ),
+    )
+    stats_parser.add_argument(
+        "--primary-topic-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use primary_topic.id instead of topics.id filter. "
+            "Enabled by default; use --no-primary-topic-only to disable."
+        ),
+    )
+    stats_parser.add_argument(
+        "--openalex-url",
+        default=None,
+        help="OpenAlex base URL. Defaults to worker OPENALEX_BASE_URL.",
+    )
+    stats_parser.add_argument(
+        "--openalex-api-key",
+        default=None,
+        help="OpenAlex API key stored in task. Defaults to worker OPENALEX_API_KEY.",
+    )
+    stats_parser.add_argument(
+        "--openalex-mailto",
+        default=None,
+        help="OpenAlex polite-pool email stored in task. Defaults to worker OPENALEX_MAILTO.",
+    )
+    stats_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview messages without modifying Redis.",
+    )
+    stats_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable enqueue progress bar and worker task progress.",
+    )
+    add_database_args(stats_parser)
+    add_redis_args(stats_parser)
 
     cluster_parser = subparsers.add_parser(
         "enqueue-cluster-recompute",
@@ -686,6 +1025,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "enqueue-indexing":
             payload = run_enqueue_indexing(args)
+        elif args.command in {"enqueue-topic-stats", "enqueue-collect-topic-stats"}:
+            payload = run_enqueue_topic_stats_collection(args)
         elif args.command == "enqueue-cluster-recompute":
             payload = run_enqueue_cluster_recompute(args)
         elif args.command == "enqueue-cluster-dynamics":
@@ -758,6 +1099,44 @@ def run_enqueue_indexing(args: argparse.Namespace) -> dict[str, Any]:
         "date_from": args.date_from,
         "date_to": args.date_to,
         "paper_ids_file": args.paper_ids,
+        "result": result,
+    }
+
+
+def run_enqueue_topic_stats_collection(args: argparse.Namespace) -> dict[str, Any]:
+    """Enqueue OpenAlex topic publication stats collection tasks."""
+    taxonomy_scope = resolve_topic_stats_taxonomy_scope(args)
+    topic_ids = parse_int_csv_arg(args.topic_ids) if args.topic_ids else None
+    field_ids = parse_int_csv_arg(args.field_ids) if args.field_ids else None
+    subfield_ids = parse_int_csv_arg(args.subfield_ids) if args.subfield_ids else None
+    redis_adapter = None if args.dry_run else RedisAdapter(build_redis_client(args))
+    result = OpenAlexTopicStatsTaskEnqueuer(
+        redis_adapter=redis_adapter,
+    ).enqueue(
+        date_from=args.date_from,
+        date_to=args.date_to,
+        topic_ids=topic_ids,
+        field_ids=field_ids,
+        subfield_ids=subfield_ids,
+        taxonomy_scope=taxonomy_scope,
+        languages=parse_csv_arg(args.languages),
+        types=parse_csv_arg(args.types),
+        batch_size=args.batch_size,
+        task_batch_size=args.task_batch_size,
+        request_workers=args.request_workers,
+        rate_limit_rps=args.rate_limit_rps,
+        max_retries=args.max_retries,
+        group_by_page_size=args.group_by_page_size,
+        normalize_january_first=bool(args.normalize_january_first),
+        primary_topic_only=bool(args.primary_topic_only),
+        openalex_url=args.openalex_url,
+        openalex_api_key=args.openalex_api_key,
+        openalex_mailto=args.openalex_mailto,
+        dry_run=bool(args.dry_run),
+        show_progress=not args.no_progress,
+    )
+    return {
+        "command": "enqueue-topic-stats",
         "result": result,
     }
 
@@ -858,6 +1237,17 @@ def run_enqueue_topic_reports(args: argparse.Namespace) -> dict[str, Any]:
 def resolve_report_topic_ids(args: argparse.Namespace) -> list[int]:
     """Resolve topic ids for topic report task enqueueing."""
     return resolve_topic_ids_for_scope(args)
+
+
+def resolve_topic_stats_taxonomy_scope(args: argparse.Namespace) -> str:
+    """Infer collect-topic-stats taxonomy scope from CLI arguments."""
+    if args.taxonomy_scope:
+        return str(args.taxonomy_scope)
+    if args.field_ids:
+        return "field"
+    if args.subfield_ids:
+        return "subfield"
+    return "topic"
 
 
 def resolve_topic_ids_for_scope(args: argparse.Namespace) -> list[int]:

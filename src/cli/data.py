@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from calendar import monthrange
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
@@ -21,22 +22,29 @@ PROJECT_DIR = SRC_DIR.parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from adapters.redis_adapter import RedisAdapter
 from core.config import Settings
 from models import (
     Domain,
     Field,
     Keyword,
+    OpenAlexMonthlyTopicStat,
     OpenAlexYearlyTopicStat,
     Paper,
     PaperTopic,
+    ResearchCluster,
+    ResearchClusterPeriodStat,
     Subfield,
     Topic,
+    TopicQuarterReport,
 )
 from models.session import create_db_engine, create_session_factory
+from ml.services.quarter_periods import QuarterPeriodService
 from repositories.openalex_yearly_topic_stats import OpenAlexYearlyTopicStatsRepository
 
 
 SAMPLE_LIMIT = 20
+OPENALEX_TOPIC_STATS_QUEUE = "queue:openalex_topic_stats"
 
 
 class LocalDataValidator:
@@ -457,6 +465,415 @@ class LocalDataValidator:
         )
 
 
+class DataCoverageAnalyzer:
+    """Analyze database coverage for topic statistics, samples, and reports."""
+
+    def __init__(self, session: Session, *, sample_limit: int = SAMPLE_LIMIT) -> None:
+        self.session = session
+        self.sample_limit = max(0, sample_limit)
+
+    def analyze(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        field_ids: list[int] | None = None,
+        topic_ids: list[int] | None = None,
+        include_missing_topic_ids: bool = False,
+    ) -> dict[str, Any]:
+        """Return a coverage report for selected fields or topics."""
+        if date_from > date_to:
+            raise ValueError("--date-from must be before or equal to --date-to.")
+        if field_ids and topic_ids:
+            raise ValueError("--field-ids and --topic-ids are mutually exclusive.")
+
+        requested_topic_ids = sorted(set(topic_ids or []))
+        topics = self._load_topics(field_ids=field_ids, topic_ids=topic_ids)
+        if not topics:
+            raise ValueError("No topics found for selected coverage scope.")
+
+        months = self._month_periods(date_from, date_to)
+        quarters = [
+            {
+                "key": quarter.key,
+                "date_from": quarter.date_from,
+                "date_to": quarter.date_to,
+            }
+            for quarter in QuarterPeriodService().quarter_periods(date_from, date_to)
+        ]
+        topic_ids = [int(topic["topic_id"]) for topic in topics]
+
+        publication_stats = self._publication_stats_coverage(
+            topics,
+            months,
+            include_missing_topic_ids=include_missing_topic_ids,
+        )
+        samples = self._sample_coverage(topics, months)
+        cluster_dynamics = self._cluster_dynamics_coverage(topics, months)
+        quarter_reports = self._quarter_report_coverage(topics, quarters)
+
+        return {
+            "command": "analyze-coverage",
+            "date_from": date_from,
+            "date_to": date_to,
+            "normalized_month_from": months[0]["date_from"] if months else None,
+            "normalized_month_to": months[-1]["date_to"] if months else None,
+            "scope": {
+                "type": "topic"
+                if requested_topic_ids
+                else "field"
+                if field_ids
+                else "all",
+                "field_ids": sorted(set(field_ids or [])),
+                "topic_ids": sorted(set(topic_ids)),
+                "topics_count": len(topics),
+                "fields": self._field_summary(topics),
+            },
+            "summary": {
+                "months": len(months),
+                "quarters": len(quarters),
+                "publication_stats_missing": publication_stats["missing_topic_periods"],
+                "sample_missing": samples["missing_topic_periods"],
+                "sample_empty_months": len(samples["empty_periods"]),
+                "cluster_dynamics_missing": cluster_dynamics["missing_topic_periods"],
+                "quarter_reports_missing": quarter_reports["missing_topic_periods"],
+            },
+            "checks": {
+                "publication_stats": publication_stats,
+                "samples": samples,
+                "cluster_dynamics": cluster_dynamics,
+                "quarter_reports": quarter_reports,
+            },
+        }
+
+    def _publication_stats_coverage(
+        self,
+        topics: list[dict[str, Any]],
+        months: list[dict[str, Any]],
+        *,
+        include_missing_topic_ids: bool = False,
+    ) -> dict[str, Any]:
+        topic_ids = [int(topic["topic_id"]) for topic in topics]
+        month_starts = [period["date_from"] for period in months]
+        existing: set[tuple[int, str]] = set()
+        if topic_ids and month_starts:
+            stmt = select(
+                OpenAlexMonthlyTopicStat.topic_id,
+                OpenAlexMonthlyTopicStat.period_start,
+            ).where(
+                OpenAlexMonthlyTopicStat.topic_id.in_(topic_ids),
+                OpenAlexMonthlyTopicStat.period_start.in_(month_starts),
+            )
+            existing = {
+                (int(topic_id), self._month_key(period_start))
+                for topic_id, period_start in self.session.execute(stmt)
+                if topic_id is not None
+            }
+        return self._topic_period_coverage(
+            code="publication_stats",
+            description="OpenAlex monthly publication statistics coverage.",
+            period_unit="month",
+            topics=topics,
+            periods=months,
+            existing=existing,
+            include_missing_topic_ids=include_missing_topic_ids,
+        )
+
+    def _sample_coverage(
+        self,
+        topics: list[dict[str, Any]],
+        months: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        topic_ids = [int(topic["topic_id"]) for topic in topics]
+        counts = self._load_sample_counts(topic_ids, months)
+        existing = {key for key, count in counts.items() if count > 0}
+        coverage = self._topic_period_coverage(
+            code="samples",
+            description="Local paper sample coverage by publication month.",
+            period_unit="month",
+            topics=topics,
+            periods=months,
+            existing=existing,
+        )
+        coverage["empty_periods"] = [
+            {
+                "period": period["key"],
+                "period_start": period["date_from"],
+                "period_end": period["date_to"],
+                "sample_count": 0,
+            }
+            for period in months
+            if sum(counts.get((int(topic["topic_id"]), period["key"]), 0) for topic in topics)
+            == 0
+        ]
+        return coverage
+
+    def _cluster_dynamics_coverage(
+        self,
+        topics: list[dict[str, Any]],
+        months: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        topic_ids = [int(topic["topic_id"]) for topic in topics]
+        cluster_keys = [f"topic:{topic_id}" for topic_id in topic_ids]
+        month_starts = [period["date_from"] for period in months]
+        existing: set[tuple[int, str]] = set()
+        if cluster_keys and month_starts:
+            stmt = (
+                select(
+                    ResearchCluster.cluster_key,
+                    ResearchCluster.source_topic_id,
+                    ResearchClusterPeriodStat.period_start,
+                )
+                .join(
+                    ResearchClusterPeriodStat,
+                    ResearchClusterPeriodStat.cluster_id == ResearchCluster.id,
+                )
+                .where(
+                    ResearchCluster.cluster_key.in_(cluster_keys),
+                    ResearchClusterPeriodStat.period_start.in_(month_starts),
+                )
+            )
+            for cluster_key, source_topic_id, period_start in self.session.execute(stmt):
+                topic_id = (
+                    int(source_topic_id)
+                    if source_topic_id is not None
+                    else self._topic_id_from_cluster_key(str(cluster_key))
+                )
+                if topic_id in topic_ids:
+                    existing.add((topic_id, self._month_key(period_start)))
+        return self._topic_period_coverage(
+            code="cluster_dynamics",
+            description="Research cluster monthly dynamics coverage.",
+            period_unit="month",
+            topics=topics,
+            periods=months,
+            existing=existing,
+        )
+
+    def _quarter_report_coverage(
+        self,
+        topics: list[dict[str, Any]],
+        quarters: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        topic_ids = [int(topic["topic_id"]) for topic in topics]
+        period_keys = [period["key"] for period in quarters]
+        existing: set[tuple[int, str]] = set()
+        if topic_ids and period_keys:
+            stmt = select(
+                TopicQuarterReport.topic_id,
+                TopicQuarterReport.period_key,
+            ).where(
+                TopicQuarterReport.topic_id.in_(topic_ids),
+                TopicQuarterReport.period_key.in_(period_keys),
+            )
+            existing = {
+                (int(topic_id), str(period_key))
+                for topic_id, period_key in self.session.execute(stmt)
+            }
+        return self._topic_period_coverage(
+            code="quarter_reports",
+            description="Topic quarterly report coverage.",
+            period_unit="quarter",
+            topics=topics,
+            periods=quarters,
+            existing=existing,
+        )
+
+    def _topic_period_coverage(
+        self,
+        *,
+        code: str,
+        description: str,
+        period_unit: str,
+        topics: list[dict[str, Any]],
+        periods: list[dict[str, Any]],
+        existing: set[tuple[int, str]],
+        include_missing_topic_ids: bool = False,
+    ) -> dict[str, Any]:
+        expected = {
+            (int(topic["topic_id"]), period["key"])
+            for topic in topics
+            for period in periods
+        }
+        covered = existing & expected
+        missing = expected - covered
+        missing_by_period: list[dict[str, Any]] = []
+        missing_by_topic: list[dict[str, Any]] = []
+
+        for period in periods:
+            missing_topics = [
+                topic
+                for topic in topics
+                if (int(topic["topic_id"]), period["key"]) in missing
+            ]
+            if missing_topics:
+                item = {
+                    "period": period["key"],
+                    "period_start": period["date_from"],
+                    "period_end": period["date_to"],
+                    "missing_topics": len(missing_topics),
+                    "topic_sample": self._topic_sample(missing_topics),
+                }
+                if include_missing_topic_ids:
+                    item["topic_ids"] = [
+                        int(topic["topic_id"])
+                        for topic in missing_topics
+                    ]
+                missing_by_period.append(item)
+
+        for topic in topics:
+            missing_periods = [
+                period["key"]
+                for period in periods
+                if (int(topic["topic_id"]), period["key"]) in missing
+            ]
+            if missing_periods:
+                missing_by_topic.append(
+                    {
+                        **self._topic_identity(topic),
+                        "missing_periods": len(missing_periods),
+                        "period_sample": missing_periods[: self.sample_limit],
+                    }
+                )
+
+        return {
+            "code": code,
+            "description": description,
+            "period_unit": period_unit,
+            "periods": len(periods),
+            "topics": len(topics),
+            "expected_topic_periods": len(expected),
+            "covered_topic_periods": len(covered),
+            "missing_topic_periods": len(missing),
+            "missing_by_period": missing_by_period,
+            "missing_by_topic_sample": missing_by_topic[: self.sample_limit],
+        }
+
+    def _load_topics(
+        self,
+        *,
+        field_ids: list[int] | None,
+        topic_ids: list[int] | None,
+    ) -> list[dict[str, Any]]:
+        stmt = (
+            select(
+                Topic.id.label("topic_id"),
+                Topic.name.label("topic_name"),
+                Subfield.id.label("subfield_id"),
+                Subfield.name.label("subfield_name"),
+                Field.id.label("field_id"),
+                Field.name.label("field_name"),
+            )
+            .outerjoin(Subfield, Subfield.id == Topic.subfield_id)
+            .outerjoin(Field, Field.id == Subfield.field_id)
+            .order_by(Field.name.asc(), Subfield.name.asc(), Topic.name.asc())
+        )
+        if topic_ids:
+            stmt = stmt.where(Topic.id.in_(sorted(set(topic_ids))))
+        if field_ids:
+            stmt = stmt.where(Field.id.in_(sorted(set(field_ids))))
+        return [dict(row) for row in self.session.execute(stmt).mappings()]
+
+    def _load_sample_counts(
+        self,
+        topic_ids: list[int],
+        months: list[dict[str, Any]],
+    ) -> dict[tuple[int, str], int]:
+        if not topic_ids or not months:
+            return {}
+        year_expr = func.extract("year", Paper.publication_date)
+        month_expr = func.extract("month", Paper.publication_date)
+        stmt = (
+            select(
+                PaperTopic.topic_id,
+                year_expr.label("year"),
+                month_expr.label("month"),
+                func.count(Paper.id).label("sample_count"),
+            )
+            .join(Paper, Paper.id == PaperTopic.paper_id)
+            .where(
+                PaperTopic.topic_id.in_(topic_ids),
+                Paper.publication_date >= months[0]["date_from"],
+                Paper.publication_date <= months[-1]["date_to"],
+            )
+            .group_by(PaperTopic.topic_id, year_expr, month_expr)
+        )
+        result: dict[tuple[int, str], int] = {}
+        for topic_id, year, month, sample_count in self.session.execute(stmt):
+            key = f"{int(year):04d}-{int(month):02d}"
+            result[(int(topic_id), key)] = int(sample_count or 0)
+        return result
+
+    def _field_summary(self, topics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        fields: dict[int | None, dict[str, Any]] = {}
+        for topic in topics:
+            field_id = topic.get("field_id")
+            item = fields.setdefault(
+                field_id,
+                {
+                    "field_id": field_id,
+                    "field_name": topic.get("field_name"),
+                    "topics_count": 0,
+                },
+            )
+            item["topics_count"] += 1
+        return sorted(
+            fields.values(),
+            key=lambda item: (
+                item["field_name"] is None,
+                str(item["field_name"] or ""),
+            ),
+        )
+
+    def _topic_sample(self, topics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [self._topic_identity(topic) for topic in topics[: self.sample_limit]]
+
+    def _topic_identity(self, topic: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "topic_id": topic.get("topic_id"),
+            "topic_name": topic.get("topic_name"),
+            "field_id": topic.get("field_id"),
+            "field_name": topic.get("field_name"),
+        }
+
+    def _month_periods(self, date_from: date, date_to: date) -> list[dict[str, Any]]:
+        current = date(date_from.year, date_from.month, 1)
+        end = date(date_to.year, date_to.month, 1)
+        periods: list[dict[str, Any]] = []
+        while current <= end:
+            period_end = date(
+                current.year,
+                current.month,
+                monthrange(current.year, current.month)[1],
+            )
+            periods.append(
+                {
+                    "key": self._month_key(current),
+                    "date_from": current,
+                    "date_to": period_end,
+                }
+            )
+            current = self._next_month_start(current)
+        return periods
+
+    def _next_month_start(self, value: date) -> date:
+        if value.month == 12:
+            return date(value.year + 1, 1, 1)
+        return date(value.year, value.month + 1, 1)
+
+    def _month_key(self, value: date) -> str:
+        return f"{value.year:04d}-{value.month:02d}"
+
+    def _topic_id_from_cluster_key(self, cluster_key: str) -> int:
+        prefix = "topic:"
+        if not cluster_key.startswith(prefix):
+            return -1
+        try:
+            return int(cluster_key.removeprefix(prefix))
+        except ValueError:
+            return -1
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse data CLI command and command-specific arguments."""
     parser = argparse.ArgumentParser(description="Data maintenance CLI utilities.")
@@ -593,6 +1010,146 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="SQLAlchemy database URL. Defaults to DATABASE_URL or POSTGRES_* envs.",
     )
 
+    coverage_parser = subparsers.add_parser(
+        "analyze-coverage",
+        aliases=["analyze-data-coverage"],
+        help=(
+            "Analyze monthly and quarterly database coverage for fields or topics."
+        ),
+    )
+    coverage_parser.add_argument(
+        "--date-from",
+        type=parse_iso_date,
+        required=True,
+        help="Coverage period lower bound in YYYY-MM-DD format.",
+    )
+    coverage_parser.add_argument(
+        "--date-to",
+        type=parse_iso_date,
+        required=True,
+        help="Coverage period upper bound in YYYY-MM-DD format.",
+    )
+    coverage_parser.add_argument(
+        "--field-ids",
+        default=None,
+        help="Comma-separated local field ids. Mutually exclusive with --topic-ids.",
+    )
+    coverage_parser.add_argument(
+        "--topic-ids",
+        default=None,
+        help="Comma-separated local topic ids. Mutually exclusive with --field-ids.",
+    )
+    coverage_parser.add_argument(
+        "--sample-limit",
+        type=int,
+        default=SAMPLE_LIMIT,
+        help="Maximum detailed topics/periods per coverage section. Defaults to 20.",
+    )
+    coverage_parser.add_argument(
+        "--include-missing-topic-ids",
+        action="store_true",
+        help="Include full missing topic id lists in missing_by_period sections.",
+    )
+    coverage_parser.add_argument(
+        "--enqueue-missing-topic-stats",
+        action="store_true",
+        help="Enqueue high-priority worker collect_topic_stats tasks for missing publication stats.",
+    )
+    coverage_parser.add_argument(
+        "--enqueue-task-batch-size",
+        type=int,
+        default=100,
+        help="Maximum topic ids per enqueued collect_topic_stats task. Defaults to 100.",
+    )
+    coverage_parser.add_argument(
+        "--enqueue-queue",
+        default=OPENALEX_TOPIC_STATS_QUEUE,
+        help=f"Redis queue for enqueued worker tasks. Defaults to {OPENALEX_TOPIC_STATS_QUEUE}.",
+    )
+    coverage_parser.add_argument(
+        "--languages",
+        default="en,ru",
+        help="Comma-separated OpenAlex languages for enqueued stats tasks. Defaults to en,ru.",
+    )
+    coverage_parser.add_argument(
+        "--types",
+        default="article",
+        help="Comma-separated OpenAlex work types for enqueued stats tasks. Defaults to article.",
+    )
+    coverage_parser.add_argument(
+        "--collect-batch-size",
+        type=int,
+        default=500,
+        help="PostgreSQL upsert batch size for enqueued stats tasks. Defaults to 500.",
+    )
+    coverage_parser.add_argument(
+        "--request-workers",
+        type=int,
+        default=8,
+        help="OpenAlex request workers for enqueued stats tasks. Defaults to 8.",
+    )
+    coverage_parser.add_argument(
+        "--rate-limit-rps",
+        type=float,
+        default=10.0,
+        help="OpenAlex request rate for enqueued stats tasks. Defaults to 10.",
+    )
+    coverage_parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="OpenAlex retry count for enqueued stats tasks. Defaults to 5.",
+    )
+    coverage_parser.add_argument(
+        "--normalize-january-first",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Estimate and remove January-1 artificial publication dates in "
+            "enqueued stats tasks. Enabled by default."
+        ),
+    )
+    coverage_parser.add_argument(
+        "--primary-topic-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use primary_topic.id instead of topics.id filter in enqueued stats tasks. "
+            "Enabled by default."
+        ),
+    )
+    coverage_parser.add_argument(
+        "--openalex-url",
+        default=None,
+        help="OpenAlex base URL stored in enqueued stats tasks.",
+    )
+    coverage_parser.add_argument(
+        "--openalex-api-key",
+        default=None,
+        help="OpenAlex API key stored in enqueued stats tasks.",
+    )
+    coverage_parser.add_argument(
+        "--openalex-mailto",
+        default=None,
+        help="OpenAlex polite-pool email stored in enqueued stats tasks.",
+    )
+    coverage_parser.add_argument(
+        "--report-json",
+        default=None,
+        help="Optional path to write JSON report.",
+    )
+    coverage_parser.add_argument(
+        "--env-file",
+        default=str(PROJECT_DIR / ".env"),
+        help="Path to .env file. Defaults to project .env.",
+    )
+    coverage_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="SQLAlchemy database URL. Defaults to DATABASE_URL or POSTGRES_* envs.",
+    )
+    add_redis_args(coverage_parser)
+
     return parser.parse_args(argv)
 
 
@@ -608,6 +1165,8 @@ def main(argv: list[str] | None = None) -> int:
             report = run_rebuild_openalex_yearly_topic_stats(args)
         elif args.command == "check-openalex-jan1-anomalies":
             report = run_check_openalex_jan1_anomalies(args)
+        elif args.command in {"analyze-coverage", "analyze-data-coverage"}:
+            report = run_analyze_coverage(args)
         else:
             raise AssertionError(f"Unhandled command: {args.command}")
         if args.report_json:
@@ -739,6 +1298,137 @@ def run_check_openalex_jan1_anomalies(args: argparse.Namespace) -> dict[str, Any
             }
     finally:
         engine.dispose()
+
+
+def run_analyze_coverage(args: argparse.Namespace) -> dict[str, Any]:
+    """Analyze database coverage for publication stats, samples, and reports."""
+    if args.date_from > args.date_to:
+        raise ValueError("--date-from must be before or equal to --date-to.")
+    if args.sample_limit < 0:
+        raise ValueError("--sample-limit must be non-negative.")
+    if args.enqueue_task_batch_size <= 0:
+        raise ValueError("--enqueue-task-batch-size must be a positive integer.")
+    if args.collect_batch_size <= 0 or args.collect_batch_size > 500:
+        raise ValueError("--collect-batch-size must be between 1 and 500.")
+    if args.request_workers <= 0:
+        raise ValueError("--request-workers must be a positive integer.")
+    if args.rate_limit_rps <= 0:
+        raise ValueError("--rate-limit-rps must be positive.")
+    if args.max_retries < 0:
+        raise ValueError("--max-retries must be non-negative.")
+    field_ids = parse_int_csv_arg(args.field_ids) if args.field_ids else None
+    topic_ids = parse_int_csv_arg(args.topic_ids) if args.topic_ids else None
+    if field_ids and topic_ids:
+        raise ValueError("--field-ids and --topic-ids are mutually exclusive.")
+
+    database_url = args.database_url or Settings.from_env().database_url
+    engine = create_db_engine(database_url, echo=False)
+    SessionLocal = create_session_factory(engine, expire_on_commit=False)
+
+    try:
+        with SessionLocal() as session:
+            analyzer = DataCoverageAnalyzer(session, sample_limit=args.sample_limit)
+            report = analyzer.analyze(
+                date_from=args.date_from,
+                date_to=args.date_to,
+                field_ids=field_ids,
+                topic_ids=topic_ids,
+                include_missing_topic_ids=(
+                    args.include_missing_topic_ids
+                    or args.enqueue_missing_topic_stats
+                ),
+            )
+            if args.enqueue_missing_topic_stats:
+                report["enqueued_worker_tasks"] = enqueue_missing_topic_stats_tasks(
+                    report,
+                    redis_adapter=RedisAdapter(build_redis_client(args)),
+                    queue_name=args.enqueue_queue,
+                    task_batch_size=args.enqueue_task_batch_size,
+                    languages=parse_csv_arg(args.languages),
+                    types=parse_csv_arg(args.types),
+                    batch_size=args.collect_batch_size,
+                    request_workers=args.request_workers,
+                    rate_limit_rps=args.rate_limit_rps,
+                    max_retries=args.max_retries,
+                    normalize_january_first=bool(args.normalize_january_first),
+                    primary_topic_only=bool(args.primary_topic_only),
+                    openalex_url=args.openalex_url,
+                    openalex_api_key=args.openalex_api_key,
+                    openalex_mailto=args.openalex_mailto,
+                )
+            return report
+    finally:
+        engine.dispose()
+
+
+def enqueue_missing_topic_stats_tasks(
+    report: dict[str, Any],
+    *,
+    redis_adapter: RedisAdapter,
+    queue_name: str,
+    task_batch_size: int,
+    languages: list[str],
+    types: list[str],
+    batch_size: int,
+    request_workers: int,
+    rate_limit_rps: float,
+    max_retries: int,
+    normalize_january_first: bool = True,
+    primary_topic_only: bool = True,
+    openalex_url: str | None = None,
+    openalex_api_key: str | None = None,
+    openalex_mailto: str | None = None,
+) -> dict[str, Any]:
+    """Enqueue collect_topic_stats tasks for missing publication stat months."""
+    publication_stats = report["checks"]["publication_stats"]
+    messages: list[dict[str, Any]] = []
+    missing_periods = publication_stats.get("missing_by_period", [])
+    if not isinstance(missing_periods, list):
+        raise ValueError("Coverage report publication_stats.missing_by_period is invalid.")
+
+    for period in missing_periods:
+        topic_ids = period.get("topic_ids") if isinstance(period, dict) else None
+        if not isinstance(topic_ids, list):
+            raise ValueError(
+                "Coverage report does not include full missing topic ids. "
+                "Run analyzer with include_missing_topic_ids enabled."
+            )
+        for chunk in chunked_ints([int(topic_id) for topic_id in topic_ids], task_batch_size):
+            messages.append(
+                {
+                    "task_type": "collect_topic_stats",
+                    "date_from": _iso_date_value(period["period_start"]),
+                    "date_to": _iso_date_value(period["period_end"]),
+                    "taxonomy_scope": "topic",
+                    "topic_ids": chunk,
+                    "languages": languages,
+                    "types": types,
+                    "batch_size": batch_size,
+                    "request_workers": request_workers,
+                    "rate_limit_rps": rate_limit_rps,
+                    "max_retries": max_retries,
+                    "group_by_page_size": 200,
+                    "normalize_january_first": bool(normalize_january_first),
+                    "primary_topic_only": bool(primary_topic_only),
+                    "show_progress": False,
+                    **({"openalex_url": openalex_url} if openalex_url else {}),
+                    **({"openalex_api_key": openalex_api_key} if openalex_api_key else {}),
+                    **({"openalex_mailto": openalex_mailto} if openalex_mailto else {}),
+                }
+            )
+
+    for message in messages:
+        redis_adapter.enqueue(queue_name, message)
+
+    return {
+        "queue": queue_name,
+        "priority": "max",
+        "source_check": "publication_stats",
+        "missing_topic_periods": int(publication_stats.get("missing_topic_periods") or 0),
+        "messages": len(messages),
+        "task_batch_size": task_batch_size,
+        "sample": messages[:3],
+    }
 
 
 def _load_january_anomaly_rows(
@@ -939,6 +1629,30 @@ def parse_int_csv_arg(value: str) -> list[int]:
     return result
 
 
+def parse_csv_arg(value: str) -> list[str]:
+    """Parse comma-separated strings preserving first occurrence order."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value.split(","):
+        clean = item.strip()
+        if not clean or clean in seen:
+            continue
+        result.append(clean)
+        seen.add(clean)
+    return result
+
+
+def chunked_ints(values: list[int], size: int) -> list[list[int]]:
+    """Split integer values into fixed-size chunks."""
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def _iso_date_value(value: Any) -> str:
+    if isinstance(value, date):
+        return value.isoformat()
+    return date.fromisoformat(str(value)[:10]).isoformat()
+
+
 def normalize_keyword(value: str) -> str:
     """Normalize keyword value for safe local cleanup."""
     return value.strip().lower()
@@ -972,6 +1686,59 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
 def print_json(payload: dict[str, Any], *, stream: Any = sys.stdout) -> None:
     """Print JSON with stable UTF-8 output."""
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str), file=stream)
+
+
+def add_redis_args(parser: argparse.ArgumentParser) -> None:
+    """Add Redis connection arguments."""
+    parser.add_argument(
+        "--redis-url",
+        default=None,
+        help="Redis URL. Defaults to REDIS_URL when set.",
+    )
+    parser.add_argument(
+        "--redis-host",
+        default=None,
+        help="Redis host. Defaults to REDIS_HOST or localhost.",
+    )
+    parser.add_argument(
+        "--redis-port",
+        type=int,
+        default=None,
+        help="Redis port. Defaults to REDIS_PORT or 6379.",
+    )
+    parser.add_argument(
+        "--redis-db",
+        type=int,
+        default=None,
+        help="Redis database number. Defaults to REDIS_DB or 0.",
+    )
+
+
+def build_redis_client(args: argparse.Namespace) -> Any:
+    """Build a redis-py client from CLI arguments or environment variables."""
+    try:
+        from redis import Redis
+    except ImportError as exc:
+        raise RuntimeError(
+            "redis package is not installed. Install dependencies from requirements.txt."
+        ) from exc
+
+    redis_url = args.redis_url or os.getenv("REDIS_URL")
+    if redis_url:
+        return Redis.from_url(redis_url)
+    return Redis(
+        host=args.redis_host or os.getenv("REDIS_HOST") or "localhost",
+        port=args.redis_port or _optional_int_env("REDIS_PORT") or 6379,
+        db=args.redis_db if args.redis_db is not None else _optional_int_env("REDIS_DB") or 0,
+        password=os.getenv("REDIS_PASSWORD") or None,
+    )
+
+
+def _optional_int_env(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return int(value)
 
 
 if __name__ == "__main__":

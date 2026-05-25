@@ -22,6 +22,7 @@ if str(SRC_DIR) not in sys.path:
 from adapters import (
     LMStudioChatAdapter,
     LMStudioEmbeddingAdapter,
+    OpenAlexAdapter,
     QdrantAdapter,
     RedisAdapter,
 )
@@ -60,18 +61,21 @@ from ml.workers.redis_worker import (
     DEFAULT_QUEUE_ORDER,
     ENTITY_INDEXING_QUEUE,
     KEYWORD_EXTRACTION_QUEUE,
+    OPENALEX_TOPIC_STATS_QUEUE,
     PAPER_INDEXING_QUEUE,
     TOPIC_QUARTER_REPORT_QUEUE,
     USER_PROFILE_RECOMPUTE_QUEUE,
     RedisMLWorker,
 )
 from ml.workers.task_handlers import MLTaskHandler
+from ingestion.openalex_topic_stats import OpenAlexTopicStatsCollector, SyncRateLimiter
 from models.session import create_db_engine, create_session_factory
 from repositories import (
     AuthorRepository,
     FavouriteRepository,
     InstitutionRepository,
     OpenAlexTopicStatsRepository,
+    OpenAlexYearlyTopicStatsRepository,
     PaperGraphRepository,
     PaperRepository,
     ResearchClusterRepository,
@@ -82,6 +86,9 @@ from repositories import (
 
 
 QUEUE_ALIASES = {
+    "openalex_topic_stats": OPENALEX_TOPIC_STATS_QUEUE,
+    "collect_topic_stats": OPENALEX_TOPIC_STATS_QUEUE,
+    "collect-topic-stats": OPENALEX_TOPIC_STATS_QUEUE,
     "keyword_extraction": KEYWORD_EXTRACTION_QUEUE,
     "paper_indexing": PAPER_INDEXING_QUEUE,
     "entity_indexing": ENTITY_INDEXING_QUEUE,
@@ -381,11 +388,13 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
             "queues": queue_names,
             "max_tasks": args.max_tasks,
             "batch_sizes": {
+                OPENALEX_TOPIC_STATS_QUEUE: 1,
                 KEYWORD_EXTRACTION_QUEUE: args.keyword_extraction_batch_size,
                 PAPER_INDEXING_QUEUE: args.paper_indexing_batch_size,
                 CLUSTER_RECOMPUTE_QUEUE: args.cluster_recompute_batch_size,
             },
             "max_task_sizes": {
+                OPENALEX_TOPIC_STATS_QUEUE: 1,
                 KEYWORD_EXTRACTION_QUEUE: max_keyword_task_size,
                 PAPER_INDEXING_QUEUE: max_paper_task_size,
                 CLUSTER_RECOMPUTE_QUEUE: max_cluster_task_size,
@@ -502,10 +511,62 @@ def build_task_handler(
         cluster_dynamics_pipeline=cluster_dynamics_pipeline,
         topic_quarter_report_pipeline=topic_quarter_report_pipeline,
         user_profile_pipeline=user_profile_pipeline,
+        openalex_topic_stats_collector_factory=build_openalex_topic_stats_collector_factory(
+            session,
+        ),
         event_sink=event_sink,
         cluster_recompute_workers=cluster_recompute_workers,
         cluster_recompute_pipeline_factory=cluster_recompute_pipeline_factory,
     )
+
+
+def build_openalex_topic_stats_collector_factory(session: Any) -> Any:
+    """Build OpenAlex topic stats collectors from worker task messages."""
+
+    def _message_bool(message: dict[str, Any], field: str, default: bool) -> bool:
+        value = message.get(field, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off"}:
+                return False
+        return bool(value)
+
+    def factory(message: dict[str, Any]) -> OpenAlexTopicStatsCollector:
+        openalex_url = (
+            str(message.get("openalex_url")).strip()
+            if message.get("openalex_url")
+            else os.getenv("OPENALEX_BASE_URL") or "https://api.openalex.org"
+        )
+        api_key = (
+            str(message.get("openalex_api_key")).strip()
+            if message.get("openalex_api_key")
+            else os.getenv("OPENALEX_API_KEY")
+        )
+        mailto = (
+            str(message.get("openalex_mailto")).strip()
+            if message.get("openalex_mailto")
+            else os.getenv("OPENALEX_MAILTO")
+        )
+        return OpenAlexTopicStatsCollector(
+            taxonomy_repository=TaxonomyRepository(session),
+            stats_repository=OpenAlexTopicStatsRepository(session),
+            yearly_stats_repository=OpenAlexYearlyTopicStatsRepository(session),
+            openalex_adapter_factory=lambda: OpenAlexAdapter(
+                openalex_url,
+                api_key=api_key or None,
+                mailto=mailto or None,
+            ),
+            request_workers=max(1, int(message.get("request_workers") or 8)),
+            rate_limiter=SyncRateLimiter(float(message.get("rate_limit_rps") or 10.0)),
+            max_retries=max(0, int(message.get("max_retries") or 5)),
+            primary_topic_only=_message_bool(message, "primary_topic_only", True),
+        )
+
+    return factory
 
 
 def build_cluster_recompute_pipeline_factory(

@@ -21,7 +21,7 @@ CLI_MODULES = [
     CliModule(
         module="cli.data",
         command="python -m cli.data",
-        description="Local data validation and OpenAlex yearly stats maintenance.",
+        description="Local data validation, coverage analysis, and OpenAlex stats maintenance.",
     ),
     CliModule(
         module="cli.worker",

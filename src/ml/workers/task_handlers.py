@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, is_dataclass
 from datetime import date
 from typing import Any, Callable, Literal
 
@@ -8,6 +9,7 @@ from core.exceptions import AppError, InvalidRequestError
 from dto.common import BatchOperationResultDTO, OperationResultDTO
 from dto.keywords import PaperKeywordExtractionBatchRequestDTO
 from dto.topic_reports import TopicQuarterReportGenerateRequestDTO
+from ingestion.openalex_topic_stats import OpenAlexTopicStatsCollector
 from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.pipelines.cluster_dynamics_pipeline import ClusterDynamicsPipeline
 from ml.pipelines.keyword_extraction_pipeline import KeywordExtractionPipeline
@@ -33,6 +35,7 @@ class MLTaskHandler:
         cluster_dynamics_pipeline: ClusterDynamicsPipeline | None = None,
         topic_quarter_report_pipeline: TopicQuarterReportPipeline | None = None,
         user_profile_pipeline: UserProfilePipeline | None = None,
+        openalex_topic_stats_collector_factory: Callable[[dict[str, Any]], OpenAlexTopicStatsCollector] | None = None,
         event_sink: EventSink | None = None,
         cluster_recompute_workers: int = 1,
         cluster_recompute_pipeline_factory: Callable[[], tuple[TrendRecomputePipeline, Any]] | None = None,
@@ -45,6 +48,7 @@ class MLTaskHandler:
         self.cluster_dynamics_pipeline = cluster_dynamics_pipeline
         self.topic_quarter_report_pipeline = topic_quarter_report_pipeline
         self.user_profile_pipeline = user_profile_pipeline
+        self.openalex_topic_stats_collector_factory = openalex_topic_stats_collector_factory
         self.event_sink = event_sink or NoopEventSink()
         self.cluster_recompute_workers = max(1, int(cluster_recompute_workers))
         self.cluster_recompute_pipeline_factory = cluster_recompute_pipeline_factory
@@ -67,6 +71,8 @@ class MLTaskHandler:
         task_type = self._required_str(message, "task_type")
         if task_type == "keyword_extraction":
             return self._handle_keyword_extraction(message)
+        if task_type in {"collect_topic_stats", "collect-topic-stats"}:
+            return self._handle_collect_topic_stats(message)
         if task_type == "paper_indexing":
             return self._handle_paper_indexing(message)
         if task_type in {"entity_indexing", "research_entities_indexing"}:
@@ -141,6 +147,43 @@ class MLTaskHandler:
             success=True,
             message=response.message or "Paper indexing completed",
             details=self._dump_dto(response),
+        )
+
+    def _handle_collect_topic_stats(self, message: dict[str, Any]) -> OperationResultDTO:
+        if self.openalex_topic_stats_collector_factory is None:
+            raise InvalidRequestError(
+                "Pipeline is not configured",
+                details={"pipeline": "openalex_topic_stats_collector"},
+            )
+        collector = self.openalex_topic_stats_collector_factory(message)
+        result = collector.collect_and_store(
+            date_from=self._required_date(message, "date_from"),
+            date_to=self._required_date(message, "date_to"),
+            topic_ids=self._optional_int_list_field(message, "topic_ids"),
+            field_ids=self._optional_int_list_field(message, "field_ids"),
+            subfield_ids=self._optional_int_list_field(message, "subfield_ids"),
+            taxonomy_scope=self._taxonomy_scope(message.get("taxonomy_scope", "topic")),
+            limit=self._optional_int(message, "limit"),
+            offset=self._optional_int(message, "offset") or 0,
+            languages=self._optional_str_list_field(message, "languages"),
+            types=self._optional_str_list_field(message, "types"),
+            batch_size=self._optional_int(message, "batch_size") or 500,
+            group_by_page_size=self._optional_int(message, "group_by_page_size") or 200,
+            normalize_january_first=self._bool_field(
+                message,
+                "normalize_january_first",
+                default=True,
+            ),
+            dry_run=self._bool_field(message, "dry_run", default=False),
+            show_progress=self._bool_field(message, "show_progress", default=False),
+        )
+        return OperationResultDTO(
+            success=result.failed == 0,
+            message="OpenAlex topic stats collection completed",
+            details={
+                "task_type": "collect_topic_stats",
+                **self._dump_dto(result),
+            },
         )
 
     def _handle_entity_indexing(self, message: dict[str, Any]) -> OperationResultDTO:
@@ -558,6 +601,15 @@ class MLTaskHandler:
                 details={"field": field, "value": value},
             ) from exc
 
+    def _optional_int_list_field(
+        self,
+        message: dict[str, Any],
+        field: str,
+    ) -> list[int] | None:
+        if field not in message or message.get(field) is None:
+            return None
+        return self._int_list_field(message, field)
+
     def _str_list_field(self, message: dict[str, Any], field: str) -> list[str]:
         value = message.get(field)
         if not isinstance(value, list):
@@ -572,6 +624,22 @@ class MLTaskHandler:
                 details={"field": field, "value": value},
             )
         return result
+
+    def _optional_str_list_field(
+        self,
+        message: dict[str, Any],
+        field: str,
+    ) -> list[str] | None:
+        if field not in message or message.get(field) is None:
+            return None
+        value = message.get(field)
+        if isinstance(value, str):
+            return [
+                item.strip()
+                for item in value.split(",")
+                if item.strip()
+            ]
+        return self._str_list_field(message, field)
 
     def _required_date(self, message: dict[str, Any], field: str) -> date:
         value = message.get(field)
@@ -603,11 +671,21 @@ class MLTaskHandler:
             details={"granularity": value},
         )
 
+    def _taxonomy_scope(self, value: Any) -> str:
+        if value in {"topic", "field", "subfield"}:
+            return str(value)
+        raise InvalidRequestError(
+            "taxonomy_scope must be one of: topic, field, subfield",
+            details={"taxonomy_scope": value},
+        )
+
     def _dump_dto(self, value: Any) -> dict[str, Any]:
         if hasattr(value, "model_dump"):
             return value.model_dump(mode="json")
         if hasattr(value, "dict"):
             return value.dict()
+        if is_dataclass(value):
+            return asdict(value)
         if isinstance(value, dict):
             return value
         return {"value": value}
