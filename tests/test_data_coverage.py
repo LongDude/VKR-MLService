@@ -9,7 +9,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cli.data import (  # noqa: E402
     DataCoverageAnalyzer,
+    OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     OPENALEX_TOPIC_STATS_QUEUE,
+    enqueue_missing_sample_tasks,
     enqueue_missing_topic_stats_tasks,
     parse_args,
 )
@@ -139,6 +141,165 @@ def test_data_coverage_cli_parser_accepts_field_scope() -> None:
     assert alias_args.command == "analyze-data-coverage"
 
 
+def test_sample_month_coverage_cli_parser_accepts_field_scope() -> None:
+    args = parse_args(
+        [
+            "analyze-sample-month-coverage",
+            "--field-id",
+            "17",
+            "--topic-ids",
+            "1,2",
+            "--date-from",
+            "2025-01-15",
+            "--date-to",
+            "2025-02-01",
+        ]
+    )
+
+    assert args.command == "analyze-sample-month-coverage"
+    assert args.field_id == 17
+    assert args.topic_ids == "1,2"
+    assert args.date_to == date(2025, 2, 1)
+
+
+def test_sample_month_coverage_cli_parser_accepts_enqueue_flags() -> None:
+    args = parse_args(
+        [
+            "analyze-sample-month-coverage",
+            "--field-id",
+            "17",
+            "--date-from",
+            "2025-01-01",
+            "--date-to",
+            "2025-01-31",
+            "--enqueue-missing-samples",
+            "--enqueue-task-batch-size",
+            "2",
+            "--target-count",
+            "50",
+        ]
+    )
+
+    assert args.enqueue_missing_samples is True
+    assert args.enqueue_queue == OPENALEX_BOOTSTRAP_PAPERS_QUEUE
+    assert args.enqueue_task_batch_size == 2
+    assert args.target_count == 50
+
+
+def test_sample_month_coverage_report_is_limited_to_samples_check() -> None:
+    class _Analyzer(DataCoverageAnalyzer):
+        def _load_topics(self, *, field_ids, topic_ids):  # type: ignore[no-untyped-def]
+            assert field_ids == [17]
+            assert topic_ids == [1, 2]
+            return [
+                {
+                    "topic_id": 1,
+                    "topic_name": "Graph learning",
+                    "field_id": 17,
+                    "field_name": "Computer science",
+                },
+                {
+                    "topic_id": 2,
+                    "topic_name": "Vision",
+                    "field_id": 17,
+                    "field_name": "Computer science",
+                },
+            ]
+
+        def _load_sample_counts(self, topic_ids, months):  # type: ignore[no-untyped-def]
+            assert topic_ids == [1, 2]
+            return {(1, "2025-01"): 3, (2, "2025-02"): 4}
+
+    report = _Analyzer(session=None, sample_limit=2).analyze_sample_month_coverage(  # type: ignore[arg-type]
+        date_from=date(2025, 1, 15),
+        date_to=date(2025, 2, 1),
+        field_id=17,
+        topic_ids=[1, 2],
+    )
+
+    assert report["command"] == "analyze-sample-month-coverage"
+    assert report["scope"]["field_id"] == 17
+    assert report["summary"]["months"] == 2
+    assert report["summary"]["sample_missing"] == 2
+    assert list(report["checks"]) == ["samples"]
+    assert report["checks"]["samples"]["missing_by_period"][0]["period"] == "2025-01"
+
+
+def test_sample_month_coverage_can_include_missing_topic_ids() -> None:
+    class _Analyzer(DataCoverageAnalyzer):
+        def _load_topics(self, *, field_ids, topic_ids):  # type: ignore[no-untyped-def]
+            return [
+                {
+                    "topic_id": 1,
+                    "topic_name": "Graph learning",
+                    "field_id": 17,
+                    "field_name": "Computer science",
+                },
+                {
+                    "topic_id": 2,
+                    "topic_name": "Vision",
+                    "field_id": 17,
+                    "field_name": "Computer science",
+                },
+            ]
+
+        def _load_sample_counts(self, topic_ids, months):  # type: ignore[no-untyped-def]
+            return {(1, "2025-01"): 3}
+
+    report = _Analyzer(session=None, sample_limit=2).analyze_sample_month_coverage(  # type: ignore[arg-type]
+        date_from=date(2025, 1, 1),
+        date_to=date(2025, 1, 31),
+        field_id=17,
+        include_missing_topic_ids=True,
+    )
+
+    assert report["checks"]["samples"]["missing_by_period"][0]["topic_ids"] == [2]
+
+
+def test_coverage_enqueue_missing_samples_uses_full_missing_topic_ids() -> None:
+    redis = _CapturingRedis()
+    report = {
+        "scope": {"field_id": 17},
+        "checks": {
+            "samples": {
+                "missing_topic_periods": 3,
+                "missing_by_period": [
+                    {
+                        "period": "2025-01",
+                        "period_start": date(2025, 1, 1),
+                        "period_end": date(2025, 1, 31),
+                        "topic_ids": [1, 2, 3],
+                    }
+                ],
+            }
+        },
+    }
+
+    result = enqueue_missing_sample_tasks(
+        report,
+        redis_adapter=redis,
+        queue_name=OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+        task_batch_size=2,
+        target_count=50,
+        languages=["en"],
+        types=["article"],
+        batch_size=500,
+        request_workers=4,
+        db_workers=2,
+        rate_limit_rps=10,
+        seed=42,
+        per_page=100,
+        max_retries=5,
+    )
+
+    assert result["messages"] == 2
+    assert [message["topic_ids"] for _, message in redis.messages] == [[1, 2], [3]]
+    assert all(queue == OPENALEX_BOOTSTRAP_PAPERS_QUEUE for queue, _ in redis.messages)
+    assert {message["task_type"] for _, message in redis.messages} == {"bootstrap_papers"}
+    assert all(message["field_id"] == 17 for _, message in redis.messages)
+    assert all(message["target_scope"] == "month" for _, message in redis.messages)
+
+
 def test_data_coverage_cli_parser_topic_stats_flags_default_to_enabled() -> None:
     args = parse_args(
         [
@@ -174,6 +335,7 @@ def test_data_coverage_cli_parser_topic_stats_flags_default_to_enabled() -> None
 
 def test_openalex_topic_stats_queue_has_max_worker_priority() -> None:
     assert DEFAULT_QUEUE_ORDER[0] == OPENALEX_TOPIC_STATS_QUEUE
+    assert OPENALEX_BOOTSTRAP_PAPERS_QUEUE in DEFAULT_QUEUE_ORDER
 
 
 def test_topic_stats_cli_parser_topic_filter_flags_default_to_enabled() -> None:
@@ -297,3 +459,27 @@ def test_worker_handler_runs_collect_topic_stats_task() -> None:
     assert result.details["task_type"] == "collect_topic_stats"
     assert collector.calls[0]["topic_ids"] == [1, 2]
     assert collector.calls[0]["date_from"] == date(2025, 1, 1)
+
+
+def test_worker_handler_runs_bootstrap_papers_task() -> None:
+    calls: list[dict] = []
+
+    def runner(message: dict) -> dict:
+        calls.append(message)
+        return {"fetched": 2, "imported": 2, "failed": 0}
+
+    handler = MLTaskHandler(openalex_paper_bootstrap_runner=runner)
+
+    result = handler.handle(
+        {
+            "task_type": "bootstrap_papers",
+            "date_from": "2025-01-01",
+            "date_to": "2025-01-31",
+            "topic_ids": [1, 2],
+        }
+    )
+
+    assert result.success is True
+    assert result.details["task_type"] == "bootstrap_papers"
+    assert result.details["imported"] == 2
+    assert calls[0]["topic_ids"] == [1, 2]

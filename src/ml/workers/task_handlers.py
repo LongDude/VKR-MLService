@@ -36,6 +36,7 @@ class MLTaskHandler:
         topic_quarter_report_pipeline: TopicQuarterReportPipeline | None = None,
         user_profile_pipeline: UserProfilePipeline | None = None,
         openalex_topic_stats_collector_factory: Callable[[dict[str, Any]], OpenAlexTopicStatsCollector] | None = None,
+        openalex_paper_bootstrap_runner: Callable[[dict[str, Any]], Any] | None = None,
         event_sink: EventSink | None = None,
         cluster_recompute_workers: int = 1,
         cluster_recompute_pipeline_factory: Callable[[], tuple[TrendRecomputePipeline, Any]] | None = None,
@@ -49,6 +50,7 @@ class MLTaskHandler:
         self.topic_quarter_report_pipeline = topic_quarter_report_pipeline
         self.user_profile_pipeline = user_profile_pipeline
         self.openalex_topic_stats_collector_factory = openalex_topic_stats_collector_factory
+        self.openalex_paper_bootstrap_runner = openalex_paper_bootstrap_runner
         self.event_sink = event_sink or NoopEventSink()
         self.cluster_recompute_workers = max(1, int(cluster_recompute_workers))
         self.cluster_recompute_pipeline_factory = cluster_recompute_pipeline_factory
@@ -73,6 +75,8 @@ class MLTaskHandler:
             return self._handle_keyword_extraction(message)
         if task_type in {"collect_topic_stats", "collect-topic-stats"}:
             return self._handle_collect_topic_stats(message)
+        if task_type in {"bootstrap_papers", "bootstrap-papers"}:
+            return self._handle_bootstrap_papers(message)
         if task_type == "paper_indexing":
             return self._handle_paper_indexing(message)
         if task_type in {"entity_indexing", "research_entities_indexing"}:
@@ -183,6 +187,24 @@ class MLTaskHandler:
             details={
                 "task_type": "collect_topic_stats",
                 **self._dump_dto(result),
+            },
+        )
+
+    def _handle_bootstrap_papers(self, message: dict[str, Any]) -> OperationResultDTO:
+        if self.openalex_paper_bootstrap_runner is None:
+            raise InvalidRequestError(
+                "Pipeline is not configured",
+                details={"pipeline": "openalex_paper_bootstrap"},
+            )
+        result = self.openalex_paper_bootstrap_runner(message)
+        details = self._dump_dto(result)
+        failed = int(details.get("failed") or 0) if isinstance(details, dict) else 0
+        return OperationResultDTO(
+            success=failed == 0,
+            message="OpenAlex paper bootstrap completed",
+            details={
+                "task_type": "bootstrap_papers",
+                **details,
             },
         )
 

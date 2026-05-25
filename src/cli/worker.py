@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
 import sys
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,7 @@ from adapters import (
 )
 from core.config import Settings
 from core.exceptions import AppError
+from dto.openalex import OpenAlexBootstrapRequestDTO, OpenAlexBootstrapTopicTargetDTO
 from ml.constants import DEFAULT_EMBEDDING_MODEL
 from ml.facades import (
     ClusterAnalyticsFacade,
@@ -39,8 +42,10 @@ from ml.facades import (
     TopicQuarterReportFacade,
     UserProfileFacade,
 )
+from ml.facades.openalex_papers import OpenAlexPapersFacade
 from ml.pipelines.cluster_dynamics_pipeline import ClusterDynamicsPipeline
 from ml.pipelines.keyword_extraction_pipeline import KeywordExtractionPipeline
+from ml.pipelines.openalex_paper_loading_pipeline import OpenAlexPaperLoadingPipeline
 from ml.pipelines.paper_indexing_pipeline import PaperIndexingPipeline
 from ml.pipelines.research_entities_pipeline import ResearchEntitiesPipeline
 from ml.pipelines.topic_quarter_report_pipeline import TopicQuarterReportPipeline
@@ -61,6 +66,7 @@ from ml.workers.redis_worker import (
     DEFAULT_QUEUE_ORDER,
     ENTITY_INDEXING_QUEUE,
     KEYWORD_EXTRACTION_QUEUE,
+    OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     OPENALEX_TOPIC_STATS_QUEUE,
     PAPER_INDEXING_QUEUE,
     TOPIC_QUARTER_REPORT_QUEUE,
@@ -69,6 +75,10 @@ from ml.workers.redis_worker import (
 )
 from ml.workers.task_handlers import MLTaskHandler
 from ingestion.openalex_topic_stats import OpenAlexTopicStatsCollector, SyncRateLimiter
+from ml.services.openalex_paper_downloader import OpenAlexPaperDownloader
+from ml.services.openalex_paper_importer import OpenAlexPaperImporter
+from ml.services.openalex_paper_plan import OpenAlexPaperPlanService
+from ml.services.openalex_rate_limiter import AsyncRateLimiter
 from models.session import create_db_engine, create_session_factory
 from repositories import (
     AuthorRepository,
@@ -89,6 +99,9 @@ QUEUE_ALIASES = {
     "openalex_topic_stats": OPENALEX_TOPIC_STATS_QUEUE,
     "collect_topic_stats": OPENALEX_TOPIC_STATS_QUEUE,
     "collect-topic-stats": OPENALEX_TOPIC_STATS_QUEUE,
+    "openalex_bootstrap_papers": OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+    "bootstrap_papers": OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+    "bootstrap-papers": OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     "keyword_extraction": KEYWORD_EXTRACTION_QUEUE,
     "paper_indexing": PAPER_INDEXING_QUEUE,
     "entity_indexing": ENTITY_INDEXING_QUEUE,
@@ -327,6 +340,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
 
         with SessionLocal() as session:
             handler = build_task_handler(
+                session_factory=SessionLocal,
                 session=session,
                 redis_adapter=redis_adapter,
                 qdrant_adapter=qdrant_adapter,
@@ -353,11 +367,13 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 task_handler=handler,
                 queues=queue_names,
                 batch_sizes={
+                    OPENALEX_BOOTSTRAP_PAPERS_QUEUE: 1,
                     KEYWORD_EXTRACTION_QUEUE: args.keyword_extraction_batch_size,
                     PAPER_INDEXING_QUEUE: args.paper_indexing_batch_size,
                     CLUSTER_RECOMPUTE_QUEUE: args.cluster_recompute_batch_size,
                 },
                 max_task_sizes={
+                    OPENALEX_BOOTSTRAP_PAPERS_QUEUE: 1,
                     KEYWORD_EXTRACTION_QUEUE: max_keyword_task_size,
                     PAPER_INDEXING_QUEUE: max_paper_task_size,
                     CLUSTER_RECOMPUTE_QUEUE: max_cluster_task_size,
@@ -389,12 +405,14 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
             "max_tasks": args.max_tasks,
             "batch_sizes": {
                 OPENALEX_TOPIC_STATS_QUEUE: 1,
+                OPENALEX_BOOTSTRAP_PAPERS_QUEUE: 1,
                 KEYWORD_EXTRACTION_QUEUE: args.keyword_extraction_batch_size,
                 PAPER_INDEXING_QUEUE: args.paper_indexing_batch_size,
                 CLUSTER_RECOMPUTE_QUEUE: args.cluster_recompute_batch_size,
             },
             "max_task_sizes": {
                 OPENALEX_TOPIC_STATS_QUEUE: 1,
+                OPENALEX_BOOTSTRAP_PAPERS_QUEUE: 1,
                 KEYWORD_EXTRACTION_QUEUE: max_keyword_task_size,
                 PAPER_INDEXING_QUEUE: max_paper_task_size,
                 CLUSTER_RECOMPUTE_QUEUE: max_cluster_task_size,
@@ -411,6 +429,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_task_handler(
     *,
+    session_factory: Any,
     session: Any,
     redis_adapter: RedisAdapter,
     qdrant_adapter: QdrantAdapter,
@@ -514,6 +533,10 @@ def build_task_handler(
         openalex_topic_stats_collector_factory=build_openalex_topic_stats_collector_factory(
             session,
         ),
+        openalex_paper_bootstrap_runner=build_openalex_paper_bootstrap_runner(
+            session_factory=session_factory,
+            redis_adapter=redis_adapter,
+        ),
         event_sink=event_sink,
         cluster_recompute_workers=cluster_recompute_workers,
         cluster_recompute_pipeline_factory=cluster_recompute_pipeline_factory,
@@ -567,6 +590,202 @@ def build_openalex_topic_stats_collector_factory(session: Any) -> Any:
         )
 
     return factory
+
+
+def build_openalex_paper_bootstrap_runner(
+    *,
+    session_factory: Any,
+    redis_adapter: RedisAdapter,
+) -> Any:
+    """Build a callable that runs OpenAlex paper bootstrap from worker messages."""
+
+    def runner(message: dict[str, Any]) -> Any:
+        request = build_openalex_bootstrap_request(message, session_factory)
+        pipeline = OpenAlexPaperLoadingPipeline(
+            OpenAlexPapersFacade(
+                session_factory=session_factory,
+                plan_service=OpenAlexPaperPlanService(),
+                downloader=OpenAlexPaperDownloader(
+                    base_url=str(
+                        message.get("openalex_url")
+                        or os.getenv("OPENALEX_BASE_URL")
+                        or "https://api.openalex.org"
+                    ),
+                    request_workers=request.request_workers,
+                    rate_limiter=AsyncRateLimiter(request.rate_limit_rps),
+                    max_retries=request.max_retries,
+                    api_key=(
+                        str(message.get("openalex_api_key")).strip()
+                        if message.get("openalex_api_key")
+                        else os.getenv("OPENALEX_API_KEY") or None
+                    ),
+                    mailto=(
+                        str(message.get("openalex_mailto")).strip()
+                        if message.get("openalex_mailto")
+                        else os.getenv("OPENALEX_MAILTO") or None
+                    ),
+                    rate_limit_defer_after_seconds=float(
+                        message.get("rate_limit_defer_after_seconds") or 120.0
+                    ),
+                ),
+                importer=OpenAlexPaperImporter(
+                    session_factory=session_factory,
+                    batch_size=request.batch_size,
+                ),
+                redis_adapter=redis_adapter,
+                pending_redis_key=str(
+                    message.get("pending_redis_key")
+                    or "queue:openalex_bootstrap_papers_pending"
+                ),
+            )
+        )
+        return asyncio.run(pipeline.bootstrap_papers(request))
+
+    return runner
+
+
+def build_openalex_bootstrap_request(
+    message: dict[str, Any],
+    session_factory: Any,
+) -> OpenAlexBootstrapRequestDTO:
+    topic_ids = _int_list_message(message, "topic_ids")
+    field_ids = _optional_int_list_message(message, "field_ids")
+    if not field_ids and message.get("field_id") is not None:
+        field_ids = [int(message["field_id"])]
+    subfield_ids = _optional_int_list_message(message, "subfield_ids")
+
+    topic_targets = (
+        build_openalex_topic_targets(
+            session_factory,
+            topic_ids=topic_ids,
+            primary_topic_only=_bool_message(message, "primary_topic_only", True),
+        )
+        if topic_ids
+        else []
+    )
+    target_unit = str(message.get("target_unit") or ("topic" if topic_targets else "aggregate"))
+    if target_unit not in {"aggregate", "topic"}:
+        raise ValueError("bootstrap_papers target_unit must be aggregate or topic.")
+
+    return OpenAlexBootstrapRequestDTO(
+        target_count=int(message.get("target_count") or 0),
+        target_count_scope=str(message.get("target_scope") or "month"),
+        target_count_unit=target_unit,
+        topic_targets=topic_targets,
+        date_from=_date_message(message, "date_from"),
+        date_to=_date_message(message, "date_to"),
+        sample=True,
+        normalize="none",
+        monthly_stats_source=str(message.get("stats_source") or "redis"),
+        monthly_counts_redis_key=message.get("stats_redis_key"),
+        monthly_counts_csv=message.get("monthly_counts_csv"),
+        missing_stats_policy=str(message.get("missing_stats_policy") or "error"),
+        languages=_str_list_message(message, "languages", ["en", "ru"]),
+        types=_str_list_message(message, "types", ["article"]),
+        openalex_filter_parts=_str_list_message(message, "openalex_filter_parts", []),
+        local_field_ids=field_ids or [],
+        local_subfield_ids=subfield_ids or [],
+        batch_size=int(message.get("batch_size") or 500),
+        request_workers=int(message.get("request_workers") or 8),
+        db_workers=int(message.get("db_workers") or 2),
+        rate_limit_rps=float(message.get("rate_limit_rps") or 70.0),
+        seed=int(message.get("seed") or 42),
+        max_rounds=1,
+        per_page=int(message.get("per_page") or 100),
+        max_retries=int(message.get("max_retries") or 5),
+        skip_existing=_bool_message(message, "skip_existing", False),
+        enqueue_indexing=_bool_message(message, "enqueue_indexing", False),
+        dry_run=_bool_message(message, "dry_run", False),
+        show_progress=_bool_message(message, "show_progress", False),
+    )
+
+
+def build_openalex_topic_targets(
+    session_factory: Any,
+    *,
+    topic_ids: list[int],
+    primary_topic_only: bool,
+) -> list[OpenAlexBootstrapTopicTargetDTO]:
+    prefix = "primary_topic" if primary_topic_only else "topics"
+    with session_factory() as session:
+        topics = TaxonomyRepository(session).list_topics_by_ids(topic_ids)
+    missing = sorted(set(topic_ids) - {int(topic.id) for topic in topics})
+    if missing:
+        raise ValueError(f"Cannot build OpenAlex topic filters: missing_topic_ids={missing}")
+    without_openalex = [int(topic.id) for topic in topics if not topic.openalex_id]
+    if without_openalex:
+        raise ValueError(
+            "Cannot build OpenAlex topic filters: "
+            f"topics_without_openalex_id={without_openalex}"
+        )
+    return [
+        OpenAlexBootstrapTopicTargetDTO(
+            topic_id=int(topic.id),
+            filter_part=(
+                f"{prefix}.id:{normalize_openalex_filter_id(str(topic.openalex_id))}"
+            ),
+        )
+        for topic in topics
+    ]
+
+
+def normalize_openalex_filter_id(value: str) -> str:
+    return value.strip().rstrip("/").rsplit("/", 1)[-1]
+
+
+def _date_message(message: dict[str, Any], field: str) -> date:
+    value = message.get(field)
+    if isinstance(value, date):
+        return value
+    if value is None:
+        raise ValueError(f"bootstrap_papers {field} is required.")
+    return date.fromisoformat(str(value)[:10])
+
+
+def _int_list_message(message: dict[str, Any], field: str) -> list[int]:
+    values = _optional_int_list_message(message, field)
+    if not values:
+        return []
+    return values
+
+
+def _optional_int_list_message(message: dict[str, Any], field: str) -> list[int] | None:
+    value = message.get(field)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [int(item.strip()) for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [int(item) for item in value]
+    return [int(value)]
+
+
+def _str_list_message(
+    message: dict[str, Any],
+    field: str,
+    default: list[str],
+) -> list[str]:
+    value = message.get(field)
+    if value is None:
+        return list(default)
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()]
+
+
+def _bool_message(message: dict[str, Any], field: str, default: bool) -> bool:
+    value = message.get(field, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
 
 
 def build_cluster_recompute_pipeline_factory(

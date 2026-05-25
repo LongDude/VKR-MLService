@@ -45,6 +45,7 @@ from repositories.openalex_yearly_topic_stats import OpenAlexYearlyTopicStatsRep
 
 SAMPLE_LIMIT = 20
 OPENALEX_TOPIC_STATS_QUEUE = "queue:openalex_topic_stats"
+OPENALEX_BOOTSTRAP_PAPERS_QUEUE = "queue:openalex_bootstrap_papers"
 
 
 class LocalDataValidator:
@@ -546,6 +547,53 @@ class DataCoverageAnalyzer:
             },
         }
 
+    def analyze_sample_month_coverage(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        field_id: int,
+        topic_ids: list[int] | None = None,
+        include_missing_topic_ids: bool = False,
+    ) -> dict[str, Any]:
+        """Return local paper sample coverage by month for topics in one field."""
+        if date_from > date_to:
+            raise ValueError("--date-from must be before or equal to --date-to.")
+
+        topics = self._load_topics(field_ids=[field_id], topic_ids=topic_ids)
+        if not topics:
+            raise ValueError("No topics found for selected field scope.")
+
+        months = self._month_periods(date_from, date_to)
+        samples = self._sample_coverage(
+            topics,
+            months,
+            include_missing_topic_ids=include_missing_topic_ids,
+        )
+
+        return {
+            "command": "analyze-sample-month-coverage",
+            "date_from": date_from,
+            "date_to": date_to,
+            "normalized_month_from": months[0]["date_from"] if months else None,
+            "normalized_month_to": months[-1]["date_to"] if months else None,
+            "scope": {
+                "type": "field",
+                "field_id": field_id,
+                "topic_ids": sorted(set(topic_ids or [])),
+                "topics_count": len(topics),
+                "fields": self._field_summary(topics),
+            },
+            "summary": {
+                "months": len(months),
+                "sample_missing": samples["missing_topic_periods"],
+                "sample_empty_months": len(samples["empty_periods"]),
+            },
+            "checks": {
+                "samples": samples,
+            },
+        }
+
     def _publication_stats_coverage(
         self,
         topics: list[dict[str, Any]],
@@ -583,6 +631,8 @@ class DataCoverageAnalyzer:
         self,
         topics: list[dict[str, Any]],
         months: list[dict[str, Any]],
+        *,
+        include_missing_topic_ids: bool = False,
     ) -> dict[str, Any]:
         topic_ids = [int(topic["topic_id"]) for topic in topics]
         counts = self._load_sample_counts(topic_ids, months)
@@ -594,6 +644,7 @@ class DataCoverageAnalyzer:
             topics=topics,
             periods=months,
             existing=existing,
+            include_missing_topic_ids=include_missing_topic_ids,
         )
         coverage["empty_periods"] = [
             {
@@ -1150,6 +1201,167 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     add_redis_args(coverage_parser)
 
+    sample_coverage_parser = subparsers.add_parser(
+        "analyze-sample-month-coverage",
+        aliases=["analyze-samples-coverage"],
+        help="Analyze local monthly paper sample coverage for topics in one field.",
+    )
+    sample_coverage_parser.add_argument(
+        "--field-id",
+        type=int,
+        required=True,
+        help="Local field id whose topics should be analyzed.",
+    )
+    sample_coverage_parser.add_argument(
+        "--date-from",
+        type=parse_iso_date,
+        required=True,
+        help="Coverage period lower bound in YYYY-MM-DD format.",
+    )
+    sample_coverage_parser.add_argument(
+        "--date-to",
+        type=parse_iso_date,
+        required=True,
+        help="Coverage period upper bound in YYYY-MM-DD format.",
+    )
+    sample_coverage_parser.add_argument(
+        "--topic-ids",
+        default=None,
+        help="Optional comma-separated local topic ids within the selected field.",
+    )
+    sample_coverage_parser.add_argument(
+        "--sample-limit",
+        type=int,
+        default=SAMPLE_LIMIT,
+        help="Maximum detailed topics/periods in the report. Defaults to 20.",
+    )
+    sample_coverage_parser.add_argument(
+        "--include-missing-topic-ids",
+        action="store_true",
+        help="Include full missing topic id lists in missing_by_period sections.",
+    )
+    sample_coverage_parser.add_argument(
+        "--enqueue-missing-samples",
+        action="store_true",
+        help="Enqueue OpenAlex bootstrap_papers tasks for missing sample months.",
+    )
+    sample_coverage_parser.add_argument(
+        "--enqueue-task-batch-size",
+        type=int,
+        default=100,
+        help="Maximum topic ids per enqueued bootstrap_papers task. Defaults to 100.",
+    )
+    sample_coverage_parser.add_argument(
+        "--enqueue-queue",
+        default=OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+        help=f"Redis queue for enqueued bootstrap tasks. Defaults to {OPENALEX_BOOTSTRAP_PAPERS_QUEUE}.",
+    )
+    sample_coverage_parser.add_argument(
+        "--target-count",
+        type=int,
+        default=100,
+        help="Target sample papers per enqueued topic/month batch. Defaults to 100.",
+    )
+    sample_coverage_parser.add_argument(
+        "--languages",
+        default="en,ru",
+        help="Comma-separated OpenAlex languages for enqueued bootstrap tasks. Defaults to en,ru.",
+    )
+    sample_coverage_parser.add_argument(
+        "--types",
+        default="article",
+        help="Comma-separated OpenAlex work types for enqueued bootstrap tasks. Defaults to article.",
+    )
+    sample_coverage_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="PostgreSQL import batch size for enqueued bootstrap tasks. Defaults to 500.",
+    )
+    sample_coverage_parser.add_argument(
+        "--request-workers",
+        type=int,
+        default=8,
+        help="OpenAlex request workers for enqueued bootstrap tasks. Defaults to 8.",
+    )
+    sample_coverage_parser.add_argument(
+        "--db-workers",
+        type=int,
+        default=2,
+        help="PostgreSQL import workers for enqueued bootstrap tasks. Defaults to 2.",
+    )
+    sample_coverage_parser.add_argument(
+        "--rate-limit-rps",
+        type=float,
+        default=70.0,
+        help="OpenAlex request rate for enqueued bootstrap tasks. Defaults to 70.",
+    )
+    sample_coverage_parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Base OpenAlex sample seed for enqueued bootstrap tasks. Defaults to 42.",
+    )
+    sample_coverage_parser.add_argument(
+        "--per-page",
+        type=int,
+        default=100,
+        help="OpenAlex per-page value for enqueued bootstrap tasks. Defaults to 100.",
+    )
+    sample_coverage_parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="OpenAlex retry count for enqueued bootstrap tasks. Defaults to 5.",
+    )
+    sample_coverage_parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Ask bootstrap task processor not to update existing papers.",
+    )
+    sample_coverage_parser.add_argument(
+        "--enqueue-indexing",
+        action="store_true",
+        help="Ask bootstrap task processor to enqueue imported paper ids for indexing.",
+    )
+    sample_coverage_parser.add_argument(
+        "--primary-topic-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use primary_topic topic filters in bootstrap task processors. Enabled by default.",
+    )
+    sample_coverage_parser.add_argument(
+        "--openalex-url",
+        default=None,
+        help="OpenAlex base URL stored in enqueued bootstrap tasks.",
+    )
+    sample_coverage_parser.add_argument(
+        "--openalex-api-key",
+        default=None,
+        help="OpenAlex API key stored in enqueued bootstrap tasks.",
+    )
+    sample_coverage_parser.add_argument(
+        "--openalex-mailto",
+        default=None,
+        help="OpenAlex polite-pool email stored in enqueued bootstrap tasks.",
+    )
+    sample_coverage_parser.add_argument(
+        "--report-json",
+        default=None,
+        help="Optional path to write JSON report.",
+    )
+    sample_coverage_parser.add_argument(
+        "--env-file",
+        default=str(PROJECT_DIR / ".env"),
+        help="Path to .env file. Defaults to project .env.",
+    )
+    sample_coverage_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="SQLAlchemy database URL. Defaults to DATABASE_URL or POSTGRES_* envs.",
+    )
+    add_redis_args(sample_coverage_parser)
+
     return parser.parse_args(argv)
 
 
@@ -1167,6 +1379,11 @@ def main(argv: list[str] | None = None) -> int:
             report = run_check_openalex_jan1_anomalies(args)
         elif args.command in {"analyze-coverage", "analyze-data-coverage"}:
             report = run_analyze_coverage(args)
+        elif args.command in {
+            "analyze-sample-month-coverage",
+            "analyze-samples-coverage",
+        }:
+            report = run_analyze_sample_month_coverage(args)
         else:
             raise AssertionError(f"Unhandled command: {args.command}")
         if args.report_json:
@@ -1359,6 +1576,158 @@ def run_analyze_coverage(args: argparse.Namespace) -> dict[str, Any]:
             return report
     finally:
         engine.dispose()
+
+
+def run_analyze_sample_month_coverage(args: argparse.Namespace) -> dict[str, Any]:
+    """Analyze local monthly paper sample coverage for topics in a field."""
+    if args.date_from > args.date_to:
+        raise ValueError("--date-from must be before or equal to --date-to.")
+    if args.field_id <= 0:
+        raise ValueError("--field-id must be a positive integer.")
+    if args.sample_limit < 0:
+        raise ValueError("--sample-limit must be non-negative.")
+    if args.enqueue_task_batch_size <= 0:
+        raise ValueError("--enqueue-task-batch-size must be a positive integer.")
+    if args.target_count < 0:
+        raise ValueError("--target-count must be non-negative.")
+    if args.batch_size <= 0 or args.batch_size > 500:
+        raise ValueError("--batch-size must be between 1 and 500.")
+    if args.request_workers <= 0:
+        raise ValueError("--request-workers must be a positive integer.")
+    if args.db_workers <= 0:
+        raise ValueError("--db-workers must be a positive integer.")
+    if args.rate_limit_rps <= 0:
+        raise ValueError("--rate-limit-rps must be positive.")
+    if args.per_page <= 0 or args.per_page > 100:
+        raise ValueError("--per-page must be between 1 and 100.")
+    if args.max_retries < 0:
+        raise ValueError("--max-retries must be non-negative.")
+
+    topic_ids = parse_int_csv_arg(args.topic_ids) if args.topic_ids else None
+    database_url = args.database_url or Settings.from_env().database_url
+    engine = create_db_engine(database_url, echo=False)
+    SessionLocal = create_session_factory(engine, expire_on_commit=False)
+
+    try:
+        with SessionLocal() as session:
+            analyzer = DataCoverageAnalyzer(session, sample_limit=args.sample_limit)
+            report = analyzer.analyze_sample_month_coverage(
+                date_from=args.date_from,
+                date_to=args.date_to,
+                field_id=args.field_id,
+                topic_ids=topic_ids,
+                include_missing_topic_ids=(
+                    args.include_missing_topic_ids or args.enqueue_missing_samples
+                ),
+            )
+            if args.enqueue_missing_samples:
+                report["enqueued_worker_tasks"] = enqueue_missing_sample_tasks(
+                    report,
+                    redis_adapter=RedisAdapter(build_redis_client(args)),
+                    queue_name=args.enqueue_queue,
+                    task_batch_size=args.enqueue_task_batch_size,
+                    target_count=args.target_count,
+                    languages=parse_csv_arg(args.languages),
+                    types=parse_csv_arg(args.types),
+                    batch_size=args.batch_size,
+                    request_workers=args.request_workers,
+                    db_workers=args.db_workers,
+                    rate_limit_rps=args.rate_limit_rps,
+                    seed=args.seed,
+                    per_page=args.per_page,
+                    max_retries=args.max_retries,
+                    skip_existing=bool(args.skip_existing),
+                    enqueue_indexing=bool(args.enqueue_indexing),
+                    primary_topic_only=bool(args.primary_topic_only),
+                    openalex_url=args.openalex_url,
+                    openalex_api_key=args.openalex_api_key,
+                    openalex_mailto=args.openalex_mailto,
+                )
+            return report
+    finally:
+        engine.dispose()
+
+
+def enqueue_missing_sample_tasks(
+    report: dict[str, Any],
+    *,
+    redis_adapter: RedisAdapter,
+    queue_name: str,
+    task_batch_size: int,
+    target_count: int,
+    languages: list[str],
+    types: list[str],
+    batch_size: int,
+    request_workers: int,
+    db_workers: int,
+    rate_limit_rps: float,
+    seed: int,
+    per_page: int,
+    max_retries: int,
+    skip_existing: bool = False,
+    enqueue_indexing: bool = False,
+    primary_topic_only: bool = True,
+    openalex_url: str | None = None,
+    openalex_api_key: str | None = None,
+    openalex_mailto: str | None = None,
+) -> dict[str, Any]:
+    """Enqueue bootstrap_papers tasks for missing local sample months."""
+    samples = report["checks"]["samples"]
+    field_id = int(report["scope"]["field_id"])
+    messages: list[dict[str, Any]] = []
+    missing_periods = samples.get("missing_by_period", [])
+    if not isinstance(missing_periods, list):
+        raise ValueError("Coverage report samples.missing_by_period is invalid.")
+
+    for period in missing_periods:
+        topic_ids = period.get("topic_ids") if isinstance(period, dict) else None
+        if not isinstance(topic_ids, list):
+            raise ValueError(
+                "Coverage report does not include full missing topic ids. "
+                "Run analyzer with include_missing_topic_ids enabled."
+            )
+        for chunk in chunked_ints([int(topic_id) for topic_id in topic_ids], task_batch_size):
+            messages.append(
+                {
+                    "task_type": "bootstrap_papers",
+                    "date_from": _iso_date_value(period["period_start"]),
+                    "date_to": _iso_date_value(period["period_end"]),
+                    "field_id": field_id,
+                    "topic_ids": chunk,
+                    "target_count": target_count,
+                    "target_scope": "month",
+                    "target_unit": "topic",
+                    "languages": languages,
+                    "types": types,
+                    "batch_size": batch_size,
+                    "request_workers": request_workers,
+                    "db_workers": db_workers,
+                    "rate_limit_rps": rate_limit_rps,
+                    "seed": seed,
+                    "per_page": per_page,
+                    "max_retries": max_retries,
+                    "skip_existing": bool(skip_existing),
+                    "enqueue_indexing": bool(enqueue_indexing),
+                    "primary_topic_only": bool(primary_topic_only),
+                    "show_progress": False,
+                    **({"openalex_url": openalex_url} if openalex_url else {}),
+                    **({"openalex_api_key": openalex_api_key} if openalex_api_key else {}),
+                    **({"openalex_mailto": openalex_mailto} if openalex_mailto else {}),
+                }
+            )
+
+    for message in messages:
+        redis_adapter.enqueue(queue_name, message)
+
+    return {
+        "queue": queue_name,
+        "source_check": "samples",
+        "missing_topic_periods": int(samples.get("missing_topic_periods") or 0),
+        "messages": len(messages),
+        "task_batch_size": task_batch_size,
+        "target_count": target_count,
+        "sample": messages[:3],
+    }
 
 
 def enqueue_missing_topic_stats_tasks(

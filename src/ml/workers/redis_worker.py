@@ -13,6 +13,7 @@ from ml.workers.task_handlers import MLTaskHandler
 
 KEYWORD_EXTRACTION_QUEUE = "queue:keyword_extraction"
 OPENALEX_TOPIC_STATS_QUEUE = "queue:openalex_topic_stats"
+OPENALEX_BOOTSTRAP_PAPERS_QUEUE = "queue:openalex_bootstrap_papers"
 PAPER_INDEXING_QUEUE = "queue:paper_indexing"
 ENTITY_INDEXING_QUEUE = "queue:entity_indexing"
 CLUSTER_RECOMPUTE_QUEUE = "queue:cluster_recompute"
@@ -23,6 +24,7 @@ FAILED_TASKS_QUEUE = "queue:failed_tasks"
 
 DEFAULT_QUEUE_ORDER = (
     OPENALEX_TOPIC_STATS_QUEUE,
+    OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     KEYWORD_EXTRACTION_QUEUE,
     PAPER_INDEXING_QUEUE,
     ENTITY_INDEXING_QUEUE,
@@ -731,6 +733,7 @@ __all__ = [
     "FAILED_TASKS_QUEUE",
     "KEYWORD_EXTRACTION_QUEUE",
     "OPENALEX_TOPIC_STATS_QUEUE",
+    "OPENALEX_BOOTSTRAP_PAPERS_QUEUE",
     "PAPER_INDEXING_QUEUE",
     "RedisMLWorker",
     "TOPIC_QUARTER_REPORT_QUEUE",
