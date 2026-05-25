@@ -64,6 +64,9 @@ class OpenAlexTopicStatsCollectionResult:
     created: int = 0
     updated: int = 0
     failed: int = 0
+    deferred: bool = False
+    retry_after_seconds: float | None = None
+    pending_tasks: list[dict[str, object]] = field(default_factory=list)
     dry_run: bool = False
     errors: list[dict[str, object]] = field(default_factory=list)
 
@@ -134,6 +137,7 @@ class OpenAlexTopicStatsCollector:
         request_workers: int = 8,
         rate_limiter: SyncRateLimiter | None = None,
         max_retries: int = 5,
+        rate_limit_defer_after_seconds: float = 120.0,
         primary_topic_only: bool = False,
         commit_each_batch: bool = True,
     ) -> None:
@@ -144,6 +148,7 @@ class OpenAlexTopicStatsCollector:
         self.request_workers = max(1, request_workers)
         self.rate_limiter = rate_limiter or SyncRateLimiter(70)
         self.max_retries = max(0, max_retries)
+        self.rate_limit_defer_after_seconds = max(0.0, rate_limit_defer_after_seconds)
         self.primary_topic_only = primary_topic_only
         self.commit_each_batch = commit_each_batch
         self._thread_local = threading.local()
@@ -253,6 +258,7 @@ class OpenAlexTopicStatsCollector:
         )
         try:
             if taxonomy_scope == "topic":
+                completed_topic_periods: set[tuple[int, date]] = set()
                 for fetch_result in self._iter_fetch_results(
                     topics=topic_infos,
                     periods=periods,
@@ -261,11 +267,36 @@ class OpenAlexTopicStatsCollector:
                     normalize_january_first=normalize_january_first,
                 ):
                     result.openalex_requests += fetch_result.openalex_requests
+                    deferred_error = self._deferred_error(fetch_result.errors)
+                    if deferred_error is not None:
+                        result.deferred = True
+                        result.retry_after_seconds = self._error_retry_after_seconds(
+                            deferred_error
+                        )
+                        result.errors.append(deferred_error)
+                        result.pending_tasks = self._topic_pending_tasks(
+                            topic_infos=topic_infos,
+                            periods=periods,
+                            completed=completed_topic_periods,
+                            languages=languages or ["en", "ru"],
+                            types=types or ["article"],
+                            batch_size=batch_size,
+                            request_workers=self.request_workers,
+                            group_by_page_size=group_by_page_size,
+                            normalize_january_first=normalize_january_first,
+                        )
+                        break
                     if fetch_result.errors:
                         result.failed += 1
                         result.errors.extend(fetch_result.errors)
                     if fetch_result.item is not None:
                         pending_items.append(fetch_result.item)
+                        completed_topic_periods.add(
+                            (
+                                int(fetch_result.item.topic_id),
+                                fetch_result.item.period_start,
+                            )
+                        )
                     if fetch_result.yearly_item is not None:
                         pending_yearly_items.append(fetch_result.yearly_item)
                     if progress_bar is not None:
@@ -273,6 +304,7 @@ class OpenAlexTopicStatsCollector:
                     if len(pending_items) >= batch_size:
                         self._flush_batch(pending_items, pending_yearly_items, result)
             else:
+                completed_periods: set[date] = set()
                 topic_by_external_id = {
                     _normalize_external_id(item.openalex_id): item
                     for item in topic_infos
@@ -287,11 +319,34 @@ class OpenAlexTopicStatsCollector:
                     normalize_january_first=normalize_january_first,
                 ):
                     result.openalex_requests += grouped_result.openalex_requests
+                    deferred_error = self._deferred_error(grouped_result.errors)
+                    if deferred_error is not None:
+                        result.deferred = True
+                        result.retry_after_seconds = self._error_retry_after_seconds(
+                            deferred_error
+                        )
+                        result.errors.append(deferred_error)
+                        result.pending_tasks = self._grouped_pending_tasks(
+                            periods=periods,
+                            completed=completed_periods,
+                            field_ids=field_ids,
+                            subfield_ids=subfield_ids,
+                            taxonomy_scope=taxonomy_scope,
+                            languages=languages or ["en", "ru"],
+                            types=types or ["article"],
+                            batch_size=batch_size,
+                            request_workers=self.request_workers,
+                            group_by_page_size=group_by_page_size,
+                            normalize_january_first=normalize_january_first,
+                        )
+                        break
                     if grouped_result.errors:
                         result.failed += 1
                         result.errors.extend(grouped_result.errors)
                     pending_items.extend(grouped_result.items)
                     pending_yearly_items.extend(grouped_result.yearly_items)
+                    for item in grouped_result.items:
+                        completed_periods.add(item.period_start)
                     if progress_bar is not None:
                         progress_bar.update(1)
                     if len(pending_items) >= batch_size:
@@ -314,6 +369,130 @@ class OpenAlexTopicStatsCollector:
             result.openalex_requests,
         )
         return result
+
+    def _topic_pending_tasks(
+        self,
+        *,
+        topic_infos: list[_TopicInfo],
+        periods: list[MonthPeriod],
+        completed: set[tuple[int, date]],
+        languages: list[str],
+        types: list[str],
+        batch_size: int,
+        request_workers: int,
+        group_by_page_size: int,
+        normalize_january_first: bool,
+    ) -> list[dict[str, object]]:
+        return [
+            self._pending_task_payload(
+                period=period,
+                taxonomy_scope="topic",
+                topic_ids=[topic.id],
+                field_ids=None,
+                subfield_ids=None,
+                languages=languages,
+                types=types,
+                batch_size=batch_size,
+                request_workers=request_workers,
+                group_by_page_size=group_by_page_size,
+                normalize_january_first=normalize_january_first,
+            )
+            for topic in topic_infos
+            for period in periods
+            if (topic.id, period.period_start) not in completed
+        ]
+
+    def _grouped_pending_tasks(
+        self,
+        *,
+        periods: list[MonthPeriod],
+        completed: set[date],
+        field_ids: list[int] | None,
+        subfield_ids: list[int] | None,
+        taxonomy_scope: TaxonomyStatsScope,
+        languages: list[str],
+        types: list[str],
+        batch_size: int,
+        request_workers: int,
+        group_by_page_size: int,
+        normalize_january_first: bool,
+    ) -> list[dict[str, object]]:
+        return [
+            self._pending_task_payload(
+                period=period,
+                taxonomy_scope=taxonomy_scope,
+                topic_ids=None,
+                field_ids=field_ids,
+                subfield_ids=subfield_ids,
+                languages=languages,
+                types=types,
+                batch_size=batch_size,
+                request_workers=request_workers,
+                group_by_page_size=group_by_page_size,
+                normalize_january_first=normalize_january_first,
+            )
+            for period in periods
+            if period.period_start not in completed
+        ]
+
+    def _pending_task_payload(
+        self,
+        *,
+        period: MonthPeriod,
+        taxonomy_scope: TaxonomyStatsScope,
+        topic_ids: list[int] | None,
+        field_ids: list[int] | None,
+        subfield_ids: list[int] | None,
+        languages: list[str],
+        types: list[str],
+        batch_size: int,
+        request_workers: int,
+        group_by_page_size: int,
+        normalize_january_first: bool,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "task_type": "collect_topic_stats",
+            "date_from": period.period_start.isoformat(),
+            "date_to": period.period_end.isoformat(),
+            "taxonomy_scope": taxonomy_scope,
+            "languages": languages,
+            "types": types,
+            "batch_size": batch_size,
+            "request_workers": request_workers,
+            "group_by_page_size": group_by_page_size,
+            "max_retries": self.max_retries,
+            "normalize_january_first": normalize_january_first,
+            "primary_topic_only": self.primary_topic_only,
+            "show_progress": False,
+        }
+        if topic_ids:
+            payload["topic_ids"] = topic_ids
+        if field_ids:
+            payload["field_ids"] = field_ids
+        if subfield_ids:
+            payload["subfield_ids"] = subfield_ids
+        rate_limit = getattr(self.rate_limiter, "requests_per_second", None)
+        if rate_limit is not None:
+            payload["rate_limit_rps"] = float(rate_limit)
+        return payload
+
+    def _deferred_error(
+        self,
+        errors: list[dict[str, object]],
+    ) -> dict[str, object] | None:
+        for error in errors:
+            if bool(error.get("deferred")):
+                return error
+        return None
+
+    def _error_retry_after_seconds(self, error: dict[str, object]) -> float | None:
+        value = error.get("retry_after_seconds")
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _flush_batch(
         self,
@@ -588,8 +767,43 @@ class OpenAlexTopicStatsCollector:
                     seen_cursors.add(cursor)
                     cursor = next_cursor
                 return counts, requests, None
+            except ExternalServiceRateLimitError as exc:
+                retry_after = self._retry_after_seconds(exc)
+                if (
+                    retry_after is None
+                    or retry_after > self.rate_limit_defer_after_seconds
+                ):
+                    error = self._group_error_payload(
+                        period,
+                        language,
+                        publication_type,
+                        group_by,
+                        exc,
+                    )
+                    error["deferred"] = True
+                    error["retry_after_seconds"] = retry_after
+                    return {}, requests, error
+                if attempt >= self.max_retries:
+                    return {}, requests, self._group_error_payload(
+                        period,
+                        language,
+                        publication_type,
+                        group_by,
+                        exc,
+                    )
+                logger.warning(
+                    "OpenAlex group retry: period=%s language=%s type=%s group_by=%s attempt=%s/%s delay=%.2fs reason=%s",
+                    period.period_start.isoformat(),
+                    language,
+                    publication_type,
+                    group_by,
+                    attempt + 1,
+                    self.max_retries,
+                    retry_after,
+                    exc.__class__.__name__,
+                )
+                time.sleep(retry_after)
             except (
-                ExternalServiceRateLimitError,
                 ExternalServiceUnavailableError,
                 httpx.HTTPError,
             ) as exc:
@@ -648,8 +862,43 @@ class OpenAlexTopicStatsCollector:
                     primary_topic_only=self.primary_topic_only,
                 )
                 return count, requests, None
+            except ExternalServiceRateLimitError as exc:
+                retry_after = self._retry_after_seconds(exc)
+                if (
+                    retry_after is None
+                    or retry_after > self.rate_limit_defer_after_seconds
+                ):
+                    error = self._error_payload(
+                        topic,
+                        period,
+                        language,
+                        publication_type,
+                        exc,
+                    )
+                    error["deferred"] = True
+                    error["retry_after_seconds"] = retry_after
+                    return 0, requests, error
+                if attempt >= self.max_retries:
+                    return 0, requests, self._error_payload(
+                        topic,
+                        period,
+                        language,
+                        publication_type,
+                        exc,
+                    )
+                logger.warning(
+                    "OpenAlex count retry: topic_id=%s period=%s language=%s type=%s attempt=%s/%s delay=%.2fs reason=%s",
+                    topic.id,
+                    period.period_start.isoformat(),
+                    language,
+                    publication_type,
+                    attempt + 1,
+                    self.max_retries,
+                    retry_after,
+                    exc.__class__.__name__,
+                )
+                time.sleep(retry_after)
             except (
-                ExternalServiceRateLimitError,
                 ExternalServiceUnavailableError,
                 httpx.HTTPError,
             ) as exc:
@@ -811,6 +1060,7 @@ class OpenAlexTopicStatsCollector:
             "topic_id": topic.id,
             "topic_openalex_id": topic.openalex_id,
             "period_start": period.period_start.isoformat(),
+            "period_end": period.period_end.isoformat(),
             "language": language,
             "type": publication_type,
             "code": exc.__class__.__name__,
@@ -841,7 +1091,7 @@ class OpenAlexTopicStatsCollector:
     def _backoff_seconds(self, attempt: int) -> float:
         return min(30.0, 0.5 * (2**attempt))
 
-    def _retry_delay(self, exc: Exception, attempt: int) -> float:
+    def _retry_after_seconds(self, exc: Exception) -> float | None:
         details = getattr(exc, "details", None)
         retry_after = (
             details.get("retry_after")
@@ -849,9 +1099,15 @@ class OpenAlexTopicStatsCollector:
             else None
         )
         if isinstance(retry_after, str):
-            parsed = self._parse_retry_after(retry_after)
-            if parsed is not None:
-                return parsed
+            return self._parse_retry_after(retry_after)
+        if isinstance(retry_after, (int, float)):
+            return max(0.0, float(retry_after))
+        return None
+
+    def _retry_delay(self, exc: Exception, attempt: int) -> float:
+        parsed = self._retry_after_seconds(exc)
+        if parsed is not None:
+            return parsed
         return self._backoff_seconds(attempt)
 
     def _parse_retry_after(self, value: str) -> float | None:

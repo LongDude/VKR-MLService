@@ -23,10 +23,12 @@ from core.config import Settings
 from core.exceptions import AppError
 from ml.constants import PAPERS_COLLECTION
 from ml.services.quarter_periods import QuarterPeriodService
+from ml.services.openalex_cooldown import OPENALEX_COOLDOWN_KEY
 from ml.workers.redis_worker import (
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
     FAILED_TASKS_QUEUE,
+    OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     OPENALEX_TOPIC_STATS_QUEUE,
     PAPER_INDEXING_QUEUE,
     TOPIC_QUARTER_REPORT_QUEUE,
@@ -782,6 +784,86 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_database_args(stats_parser)
     add_redis_args(stats_parser)
 
+    bootstrap_parser = subparsers.add_parser(
+        "enqueue-bootstrap-papers",
+        help="Enqueue OpenAlex bootstrap_papers worker tasks without running OpenAlex.",
+    )
+    bootstrap_parser.add_argument(
+        "--topic-ids",
+        required=True,
+        help="Comma-separated local topic ids to sample with primary_topic filters.",
+    )
+    bootstrap_parser.add_argument(
+        "--date-from",
+        type=parse_iso_date,
+        required=True,
+        help="Publication period lower bound in YYYY-MM-DD format.",
+    )
+    bootstrap_parser.add_argument(
+        "--date-to",
+        type=parse_iso_date,
+        required=True,
+        help="Publication period upper bound in YYYY-MM-DD format.",
+    )
+    bootstrap_parser.add_argument(
+        "--target-count",
+        type=int,
+        default=20,
+        help="Target sample papers per topic/month. Defaults to 20.",
+    )
+    bootstrap_parser.add_argument(
+        "--task-batch-size",
+        type=int,
+        default=100,
+        help="Maximum topic ids per Redis task. Defaults to 100.",
+    )
+    bootstrap_parser.add_argument("--languages", default="en,ru")
+    bootstrap_parser.add_argument("--types", default="article")
+    bootstrap_parser.add_argument("--batch-size", type=int, default=500)
+    bootstrap_parser.add_argument("--request-workers", type=int, default=8)
+    bootstrap_parser.add_argument("--db-workers", type=int, default=2)
+    bootstrap_parser.add_argument("--rate-limit-rps", type=float, default=70.0)
+    bootstrap_parser.add_argument("--seed", type=int, default=42)
+    bootstrap_parser.add_argument("--per-page", type=int, default=100)
+    bootstrap_parser.add_argument("--max-retries", type=int, default=5)
+    bootstrap_parser.add_argument("--skip-existing", action="store_true")
+    bootstrap_parser.add_argument(
+        "--no-enqueue-indexing",
+        action="store_true",
+        help="Do not enqueue imported papers for indexing.",
+    )
+    bootstrap_parser.add_argument(
+        "--no-enqueue-cluster-dynamics",
+        action="store_true",
+        help="Do not enqueue cluster dynamics through indexing workflow.",
+    )
+    bootstrap_parser.add_argument(
+        "--primary-topic-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    bootstrap_parser.add_argument("--openalex-url", default=None)
+    bootstrap_parser.add_argument("--openalex-api-key", default=None)
+    bootstrap_parser.add_argument("--openalex-mailto", default=None)
+    bootstrap_parser.add_argument("--dry-run", action="store_true")
+    bootstrap_parser.add_argument(
+        "--env-file",
+        default=str(PROJECT_DIR / ".env"),
+        help="Path to .env file. Defaults to project .env.",
+    )
+    add_redis_args(bootstrap_parser)
+
+    cooldown_parser = subparsers.add_parser(
+        "openalex-cooldown-status",
+        help="Show OpenAlex worker cooldown status stored in Redis.",
+    )
+    cooldown_parser.add_argument(
+        "--env-file",
+        default=str(PROJECT_DIR / ".env"),
+        help="Path to .env file. Defaults to project .env.",
+    )
+    add_redis_args(cooldown_parser)
+
     cluster_parser = subparsers.add_parser(
         "enqueue-cluster-recompute",
         help="Enqueue static topic cluster recomputation tasks.",
@@ -1027,6 +1109,10 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_enqueue_indexing(args)
         elif args.command in {"enqueue-topic-stats", "enqueue-collect-topic-stats"}:
             payload = run_enqueue_topic_stats_collection(args)
+        elif args.command == "enqueue-bootstrap-papers":
+            payload = run_enqueue_bootstrap_papers(args)
+        elif args.command == "openalex-cooldown-status":
+            payload = run_openalex_cooldown_status(args)
         elif args.command == "enqueue-cluster-recompute":
             payload = run_enqueue_cluster_recompute(args)
         elif args.command == "enqueue-cluster-dynamics":
@@ -1138,6 +1224,77 @@ def run_enqueue_topic_stats_collection(args: argparse.Namespace) -> dict[str, An
     return {
         "command": "enqueue-topic-stats",
         "result": result,
+    }
+
+
+def run_enqueue_bootstrap_papers(args: argparse.Namespace) -> dict[str, Any]:
+    """Enqueue OpenAlex paper bootstrap tasks into Redis."""
+    if args.date_from > args.date_to:
+        raise ValueError("--date-from must be before or equal to --date-to.")
+    if args.target_count < 0:
+        raise ValueError("--target-count must be non-negative.")
+    if args.task_batch_size <= 0:
+        raise ValueError("--task-batch-size must be a positive integer.")
+    topic_ids = parse_int_csv_arg(args.topic_ids)
+    messages: list[dict[str, Any]] = []
+    for chunk in chunked(topic_ids, args.task_batch_size):
+        messages.append(
+            {
+                "task_type": "bootstrap_papers",
+                "date_from": args.date_from.isoformat(),
+                "date_to": args.date_to.isoformat(),
+                "topic_ids": chunk,
+                "source_topic_ids": chunk,
+                "target_count": args.target_count,
+                "target_scope": "month",
+                "target_unit": "topic",
+                "languages": parse_csv_arg(args.languages),
+                "types": parse_csv_arg(args.types),
+                "batch_size": args.batch_size,
+                "request_workers": args.request_workers,
+                "db_workers": args.db_workers,
+                "rate_limit_rps": args.rate_limit_rps,
+                "seed": args.seed,
+                "per_page": args.per_page,
+                "max_retries": args.max_retries,
+                "skip_existing": bool(args.skip_existing),
+                "enqueue_indexing": not bool(args.no_enqueue_indexing),
+                "enqueue_cluster_dynamics": not bool(args.no_enqueue_cluster_dynamics),
+                "primary_topic_only": bool(args.primary_topic_only),
+                "workflow_date_from": args.date_from.isoformat(),
+                "workflow_date_to": args.date_to.isoformat(),
+                "workflow_granularity": "month",
+                "show_progress": False,
+                **({"openalex_url": args.openalex_url} if args.openalex_url else {}),
+                **({"openalex_api_key": args.openalex_api_key} if args.openalex_api_key else {}),
+                **({"openalex_mailto": args.openalex_mailto} if args.openalex_mailto else {}),
+            }
+        )
+    if not args.dry_run:
+        redis_adapter = RedisAdapter(build_redis_client(args))
+        for message in messages:
+            redis_adapter.enqueue(OPENALEX_BOOTSTRAP_PAPERS_QUEUE, message)
+    return {
+        "command": "enqueue-bootstrap-papers",
+        "queue": OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+        "dry_run": bool(args.dry_run),
+        "topic_count": len(set(topic_ids)),
+        "messages": len(messages),
+        "target_count": args.target_count,
+        "sample": messages[:3],
+    }
+
+
+def run_openalex_cooldown_status(args: argparse.Namespace) -> dict[str, Any]:
+    """Return OpenAlex cooldown key status from Redis."""
+    redis_adapter = RedisAdapter(build_redis_client(args))
+    exists = redis_adapter.exists(OPENALEX_COOLDOWN_KEY)
+    return {
+        "command": "openalex-cooldown-status",
+        "key": OPENALEX_COOLDOWN_KEY,
+        "exists": exists,
+        "ttl_seconds": redis_adapter.ttl(OPENALEX_COOLDOWN_KEY) if exists else -2,
+        "payload": redis_adapter.get_json(OPENALEX_COOLDOWN_KEY) if exists else None,
     }
 
 

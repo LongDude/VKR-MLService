@@ -18,6 +18,7 @@ from ml.services.openalex_paper_downloader import (
 )
 from ml.services.openalex_paper_importer import OpenAlexPaperImporter
 from ml.services.openalex_paper_plan import OpenAlexPaperPlanService
+from ml.services.openalex_cooldown import set_openalex_cooldown
 from repositories.papers import PaperRepository
 
 
@@ -36,6 +37,8 @@ class OpenAlexPapersFacade:
         importer: OpenAlexPaperImporter,
         redis_adapter: RedisAdapter | None = None,
         pending_redis_key: str | None = None,
+        pending_task_options: dict[str, Any] | None = None,
+        cooldown_source_queue: str | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.session_factory = session_factory
@@ -44,6 +47,8 @@ class OpenAlexPapersFacade:
         self.importer = importer
         self.redis_adapter = redis_adapter
         self.pending_redis_key = pending_redis_key
+        self.pending_task_options = dict(pending_task_options or {})
+        self.cooldown_source_queue = cooldown_source_queue
         self.logger = logger or logging.getLogger(__name__)
 
     async def bootstrap(
@@ -108,6 +113,10 @@ class OpenAlexPapersFacade:
             report.deferred = True
             report.pending_redis_key = self.pending_redis_key
             report.retry_after_seconds = download.retry_after_seconds
+            self._set_cooldown(
+                download.retry_after_seconds,
+                task_type="bootstrap_papers",
+            )
 
         report.final_count = self._paper_count()
         report.final_total_count = report.final_count
@@ -148,6 +157,11 @@ class OpenAlexPapersFacade:
         deferred_pages = (
             self._enqueue_pending_pages(download.pending_pages) if download.deferred else 0
         )
+        if download.deferred:
+            self._set_cooldown(
+                download.retry_after_seconds,
+                task_type="resume_bootstrap_papers",
+            )
         unit_summaries = [
             self._unit_summary_payload(summary)
             for summary in download.unit_summaries.values()
@@ -335,13 +349,17 @@ class OpenAlexPapersFacade:
             return 0
         enqueued = 0
         for paper_id in paper_ids:
+            message = {
+                "task_type": "paper_indexing",
+                "paper_id": paper_id,
+                "force_reindex": False,
+            }
+            workflow_options = self._indexing_workflow_options()
+            if workflow_options:
+                message.update(workflow_options)
             self.redis_adapter.enqueue(
                 PAPER_INDEXING_QUEUE,
-                {
-                    "task_type": "paper_indexing",
-                    "paper_id": paper_id,
-                    "force_reindex": False,
-                },
+                message,
             )
             enqueued += 1
         return enqueued
@@ -353,12 +371,48 @@ class OpenAlexPapersFacade:
             raise ValueError("Redis adapter and pending_redis_key are required.")
         enqueued = 0
         for page in pages:
+            payload = page.model_dump(mode="json")
+            if self.pending_task_options:
+                payload = {
+                    "task_type": "resume_bootstrap_papers",
+                    "page": payload,
+                    **self.pending_task_options,
+                }
             self.redis_adapter.enqueue(
                 self.pending_redis_key,
-                page.model_dump(mode="json"),
+                payload,
             )
             enqueued += 1
         return enqueued
+
+    def _indexing_workflow_options(self) -> dict[str, Any]:
+        allowed = {
+            "source_topic_ids",
+            "workflow_date_from",
+            "workflow_date_to",
+            "workflow_granularity",
+            "enqueue_cluster_dynamics",
+        }
+        return {
+            key: value
+            for key, value in self.pending_task_options.items()
+            if key in allowed and value is not None
+        }
+
+    def _set_cooldown(
+        self,
+        retry_after_seconds: float | None,
+        *,
+        task_type: str,
+    ) -> None:
+        if self.redis_adapter is None:
+            return
+        set_openalex_cooldown(
+            self.redis_adapter,
+            retry_after_seconds=retry_after_seconds,
+            source_queue=self.cooldown_source_queue,
+            task_type=task_type,
+        )
 
     def _paper_count(self) -> int:
         with self.session_factory() as session:

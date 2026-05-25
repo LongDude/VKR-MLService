@@ -30,7 +30,11 @@ from adapters import (
 )
 from core.config import Settings
 from core.exceptions import AppError
-from dto.openalex import OpenAlexBootstrapRequestDTO, OpenAlexBootstrapTopicTargetDTO
+from dto.openalex import (
+    OpenAlexBootstrapRequestDTO,
+    OpenAlexBootstrapTopicTargetDTO,
+    OpenAlexPendingPageDTO,
+)
 from ml.constants import DEFAULT_EMBEDDING_MODEL
 from ml.facades import (
     ClusterAnalyticsFacade,
@@ -66,7 +70,9 @@ from ml.workers.redis_worker import (
     DEFAULT_QUEUE_ORDER,
     ENTITY_INDEXING_QUEUE,
     KEYWORD_EXTRACTION_QUEUE,
+    OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE,
     OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
     OPENALEX_TOPIC_STATS_QUEUE,
     PAPER_INDEXING_QUEUE,
     TOPIC_QUARTER_REPORT_QUEUE,
@@ -99,9 +105,11 @@ QUEUE_ALIASES = {
     "openalex_topic_stats": OPENALEX_TOPIC_STATS_QUEUE,
     "collect_topic_stats": OPENALEX_TOPIC_STATS_QUEUE,
     "collect-topic-stats": OPENALEX_TOPIC_STATS_QUEUE,
+    "openalex_topic_stats_pending": OPENALEX_TOPIC_STATS_PENDING_QUEUE,
     "openalex_bootstrap_papers": OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     "bootstrap_papers": OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     "bootstrap-papers": OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+    "openalex_bootstrap_papers_pending": OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE,
     "keyword_extraction": KEYWORD_EXTRACTION_QUEUE,
     "paper_indexing": PAPER_INDEXING_QUEUE,
     "entity_indexing": ENTITY_INDEXING_QUEUE,
@@ -125,7 +133,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     run_parser.add_argument(
         "--queues",
-        default=",".join(alias for alias in QUEUE_ALIASES if alias != "research_entities_indexing"),
+        default=",".join(DEFAULT_QUEUE_ORDER),
         help=(
             "Comma-separated queues to process. Accepts names like "
             "paper_indexing,cluster_recompute or full queue:* names."
@@ -142,6 +150,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=2.0,
         help="Seconds to sleep when no tasks are available. Defaults to 2.",
+    )
+    run_parser.add_argument(
+        "--dequeue-timeout-seconds",
+        type=int,
+        default=30,
+        help="Redis BLPOP timeout for active queues. Defaults to 30.",
     )
     run_parser.add_argument(
         "-v",
@@ -295,6 +309,8 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--max-tasks must be a positive integer.")
     if args.idle_sleep < 0:
         raise ValueError("--idle-sleep must be non-negative.")
+    if args.dequeue_timeout_seconds <= 0:
+        raise ValueError("--dequeue-timeout-seconds must be a positive integer.")
     if args.keyword_extraction_batch_size <= 0:
         raise ValueError("--keyword-extraction-batch-size must be a positive integer.")
     if args.max_keyword_task_size is not None and args.max_keyword_task_size <= 0:
@@ -379,6 +395,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                     CLUSTER_RECOMPUTE_QUEUE: max_cluster_task_size,
                 },
                 idle_sleep_seconds=args.idle_sleep,
+                dequeue_timeout_seconds=args.dequeue_timeout_seconds,
                 show_progress=not args.no_progress,
                 event_sink=event_sink,
             )
@@ -418,6 +435,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 CLUSTER_RECOMPUTE_QUEUE: max_cluster_task_size,
             },
             "progress": not args.no_progress,
+            "dequeue_timeout_seconds": args.dequeue_timeout_seconds,
             "event_redis": bool(args.event_redis),
             "verbosity": args.verbose,
             "processed": processed,
@@ -537,6 +555,7 @@ def build_task_handler(
             session_factory=session_factory,
             redis_adapter=redis_adapter,
         ),
+        redis_adapter=redis_adapter,
         event_sink=event_sink,
         cluster_recompute_workers=cluster_recompute_workers,
         cluster_recompute_pipeline_factory=cluster_recompute_pipeline_factory,
@@ -586,6 +605,9 @@ def build_openalex_topic_stats_collector_factory(session: Any) -> Any:
             request_workers=max(1, int(message.get("request_workers") or 8)),
             rate_limiter=SyncRateLimiter(float(message.get("rate_limit_rps") or 10.0)),
             max_retries=max(0, int(message.get("max_retries") or 5)),
+            rate_limit_defer_after_seconds=float(
+                message.get("rate_limit_defer_after_seconds") or 120.0
+            ),
             primary_topic_only=_message_bool(message, "primary_topic_only", True),
         )
 
@@ -600,7 +622,12 @@ def build_openalex_paper_bootstrap_runner(
     """Build a callable that runs OpenAlex paper bootstrap from worker messages."""
 
     def runner(message: dict[str, Any]) -> Any:
-        request = build_openalex_bootstrap_request(message, session_factory)
+        task_type = str(message.get("task_type") or "bootstrap_papers")
+        request = (
+            build_openalex_bootstrap_request(message, session_factory)
+            if task_type != "resume_bootstrap_papers"
+            else None
+        )
         pipeline = OpenAlexPaperLoadingPipeline(
             OpenAlexPapersFacade(
                 session_factory=session_factory,
@@ -611,9 +638,21 @@ def build_openalex_paper_bootstrap_runner(
                         or os.getenv("OPENALEX_BASE_URL")
                         or "https://api.openalex.org"
                     ),
-                    request_workers=request.request_workers,
-                    rate_limiter=AsyncRateLimiter(request.rate_limit_rps),
-                    max_retries=request.max_retries,
+                    request_workers=(
+                        request.request_workers
+                        if request is not None
+                        else int(message.get("request_workers") or 8)
+                    ),
+                    rate_limiter=AsyncRateLimiter(
+                        request.rate_limit_rps
+                        if request is not None
+                        else float(message.get("rate_limit_rps") or 70.0)
+                    ),
+                    max_retries=(
+                        request.max_retries
+                        if request is not None
+                        else int(message.get("max_retries") or 5)
+                    ),
                     api_key=(
                         str(message.get("openalex_api_key")).strip()
                         if message.get("openalex_api_key")
@@ -630,15 +669,33 @@ def build_openalex_paper_bootstrap_runner(
                 ),
                 importer=OpenAlexPaperImporter(
                     session_factory=session_factory,
-                    batch_size=request.batch_size,
+                    batch_size=(
+                        request.batch_size
+                        if request is not None
+                        else int(message.get("batch_size") or 500)
+                    ),
                 ),
                 redis_adapter=redis_adapter,
                 pending_redis_key=str(
                     message.get("pending_redis_key")
-                    or "queue:openalex_bootstrap_papers_pending"
+                    or OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE
+                ),
+                pending_task_options=build_bootstrap_pending_task_options(message),
+                cooldown_source_queue=str(
+                    message.get("source_queue") or OPENALEX_BOOTSTRAP_PAPERS_QUEUE
                 ),
             )
         )
+        if task_type == "resume_bootstrap_papers":
+            return asyncio.run(
+                pipeline.resume_pages(
+                    bootstrap_pending_pages_from_message(message),
+                    db_workers=int(message.get("db_workers") or 2),
+                    skip_existing=_bool_message(message, "skip_existing", False),
+                    enqueue_indexing=_bool_message(message, "enqueue_indexing", False),
+                    show_progress=_bool_message(message, "show_progress", False),
+                )
+            )
         return asyncio.run(pipeline.bootstrap_papers(request))
 
     return runner
@@ -687,8 +744,7 @@ def build_openalex_bootstrap_request(
         local_subfield_ids=subfield_ids or [],
         batch_size=int(message.get("batch_size") or 500),
         request_workers=int(message.get("request_workers") or 8),
-        db_workers=1, #! TEMPORAL PATCH
-        # db_workers=int(message.get("db_workers") or 2),
+        db_workers=int(message.get("db_workers") or 2),
         rate_limit_rps=float(message.get("rate_limit_rps") or 70.0),
         seed=int(message.get("seed") or 42),
         max_rounds=1,
@@ -699,6 +755,65 @@ def build_openalex_bootstrap_request(
         dry_run=_bool_message(message, "dry_run", False),
         show_progress=_bool_message(message, "show_progress", False),
     )
+
+
+def build_bootstrap_pending_task_options(message: dict[str, Any]) -> dict[str, Any]:
+    option_fields = {
+        "batch_size",
+        "request_workers",
+        "db_workers",
+        "rate_limit_rps",
+        "seed",
+        "per_page",
+        "max_retries",
+        "skip_existing",
+        "enqueue_indexing",
+        "primary_topic_only",
+        "show_progress",
+        "openalex_url",
+        "openalex_api_key",
+        "openalex_mailto",
+        "pending_redis_key",
+        "rate_limit_defer_after_seconds",
+        "source_topic_ids",
+        "workflow_date_from",
+        "workflow_date_to",
+        "workflow_granularity",
+        "enqueue_cluster_dynamics",
+    }
+    options = {
+        key: value
+        for key, value in message.items()
+        if key in option_fields and value is not None
+    }
+    if "source_topic_ids" not in options:
+        topic_ids = _optional_int_list_message(message, "topic_ids")
+        if topic_ids:
+            options["source_topic_ids"] = topic_ids
+    options.setdefault(
+        "workflow_date_from",
+        message.get("workflow_date_from") or message.get("date_from"),
+    )
+    options.setdefault(
+        "workflow_date_to",
+        message.get("workflow_date_to") or message.get("date_to"),
+    )
+    options.setdefault("workflow_granularity", "month")
+    return {key: value for key, value in options.items() if value is not None}
+
+
+def bootstrap_pending_pages_from_message(
+    message: dict[str, Any],
+) -> list[OpenAlexPendingPageDTO]:
+    if isinstance(message.get("pages"), list):
+        return [
+            OpenAlexPendingPageDTO.model_validate(page)
+            for page in message["pages"]
+            if isinstance(page, dict)
+        ]
+    if isinstance(message.get("page"), dict):
+        return [OpenAlexPendingPageDTO.model_validate(message["page"])]
+    return [OpenAlexPendingPageDTO.model_validate(message)]
 
 
 def build_openalex_topic_targets(

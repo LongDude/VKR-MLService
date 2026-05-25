@@ -218,6 +218,7 @@ class PaperIndexingFacade:
                 topic_ids=payload.get("topic_ids", []),
                 keyword_ids=payload.get("keyword_ids", []),
                 text_hash=text_hash,
+                workflow_options=self._workflow_options(request),
             )
         except AppError as exc:
             if not qdrant_indexed:
@@ -333,6 +334,7 @@ class PaperIndexingFacade:
             self._index_loaded_papers(
                 ordered_papers,
                 force_reindex=request.force_reindex,
+                workflow_options=self._workflow_options(request),
             ),
             keep_total=True,
         )
@@ -367,6 +369,7 @@ class PaperIndexingFacade:
                 self._index_loaded_papers(
                     papers,
                     force_reindex=request.force_reindex,
+                    workflow_options=self._workflow_options(request),
                 ),
             )
 
@@ -386,6 +389,7 @@ class PaperIndexingFacade:
         papers: list[Any],
         *,
         force_reindex: bool,
+        workflow_options: dict[str, Any] | None = None,
     ) -> BatchOperationResultDTO:
         result = BatchOperationResultDTO(total=len(papers))
         if not papers:
@@ -613,6 +617,7 @@ class PaperIndexingFacade:
                 topic_ids=sorted(indexed_topic_ids),
                 keyword_ids=sorted(indexed_keyword_ids),
                 text_hashes=indexed_text_hashes,
+                workflow_options=workflow_options,
             )
 
         self._mark_processing_indexed(skipped_text_hashes)
@@ -704,6 +709,7 @@ class PaperIndexingFacade:
         topic_ids: list[int],
         keyword_ids: list[int],
         text_hash: str,
+        workflow_options: dict[str, Any] | None = None,
     ) -> None:
         self.redis_adapter.enqueue(
             CLUSTER_RECOMPUTE_QUEUE,
@@ -713,6 +719,7 @@ class PaperIndexingFacade:
                 "topic_ids": topic_ids,
                 "keyword_ids": keyword_ids,
                 "text_hash": text_hash,
+                **(workflow_options or {}),
             },
         )
 
@@ -723,6 +730,7 @@ class PaperIndexingFacade:
         topic_ids: list[int],
         keyword_ids: list[int],
         text_hashes: dict[int, str],
+        workflow_options: dict[str, Any] | None = None,
     ) -> None:
         self.redis_adapter.enqueue(
             CLUSTER_RECOMPUTE_QUEUE,
@@ -732,8 +740,28 @@ class PaperIndexingFacade:
                 "topic_ids": topic_ids,
                 "keyword_ids": keyword_ids,
                 "text_hashes": {str(key): value for key, value in text_hashes.items()},
+                **(workflow_options or {}),
             },
         )
+
+    def _workflow_options(self, request: Any) -> dict[str, Any]:
+        if not getattr(request, "enqueue_cluster_dynamics", False):
+            return {}
+        date_from = getattr(request, "workflow_date_from", None)
+        date_to = getattr(request, "workflow_date_to", None)
+        if date_from is None or date_to is None:
+            return {}
+        source_topic_ids = [
+            int(topic_id)
+            for topic_id in getattr(request, "source_topic_ids", []) or []
+        ]
+        return {
+            "source_topic_ids": source_topic_ids,
+            "workflow_date_from": date_from.isoformat(),
+            "workflow_date_to": date_to.isoformat(),
+            "workflow_granularity": getattr(request, "workflow_granularity", "month"),
+            "enqueue_cluster_dynamics": True,
+        }
 
     def _merge_batch_result(
         self,

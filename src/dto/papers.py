@@ -99,6 +99,11 @@ class PaperResolveResponseDTO(BaseDTO):
 class PaperIndexingRequestDTO(BaseDTO):
     paper_id: int
     force_reindex: bool = False
+    source_topic_ids: list[int] = Field(default_factory=list)
+    workflow_date_from: date | None = None
+    workflow_date_to: date | None = None
+    workflow_granularity: Literal["week", "month"] = "month"
+    enqueue_cluster_dynamics: bool = False
 
 
 class PaperIndexingResponseDTO(BaseDTO):
@@ -115,6 +120,11 @@ class PaperBatchIndexingRequestDTO(BaseDTO):
     offset: int = Field(default=0, ge=0)
     batch_size: int = Field(default=200, ge=1, le=1000)
     force_reindex: bool = False
+    source_topic_ids: list[int] = Field(default_factory=list)
+    workflow_date_from: date | None = None
+    workflow_date_to: date | None = None
+    workflow_granularity: Literal["week", "month"] = "month"
+    enqueue_cluster_dynamics: bool = False
 
 
 __all__ = [

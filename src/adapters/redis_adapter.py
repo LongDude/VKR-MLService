@@ -81,6 +81,28 @@ class RedisAdapter:
                 details={"queue_name": queue_name, "reason": str(exc)},
             ) from exc
 
+    def dequeue_any(
+        self,
+        queue_names: list[str] | tuple[str, ...],
+        timeout_seconds: int = 5,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Return one message from the first ready queue using Redis BLPOP."""
+        if not queue_names:
+            return None
+        try:
+            result = self._client.blpop(list(queue_names), timeout=timeout_seconds)
+            if result is None:
+                return None
+            queue_name, value = result
+            if isinstance(queue_name, bytes):
+                queue_name = queue_name.decode("utf-8")
+            return str(queue_name), self._decode_queue_message(value)
+        except Exception as exc:
+            raise RedisOperationError(
+                "Failed to dequeue Redis message from multiple queues",
+                details={"queue_names": list(queue_names), "reason": str(exc)},
+            ) from exc
+
     def dequeue_nowait(self, queue_name: str) -> dict[str, Any] | None:
         """Return one queue message without blocking, or ``None`` when empty."""
         try:
@@ -119,6 +141,26 @@ class RedisAdapter:
             raise RedisOperationError(
                 f"Failed to read Redis queue length for {queue_name!r}",
                 details={"queue_name": queue_name, "reason": str(exc)},
+            ) from exc
+
+    def exists(self, key: str) -> bool:
+        """Return whether a Redis key exists."""
+        try:
+            return bool(self._client.exists(key))
+        except Exception as exc:
+            raise RedisOperationError(
+                f"Failed to check Redis key {key!r}",
+                details={"key": key, "reason": str(exc)},
+            ) from exc
+
+    def ttl(self, key: str) -> int:
+        """Return key TTL in seconds; mirrors Redis TTL semantics."""
+        try:
+            return int(self._client.ttl(key))
+        except Exception as exc:
+            raise RedisOperationError(
+                f"Failed to read Redis key TTL for {key!r}",
+                details={"key": key, "reason": str(exc)},
             ) from exc
 
     def acquire_lock(self, key: str, ttl_seconds: int) -> bool:

@@ -52,15 +52,21 @@ from ml.workers.redis_worker import (
     CLUSTER_RECOMPUTE_QUEUE,
     FAILED_TASKS_QUEUE,
     KEYWORD_EXTRACTION_QUEUE,
+    OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE,
+    OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
+    OPENALEX_TOPIC_STATS_QUEUE,
     PAPER_INDEXING_QUEUE,
     RedisMLWorker,
 )
+from ml.services.openalex_cooldown import OPENALEX_COOLDOWN_KEY
 from ml.workers.task_handlers import MLTaskHandler
 
 
 class FakeRedisClient:
     def __init__(self) -> None:
         self.values: dict[str, str] = {}
+        self.ttls: dict[str, int] = {}
         self.queues: dict[str, list[str]] = {}
 
     def get(self, key: str) -> str | None:
@@ -76,19 +82,24 @@ class FakeRedisClient:
         if nx and key in self.values:
             return False
         self.values[key] = value
+        if ex is not None:
+            self.ttls[key] = ex
         return True
 
     def delete(self, key: str) -> None:
         self.values.pop(key, None)
+        self.ttls.pop(key, None)
 
     def rpush(self, queue_name: str, payload: str) -> None:
         self.queues.setdefault(queue_name, []).append(payload)
 
-    def blpop(self, queue_name: str, timeout: int = 5) -> tuple[str, str] | None:
-        queue = self.queues.setdefault(queue_name, [])
-        if not queue:
-            return None
-        return queue_name, queue.pop(0)
+    def blpop(self, queue_name: str | list[str], timeout: int = 5) -> tuple[str, str] | None:
+        queue_names = queue_name if isinstance(queue_name, list) else [queue_name]
+        for item in queue_names:
+            queue = self.queues.setdefault(item, [])
+            if queue:
+                return item, queue.pop(0)
+        return None
 
     def lpop(self, queue_name: str) -> str | None:
         queue = self.queues.setdefault(queue_name, [])
@@ -103,6 +114,14 @@ class FakeRedisClient:
     def llen(self, queue_name: str) -> int:
         return len(self.queues.setdefault(queue_name, []))
 
+    def exists(self, key: str) -> int:
+        return 1 if key in self.values else 0
+
+    def ttl(self, key: str) -> int:
+        if key not in self.values:
+            return -2
+        return self.ttls.get(key, -1)
+
 
 class InMemoryEventSink:
     def __init__(self) -> None:
@@ -115,6 +134,15 @@ class InMemoryEventSink:
 class FailingEventSink:
     def emit(self, event: MLEvent) -> None:
         raise RuntimeError("sink failed")
+
+
+class CapturingTaskHandler:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = []
+
+    def handle(self, message: dict[str, Any]) -> OperationResultDTO:
+        self.messages.append(message)
+        return OperationResultDTO(success=True, message="ok", details={})
 
 
 def test_redis_adapter_json_queue_and_lock() -> None:
@@ -133,6 +161,63 @@ def test_redis_adapter_json_queue_and_lock() -> None:
     assert adapter.acquire_lock("lock:1", ttl_seconds=10) is False
     adapter.release_lock("lock:1")
     assert adapter.acquire_lock("lock:1", ttl_seconds=10) is True
+
+
+def test_redis_adapter_dequeue_any_and_cooldown_primitives() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+
+    adapter.enqueue("queue:a", {"task_type": "a"})
+    adapter.enqueue("queue:b", {"task_type": "b"})
+    result = adapter.dequeue_any(["queue:b", "queue:a"], timeout_seconds=1)
+
+    assert result == ("queue:b", {"task_type": "b"})
+    adapter.set_json(OPENALEX_COOLDOWN_KEY, {"reason": "rate"}, ttl_seconds=30)
+    assert adapter.exists(OPENALEX_COOLDOWN_KEY) is True
+    assert adapter.ttl(OPENALEX_COOLDOWN_KEY) == 30
+
+
+def test_worker_skips_openalex_queues_during_cooldown() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    handler = CapturingTaskHandler()
+    adapter.set_json(OPENALEX_COOLDOWN_KEY, {"reason": "rate"}, ttl_seconds=30)
+    adapter.enqueue(OPENALEX_BOOTSTRAP_PAPERS_QUEUE, {"task_type": "bootstrap_papers"})
+    adapter.enqueue(PAPER_INDEXING_QUEUE, {"task_type": "paper_indexing", "paper_id": 1})
+
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=handler,  # type: ignore[arg-type]
+        queues=(OPENALEX_BOOTSTRAP_PAPERS_QUEUE, PAPER_INDEXING_QUEUE),
+        dequeue_timeout_seconds=1,
+    )
+
+    assert worker.run_once() is True
+    assert handler.messages == [
+        {"task_type": "paper_indexing", "paper_ids": [1], "force_reindex": False}
+    ]
+    assert adapter.queue_length(OPENALEX_BOOTSTRAP_PAPERS_QUEUE) == 1
+
+
+def test_worker_prioritizes_openalex_pending_after_cooldown() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    handler = CapturingTaskHandler()
+    adapter.enqueue(OPENALEX_TOPIC_STATS_QUEUE, {"task_type": "collect_topic_stats"})
+    adapter.enqueue(
+        OPENALEX_TOPIC_STATS_PENDING_QUEUE,
+        {"task_type": "collect_topic_stats", "pending": True},
+    )
+
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=handler,  # type: ignore[arg-type]
+        queues=(OPENALEX_TOPIC_STATS_PENDING_QUEUE, OPENALEX_TOPIC_STATS_QUEUE),
+        dequeue_timeout_seconds=1,
+    )
+
+    assert worker.run_once() is True
+    assert handler.messages == [{"task_type": "collect_topic_stats", "pending": True}]
 
 
 def test_composite_event_sink_isolates_sink_failures() -> None:
@@ -1291,6 +1376,104 @@ def test_paper_indexing_merges_extracted_keywords_without_keyword_ids() -> None:
     )
 
     assert result == ["Graph Learning", "AI", "Embeddings", "Ranking"]
+
+
+def test_paper_indexing_batch_forwards_workflow_options_to_cluster_recompute() -> None:
+    class PaperRepository:
+        def __init__(self) -> None:
+            self.paper = SimpleNamespace(
+                id=1,
+                title="Graph Learning",
+                abstract="Graph embeddings for papers",
+                extracted_keywords=[],
+            )
+            self.indexed_calls: list[dict[int, str]] = []
+
+        def get_by_ids(self, paper_ids: list[int]) -> list[Any]:
+            return [self.paper] if paper_ids == [1] else []
+
+        def get_indexed_text_hashes(self, paper_ids: list[int]) -> dict[int, str]:
+            return {}
+
+        def mark_indexing_started(self, paper_ids: Any) -> None:
+            list(paper_ids)
+
+        def mark_indexed(self, text_hashes_by_paper_id: dict[int, str]) -> None:
+            self.indexed_calls.append(text_hashes_by_paper_id)
+
+        def mark_failed(self, paper_ids: Any, error_message: str) -> None:
+            raise AssertionError(error_message)
+
+    class TaxonomyRepository:
+        def list_topics_by_papers(self, paper_ids: list[int]) -> dict[int, list[Any]]:
+            return {1: [SimpleNamespace(id=7, name="AI")]}
+
+        def list_keywords_by_papers(self, paper_ids: list[int]) -> dict[int, list[Any]]:
+            return {1: [SimpleNamespace(id=9, value="graph")]}
+
+    class AuthorRepository:
+        def list_by_papers(self, paper_ids: list[int]) -> dict[int, list[Any]]:
+            return {1: []}
+
+    class InstitutionRepository:
+        def list_by_papers(self, paper_ids: list[int]) -> dict[int, list[Any]]:
+            return {1: []}
+
+    class EmbeddingAdapter:
+        def embed_batch(self, texts: list[str], model: str) -> list[Any]:
+            return [SimpleNamespace(vector=[0.1, 0.2], model=model)]
+
+    class QdrantAdapter:
+        def retrieve(
+            self,
+            collection_name: str,
+            point_ids: list[int],
+            *,
+            with_vectors: bool = False,
+        ) -> list[Any]:
+            return []
+
+        def upsert_points(self, collection_name: str, points: list[Any]) -> None:
+            assert [int(point.id) for point in points] == [1]
+
+    class RedisAdapter:
+        def __init__(self) -> None:
+            self.messages: list[tuple[str, dict[str, Any]]] = []
+
+        def enqueue(self, queue_name: str, message: dict[str, Any]) -> None:
+            self.messages.append((queue_name, message))
+
+    redis_adapter = RedisAdapter()
+    facade = PaperIndexingFacade(
+        paper_repository=PaperRepository(),  # type: ignore[arg-type]
+        taxonomy_repository=TaxonomyRepository(),  # type: ignore[arg-type]
+        author_repository=AuthorRepository(),  # type: ignore[arg-type]
+        institution_repository=InstitutionRepository(),  # type: ignore[arg-type]
+        embedding_adapter=EmbeddingAdapter(),  # type: ignore[arg-type]
+        qdrant_adapter=QdrantAdapter(),  # type: ignore[arg-type]
+        redis_adapter=redis_adapter,  # type: ignore[arg-type]
+        event_sink=NoopEventSink(),
+    )
+
+    result = facade.index_batch(
+        PaperBatchIndexingRequestDTO(
+            paper_ids=[1],
+            source_topic_ids=[7],
+            workflow_date_from=date(2026, 1, 1),
+            workflow_date_to=date(2026, 1, 31),
+            enqueue_cluster_dynamics=True,
+        )
+    )
+
+    assert result.updated == 1
+    assert redis_adapter.messages
+    queue_name, message = redis_adapter.messages[0]
+    assert queue_name == CLUSTER_RECOMPUTE_QUEUE
+    assert message["source_topic_ids"] == [7]
+    assert message["workflow_date_from"] == "2026-01-01"
+    assert message["workflow_date_to"] == "2026-01-31"
+    assert message["workflow_granularity"] == "month"
+    assert message["enqueue_cluster_dynamics"] is True
 
 
 def test_lmstudio_embedding_adapter_validates_response() -> None:

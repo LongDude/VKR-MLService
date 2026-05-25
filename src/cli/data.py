@@ -46,6 +46,7 @@ from repositories.openalex_yearly_topic_stats import OpenAlexYearlyTopicStatsRep
 SAMPLE_LIMIT = 20
 OPENALEX_TOPIC_STATS_QUEUE = "queue:openalex_topic_stats"
 OPENALEX_BOOTSTRAP_PAPERS_QUEUE = "queue:openalex_bootstrap_papers"
+CLUSTER_DYNAMICS_RECOMPUTE_QUEUE = "queue:cluster_dynamics_recompute"
 
 
 class LocalDataValidator:
@@ -510,7 +511,11 @@ class DataCoverageAnalyzer:
             include_missing_topic_ids=include_missing_topic_ids,
         )
         samples = self._sample_coverage(topics, months)
-        cluster_dynamics = self._cluster_dynamics_coverage(topics, months)
+        cluster_dynamics = self._cluster_dynamics_coverage(
+            topics,
+            months,
+            include_missing_topic_ids=include_missing_topic_ids,
+        )
         quarter_reports = self._quarter_report_coverage(topics, quarters)
 
         return {
@@ -663,6 +668,8 @@ class DataCoverageAnalyzer:
         self,
         topics: list[dict[str, Any]],
         months: list[dict[str, Any]],
+        *,
+        include_missing_topic_ids: bool = False,
     ) -> dict[str, Any]:
         topic_ids = [int(topic["topic_id"]) for topic in topics]
         cluster_keys = [f"topic:{topic_id}" for topic_id in topic_ids]
@@ -699,6 +706,7 @@ class DataCoverageAnalyzer:
             topics=topics,
             periods=months,
             existing=existing,
+            include_missing_topic_ids=include_missing_topic_ids,
         )
 
     def _quarter_report_coverage(
@@ -1107,6 +1115,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Enqueue high-priority worker collect_topic_stats tasks for missing publication stats.",
     )
     coverage_parser.add_argument(
+        "--enqueue-missing-cluster-dynamics",
+        action="store_true",
+        help="Enqueue cluster_dynamics_recompute tasks for missing monthly cluster dynamics.",
+    )
+    coverage_parser.add_argument(
         "--enqueue-task-batch-size",
         type=int,
         default=100,
@@ -1116,6 +1129,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--enqueue-queue",
         default=OPENALEX_TOPIC_STATS_QUEUE,
         help=f"Redis queue for enqueued worker tasks. Defaults to {OPENALEX_TOPIC_STATS_QUEUE}.",
+    )
+    coverage_parser.add_argument(
+        "--cluster-dynamics-queue",
+        default=CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
+        help=f"Redis queue for cluster dynamics tasks. Defaults to {CLUSTER_DYNAMICS_RECOMPUTE_QUEUE}.",
+    )
+    coverage_parser.add_argument(
+        "--cluster-dynamics-batch-size",
+        type=int,
+        default=50,
+        help="Maximum cluster ids per enqueued cluster dynamics task. Defaults to 50.",
     )
     coverage_parser.add_argument(
         "--languages",
@@ -1259,8 +1283,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sample_coverage_parser.add_argument(
         "--target-count",
         type=int,
-        default=100,
-        help="Target sample papers per enqueued topic/month batch. Defaults to 100.",
+        default=20,
+        help="Target sample papers per enqueued topic/month batch. Defaults to 20.",
     )
     sample_coverage_parser.add_argument(
         "--languages",
@@ -1525,6 +1549,8 @@ def run_analyze_coverage(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--sample-limit must be non-negative.")
     if args.enqueue_task_batch_size <= 0:
         raise ValueError("--enqueue-task-batch-size must be a positive integer.")
+    if args.cluster_dynamics_batch_size <= 0:
+        raise ValueError("--cluster-dynamics-batch-size must be a positive integer.")
     if args.collect_batch_size <= 0 or args.collect_batch_size > 500:
         raise ValueError("--collect-batch-size must be between 1 and 500.")
     if args.request_workers <= 0:
@@ -1553,6 +1579,7 @@ def run_analyze_coverage(args: argparse.Namespace) -> dict[str, Any]:
                 include_missing_topic_ids=(
                     args.include_missing_topic_ids
                     or args.enqueue_missing_topic_stats
+                    or args.enqueue_missing_cluster_dynamics
                 ),
             )
             if args.enqueue_missing_topic_stats:
@@ -1572,6 +1599,15 @@ def run_analyze_coverage(args: argparse.Namespace) -> dict[str, Any]:
                     openalex_url=args.openalex_url,
                     openalex_api_key=args.openalex_api_key,
                     openalex_mailto=args.openalex_mailto,
+                )
+            if args.enqueue_missing_cluster_dynamics:
+                report["enqueued_cluster_dynamics_tasks"] = (
+                    enqueue_missing_cluster_dynamics_tasks(
+                        report,
+                        redis_adapter=RedisAdapter(build_redis_client(args)),
+                        queue_name=args.cluster_dynamics_queue,
+                        batch_size=args.cluster_dynamics_batch_size,
+                    )
                 )
             return report
     finally:
@@ -1637,7 +1673,8 @@ def run_analyze_sample_month_coverage(args: argparse.Namespace) -> dict[str, Any
                     per_page=args.per_page,
                     max_retries=args.max_retries,
                     skip_existing=bool(args.skip_existing),
-                    enqueue_indexing=bool(args.enqueue_indexing),
+                    enqueue_indexing=bool(args.enqueue_indexing or args.enqueue_missing_samples),
+                    enqueue_cluster_dynamics=True,
                     primary_topic_only=bool(args.primary_topic_only),
                     openalex_url=args.openalex_url,
                     openalex_api_key=args.openalex_api_key,
@@ -1666,6 +1703,7 @@ def enqueue_missing_sample_tasks(
     max_retries: int,
     skip_existing: bool = False,
     enqueue_indexing: bool = False,
+    enqueue_cluster_dynamics: bool = True,
     primary_topic_only: bool = True,
     openalex_url: str | None = None,
     openalex_api_key: str | None = None,
@@ -1708,7 +1746,12 @@ def enqueue_missing_sample_tasks(
                     "max_retries": max_retries,
                     "skip_existing": bool(skip_existing),
                     "enqueue_indexing": bool(enqueue_indexing),
+                    "enqueue_cluster_dynamics": bool(enqueue_cluster_dynamics),
                     "primary_topic_only": bool(primary_topic_only),
+                    "source_topic_ids": chunk,
+                    "workflow_date_from": _iso_date_value(period["period_start"]),
+                    "workflow_date_to": _iso_date_value(period["period_end"]),
+                    "workflow_granularity": "month",
                     "show_progress": False,
                     **({"openalex_url": openalex_url} if openalex_url else {}),
                     **({"openalex_api_key": openalex_api_key} if openalex_api_key else {}),
@@ -1726,6 +1769,57 @@ def enqueue_missing_sample_tasks(
         "messages": len(messages),
         "task_batch_size": task_batch_size,
         "target_count": target_count,
+        "sample": messages[:3],
+    }
+
+
+def enqueue_missing_cluster_dynamics_tasks(
+    report: dict[str, Any],
+    *,
+    redis_adapter: RedisAdapter,
+    queue_name: str,
+    batch_size: int,
+) -> dict[str, Any]:
+    """Enqueue cluster_dynamics_recompute tasks for missing monthly dynamics."""
+    cluster_dynamics = report["checks"]["cluster_dynamics"]
+    messages: list[dict[str, Any]] = []
+    missing_periods = cluster_dynamics.get("missing_by_period", [])
+    if not isinstance(missing_periods, list):
+        raise ValueError("Coverage report cluster_dynamics.missing_by_period is invalid.")
+
+    for period in missing_periods:
+        topic_ids = period.get("topic_ids") if isinstance(period, dict) else None
+        if not isinstance(topic_ids, list):
+            raise ValueError(
+                "Coverage report does not include full missing topic ids. "
+                "Run analyzer with include_missing_topic_ids enabled."
+            )
+        cluster_ids = [f"topic:{int(topic_id)}" for topic_id in topic_ids]
+        for chunk in [
+            cluster_ids[index : index + batch_size]
+            for index in range(0, len(cluster_ids), batch_size)
+        ]:
+            messages.append(
+                {
+                    "task_type": "cluster_dynamics_recompute",
+                    "cluster_ids": chunk,
+                    "date_from": _iso_date_value(period["period_start"]),
+                    "date_to": _iso_date_value(period["period_end"]),
+                    "granularity": "month",
+                }
+            )
+
+    for message in messages:
+        redis_adapter.enqueue(queue_name, message)
+
+    return {
+        "queue": queue_name,
+        "source_check": "cluster_dynamics",
+        "missing_topic_periods": int(
+            cluster_dynamics.get("missing_topic_periods") or 0
+        ),
+        "messages": len(messages),
+        "batch_size": batch_size,
         "sample": messages[:3],
     }
 

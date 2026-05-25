@@ -10,6 +10,10 @@ from dto.common import BatchOperationResultDTO, OperationResultDTO
 from dto.keywords import PaperKeywordExtractionBatchRequestDTO
 from dto.topic_reports import TopicQuarterReportGenerateRequestDTO
 from ingestion.openalex_topic_stats import OpenAlexTopicStatsCollector
+from ml.services.openalex_cooldown import (
+    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
+    set_openalex_cooldown,
+)
 from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.pipelines.cluster_dynamics_pipeline import ClusterDynamicsPipeline
 from ml.pipelines.keyword_extraction_pipeline import KeywordExtractionPipeline
@@ -37,6 +41,7 @@ class MLTaskHandler:
         user_profile_pipeline: UserProfilePipeline | None = None,
         openalex_topic_stats_collector_factory: Callable[[dict[str, Any]], OpenAlexTopicStatsCollector] | None = None,
         openalex_paper_bootstrap_runner: Callable[[dict[str, Any]], Any] | None = None,
+        redis_adapter: Any | None = None,
         event_sink: EventSink | None = None,
         cluster_recompute_workers: int = 1,
         cluster_recompute_pipeline_factory: Callable[[], tuple[TrendRecomputePipeline, Any]] | None = None,
@@ -51,6 +56,7 @@ class MLTaskHandler:
         self.user_profile_pipeline = user_profile_pipeline
         self.openalex_topic_stats_collector_factory = openalex_topic_stats_collector_factory
         self.openalex_paper_bootstrap_runner = openalex_paper_bootstrap_runner
+        self.redis_adapter = redis_adapter
         self.event_sink = event_sink or NoopEventSink()
         self.cluster_recompute_workers = max(1, int(cluster_recompute_workers))
         self.cluster_recompute_pipeline_factory = cluster_recompute_pipeline_factory
@@ -75,7 +81,7 @@ class MLTaskHandler:
             return self._handle_keyword_extraction(message)
         if task_type in {"collect_topic_stats", "collect-topic-stats"}:
             return self._handle_collect_topic_stats(message)
-        if task_type in {"bootstrap_papers", "bootstrap-papers"}:
+        if task_type in {"bootstrap_papers", "bootstrap-papers", "resume_bootstrap_papers"}:
             return self._handle_bootstrap_papers(message)
         if task_type == "paper_indexing":
             return self._handle_paper_indexing(message)
@@ -131,11 +137,13 @@ class MLTaskHandler:
             "paper_indexing_pipeline",
         )
         force_reindex = self._bool_field(message, "force_reindex", default=False)
+        workflow_options = self._paper_workflow_options(message)
 
         if "paper_ids" in message:
             result = pipeline.run_many(
                 self._int_list_field(message, "paper_ids"),
                 force_reindex=force_reindex,
+                **workflow_options,
             )
             return self._batch_result(
                 result,
@@ -146,6 +154,7 @@ class MLTaskHandler:
         response = pipeline.run_one(
             self._required_int(message, "paper_id"),
             force_reindex=force_reindex,
+            **workflow_options,
         )
         return OperationResultDTO(
             success=True,
@@ -181,6 +190,8 @@ class MLTaskHandler:
             dry_run=self._bool_field(message, "dry_run", default=False),
             show_progress=self._bool_field(message, "show_progress", default=False),
         )
+        if result.deferred:
+            self._enqueue_deferred_topic_stats(message, self._dump_dto(result))
         return OperationResultDTO(
             success=result.failed == 0,
             message="OpenAlex topic stats collection completed",
@@ -188,6 +199,42 @@ class MLTaskHandler:
                 "task_type": "collect_topic_stats",
                 **self._dump_dto(result),
             },
+        )
+
+    def _enqueue_deferred_topic_stats(
+        self,
+        source_message: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        if self.redis_adapter is None:
+            return
+        pending_tasks = result.get("pending_tasks") or []
+        if not isinstance(pending_tasks, list):
+            return
+        source_options = {
+            key: source_message[key]
+            for key in (
+                "openalex_url",
+                "openalex_api_key",
+                "openalex_mailto",
+                "rate_limit_rps",
+                "max_retries",
+                "primary_topic_only",
+            )
+            if key in source_message
+        }
+        for pending_task in pending_tasks:
+            if not isinstance(pending_task, dict):
+                continue
+            self.redis_adapter.enqueue(
+                OPENALEX_TOPIC_STATS_PENDING_QUEUE,
+                {**source_options, **pending_task},
+            )
+        set_openalex_cooldown(
+            self.redis_adapter,
+            retry_after_seconds=result.get("retry_after_seconds"),
+            source_queue=str(source_message.get("source_queue") or "queue:openalex_topic_stats"),
+            task_type="collect_topic_stats",
         )
 
     def _handle_bootstrap_papers(self, message: dict[str, Any]) -> OperationResultDTO:
@@ -239,6 +286,13 @@ class MLTaskHandler:
                 str(cluster_id),
                 force_summary=force_summary,
             )
+            topic_ids = self._topic_ids_from_message(message)
+            if not topic_ids and str(cluster_id).startswith("topic:"):
+                try:
+                    topic_ids = [int(str(cluster_id).removeprefix("topic:"))]
+                except ValueError:
+                    topic_ids = []
+            self._enqueue_cluster_dynamics_if_requested(message, topic_ids, 0)
             return OperationResultDTO(
                 success=True,
                 message="Cluster recompute completed",
@@ -304,6 +358,7 @@ class MLTaskHandler:
                 ),
                 payload=result.model_dump(mode="json"),
             )
+            self._enqueue_cluster_dynamics_if_requested(message, topic_ids, result.failed)
             return self._batch_result(
                 result,
                 "Topic cluster recompute completed",
@@ -321,6 +376,55 @@ class MLTaskHandler:
             result,
             "All clusters recompute completed",
             task_type="cluster_recompute",
+        )
+
+    def _paper_workflow_options(self, message: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "source_topic_ids": self._optional_int_list_field(
+                message,
+                "source_topic_ids",
+            )
+            or self._optional_int_list_field(message, "topic_ids")
+            or [],
+            "workflow_date_from": self._optional_date(message, "workflow_date_from"),
+            "workflow_date_to": self._optional_date(message, "workflow_date_to"),
+            "workflow_granularity": str(message.get("workflow_granularity") or "month"),
+            "enqueue_cluster_dynamics": self._bool_field(
+                message,
+                "enqueue_cluster_dynamics",
+                default=False,
+            ),
+        }
+
+    def _enqueue_cluster_dynamics_if_requested(
+        self,
+        message: dict[str, Any],
+        topic_ids: list[int],
+        failed_count: int,
+    ) -> None:
+        if failed_count:
+            return
+        if not self._bool_field(message, "enqueue_cluster_dynamics", default=False):
+            return
+        if self.redis_adapter is None:
+            return
+        date_from = self._optional_date(message, "workflow_date_from")
+        date_to = self._optional_date(message, "workflow_date_to")
+        if date_from is None or date_to is None:
+            return
+        granularity = self._granularity(message.get("workflow_granularity", "month"))
+        cluster_ids = [f"topic:{topic_id}" for topic_id in topic_ids]
+        if not cluster_ids:
+            return
+        self.redis_adapter.enqueue(
+            "queue:cluster_dynamics_recompute",
+            {
+                "task_type": "cluster_dynamics_recompute",
+                "cluster_ids": cluster_ids,
+                "date_from": date_from.isoformat(),
+                "date_to": date_to.isoformat(),
+                "granularity": granularity,
+            },
         )
 
     def _recompute_one_topic_cluster(

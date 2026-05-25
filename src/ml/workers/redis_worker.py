@@ -7,6 +7,11 @@ from typing import Any, Sequence
 
 from adapters.redis_adapter import RedisAdapter
 from core.exceptions import AppError
+from ml.services.openalex_cooldown import (
+    OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE,
+    OPENALEX_COOLDOWN_KEY,
+    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
+)
 from ml.services.events import EventSink, MLEvent, NoopEventSink, TqdmEventSink
 from ml.workers.task_handlers import MLTaskHandler
 
@@ -23,6 +28,8 @@ USER_PROFILE_RECOMPUTE_QUEUE = "queue:user_profile_recompute"
 FAILED_TASKS_QUEUE = "queue:failed_tasks"
 
 DEFAULT_QUEUE_ORDER = (
+    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
+    OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE,
     OPENALEX_TOPIC_STATS_QUEUE,
     OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     KEYWORD_EXTRACTION_QUEUE,
@@ -32,6 +39,15 @@ DEFAULT_QUEUE_ORDER = (
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     TOPIC_QUARTER_REPORT_QUEUE,
     USER_PROFILE_RECOMPUTE_QUEUE,
+)
+
+OPENALEX_RESOURCE_QUEUES = frozenset(
+    {
+        OPENALEX_TOPIC_STATS_PENDING_QUEUE,
+        OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE,
+        OPENALEX_TOPIC_STATS_QUEUE,
+        OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+    }
 )
 
 
@@ -45,7 +61,7 @@ class RedisMLWorker:
         batch_sizes: dict[str, int] | None = None,
         max_task_sizes: dict[str, int] | None = None,
         failed_queue: str = FAILED_TASKS_QUEUE,
-        dequeue_timeout_seconds: int = 1,
+        dequeue_timeout_seconds: int = 30,
         idle_sleep_seconds: float = 1.0,
         show_progress: bool = False,
         event_sink: EventSink | None = None,
@@ -79,45 +95,48 @@ class RedisMLWorker:
         self._stop_requested = False
         while not self._stop_requested:
             handled = self.run_once()
-            if not handled:
-                time.sleep(self.idle_sleep_seconds)
+            if not handled and not self._active_queues():
+                time.sleep(self._idle_sleep_seconds())
 
     def run_once(self, max_messages: int | None = None) -> bool:
         self.last_processed_message_count = 0
         if max_messages is not None and max_messages <= 0:
             return False
 
-        for queue_name in self.queues:
-            try:
-                message = self.redis_adapter.dequeue(
-                    queue_name,
-                    timeout_seconds=self.dequeue_timeout_seconds,
-                )
-            except Exception:
-                self.logger.exception(
-                    "Failed to dequeue ML task",
-                    extra={"queue_name": queue_name},
-                )
-                continue
+        active_queues = self._active_queues()
+        if not active_queues:
+            return False
 
-            if message is None:
-                continue
-
-            messages = self._dequeue_batch(
-                queue_name,
-                first_message=message,
-                max_messages=max_messages,
+        try:
+            result = self.redis_adapter.dequeue_any(
+                active_queues,
+                timeout_seconds=self._dequeue_timeout_seconds(),
             )
-            self.last_processed_message_count = len(messages)
-            for task_message in self._coalesce_messages(queue_name, messages):
-                for executable_message in self._split_oversized_message(
-                    queue_name,
-                    task_message,
-                ):
-                    self._handle_task_message(queue_name, executable_message)
-            return True
+        except Exception:
+            self.logger.exception(
+                "Failed to dequeue ML task",
+                extra={"queue_names": active_queues},
+            )
+            return False
 
-        return False
+        if result is None:
+            return False
+
+        queue_name, message = result
+        message = self._normalize_dequeued_message(queue_name, message)
+        messages = self._dequeue_batch(
+            queue_name,
+            first_message=message,
+            max_messages=max_messages,
+        )
+        self.last_processed_message_count = len(messages)
+        for task_message in self._coalesce_messages(queue_name, messages):
+            for executable_message in self._split_oversized_message(
+                queue_name,
+                task_message,
+            ):
+                self._handle_task_message(queue_name, executable_message)
+        return True
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -145,9 +164,63 @@ class RedisMLWorker:
                 break
             if message is None:
                 break
-            messages.append(message)
+            messages.append(self._normalize_dequeued_message(queue_name, message))
 
         return messages
+
+    def _normalize_dequeued_message(
+        self,
+        queue_name: str,
+        message: dict[str, Any],
+    ) -> dict[str, Any]:
+        if (
+            queue_name == OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE
+            and "task_type" not in message
+        ):
+            return {"task_type": "resume_bootstrap_papers", "page": message}
+        return message
+
+    def _active_queues(self) -> tuple[str, ...]:
+        if self._openalex_cooldown_active():
+            return tuple(
+                queue_name
+                for queue_name in self.queues
+                if queue_name not in OPENALEX_RESOURCE_QUEUES
+            )
+        return self.queues
+
+    def _openalex_cooldown_active(self) -> bool:
+        try:
+            return self.redis_adapter.exists(OPENALEX_COOLDOWN_KEY)
+        except Exception:
+            self.logger.exception(
+                "Failed to check OpenAlex cooldown",
+                extra={"cooldown_key": OPENALEX_COOLDOWN_KEY},
+            )
+            return False
+
+    def _openalex_cooldown_ttl(self) -> int | None:
+        try:
+            ttl = self.redis_adapter.ttl(OPENALEX_COOLDOWN_KEY)
+        except Exception:
+            self.logger.exception(
+                "Failed to read OpenAlex cooldown TTL",
+                extra={"cooldown_key": OPENALEX_COOLDOWN_KEY},
+            )
+            return None
+        return ttl if ttl > 0 else None
+
+    def _dequeue_timeout_seconds(self) -> int:
+        ttl = self._openalex_cooldown_ttl()
+        if ttl is None:
+            return max(1, int(self.dequeue_timeout_seconds))
+        return max(1, min(int(self.dequeue_timeout_seconds), ttl))
+
+    def _idle_sleep_seconds(self) -> float:
+        ttl = self._openalex_cooldown_ttl()
+        if ttl is None:
+            return self.idle_sleep_seconds
+        return max(0.0, min(float(self.idle_sleep_seconds), float(ttl)))
 
     def _coalesce_messages(
         self,
@@ -426,11 +499,23 @@ class RedisMLWorker:
 
         force_summary = bool(message.get("force_summary", False))
         cluster_workers = message.get("cluster_workers")
+        workflow_fields = {
+            key: message[key]
+            for key in (
+                "source_topic_ids",
+                "workflow_date_from",
+                "workflow_date_to",
+                "workflow_granularity",
+                "enqueue_cluster_dynamics",
+            )
+            if key in message
+        }
         return [
             {
                 "task_type": "recompute_topic_clusters",
                 "topic_ids": topic_ids[index : index + max_task_size],
                 "force_summary": force_summary,
+                **workflow_fields,
                 **(
                     {"cluster_workers": int(cluster_workers)}
                     if cluster_workers is not None
@@ -732,8 +817,11 @@ __all__ = [
     "ENTITY_INDEXING_QUEUE",
     "FAILED_TASKS_QUEUE",
     "KEYWORD_EXTRACTION_QUEUE",
+    "OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE",
     "OPENALEX_TOPIC_STATS_QUEUE",
     "OPENALEX_BOOTSTRAP_PAPERS_QUEUE",
+    "OPENALEX_RESOURCE_QUEUES",
+    "OPENALEX_TOPIC_STATS_PENDING_QUEUE",
     "PAPER_INDEXING_QUEUE",
     "RedisMLWorker",
     "TOPIC_QUARTER_REPORT_QUEUE",

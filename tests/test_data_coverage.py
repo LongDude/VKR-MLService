@@ -11,6 +11,7 @@ from cli.data import (  # noqa: E402
     DataCoverageAnalyzer,
     OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     OPENALEX_TOPIC_STATS_QUEUE,
+    enqueue_missing_cluster_dynamics_tasks,
     enqueue_missing_sample_tasks,
     enqueue_missing_topic_stats_tasks,
     parse_args,
@@ -20,16 +21,35 @@ from cli.tasks import (  # noqa: E402
     parse_args as parse_task_args,
 )
 from ingestion.openalex_topic_stats import OpenAlexTopicStatsCollectionResult  # noqa: E402
-from ml.workers.redis_worker import DEFAULT_QUEUE_ORDER  # noqa: E402
+from ml.services.openalex_cooldown import (  # noqa: E402
+    OPENALEX_COOLDOWN_KEY,
+    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
+)
+from ml.workers.redis_worker import (  # noqa: E402
+    DEFAULT_QUEUE_ORDER,
+    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
+)
 from ml.workers.task_handlers import MLTaskHandler  # noqa: E402
 
 
 class _CapturingRedis:
     def __init__(self) -> None:
         self.messages: list[tuple[str, dict]] = []
+        self.values: dict[str, dict] = {}
+        self.ttls: dict[str, int] = {}
 
     def enqueue(self, queue_name: str, message: dict) -> None:
         self.messages.append((queue_name, message))
+
+    def set_json(
+        self,
+        key: str,
+        value: dict,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        self.values[key] = value
+        if ttl_seconds is not None:
+            self.ttls[key] = ttl_seconds
 
 
 class _FakeTopicStatsCollector:
@@ -42,6 +62,26 @@ class _FakeTopicStatsCollector:
             date_from=kwargs["date_from"],  # type: ignore[arg-type]
             date_to=kwargs["date_to"],  # type: ignore[arg-type]
             collected=2,
+        )
+
+
+class _DeferredTopicStatsCollector:
+    def collect_and_store(self, **kwargs: object) -> OpenAlexTopicStatsCollectionResult:
+        return OpenAlexTopicStatsCollectionResult(
+            date_from=kwargs["date_from"],  # type: ignore[arg-type]
+            date_to=kwargs["date_to"],  # type: ignore[arg-type]
+            collected=1,
+            deferred=True,
+            retry_after_seconds=None,
+            pending_tasks=[
+                {
+                    "task_type": "collect_topic_stats",
+                    "date_from": "2025-01-01",
+                    "date_to": "2025-01-31",
+                    "taxonomy_scope": "topic",
+                    "topic_ids": [2],
+                }
+            ],
         )
 
 
@@ -298,6 +338,45 @@ def test_coverage_enqueue_missing_samples_uses_full_missing_topic_ids() -> None:
     assert {message["task_type"] for _, message in redis.messages} == {"bootstrap_papers"}
     assert all(message["field_id"] == 17 for _, message in redis.messages)
     assert all(message["target_scope"] == "month" for _, message in redis.messages)
+    assert all(message["enqueue_indexing"] is False for _, message in redis.messages)
+    assert all(message["enqueue_cluster_dynamics"] is True for _, message in redis.messages)
+    assert all(message["workflow_granularity"] == "month" for _, message in redis.messages)
+
+
+def test_coverage_enqueue_missing_cluster_dynamics_uses_full_missing_topic_ids() -> None:
+    redis = _CapturingRedis()
+    report = {
+        "checks": {
+            "cluster_dynamics": {
+                "missing_topic_periods": 2,
+                "missing_by_period": [
+                    {
+                        "period": "2025-01",
+                        "period_start": date(2025, 1, 1),
+                        "period_end": date(2025, 1, 31),
+                        "topic_ids": [1, 2],
+                    }
+                ],
+            }
+        }
+    }
+
+    result = enqueue_missing_cluster_dynamics_tasks(
+        report,
+        redis_adapter=redis,
+        queue_name="queue:cluster_dynamics_recompute",
+        batch_size=1,
+    )
+
+    assert result["messages"] == 2
+    assert [message["cluster_ids"] for _, message in redis.messages] == [
+        ["topic:1"],
+        ["topic:2"],
+    ]
+    assert all(
+        message["task_type"] == "cluster_dynamics_recompute"
+        for _, message in redis.messages
+    )
 
 
 def test_data_coverage_cli_parser_topic_stats_flags_default_to_enabled() -> None:
@@ -334,7 +413,8 @@ def test_data_coverage_cli_parser_topic_stats_flags_default_to_enabled() -> None
 
 
 def test_openalex_topic_stats_queue_has_max_worker_priority() -> None:
-    assert DEFAULT_QUEUE_ORDER[0] == OPENALEX_TOPIC_STATS_QUEUE
+    assert DEFAULT_QUEUE_ORDER[0] == OPENALEX_TOPIC_STATS_PENDING_QUEUE
+    assert OPENALEX_TOPIC_STATS_QUEUE in DEFAULT_QUEUE_ORDER
     assert OPENALEX_BOOTSTRAP_PAPERS_QUEUE in DEFAULT_QUEUE_ORDER
 
 
@@ -459,6 +539,31 @@ def test_worker_handler_runs_collect_topic_stats_task() -> None:
     assert result.details["task_type"] == "collect_topic_stats"
     assert collector.calls[0]["topic_ids"] == [1, 2]
     assert collector.calls[0]["date_from"] == date(2025, 1, 1)
+
+
+def test_worker_handler_enqueues_deferred_topic_stats_and_cooldown() -> None:
+    redis = _CapturingRedis()
+    handler = MLTaskHandler(
+        openalex_topic_stats_collector_factory=lambda _message: _DeferredTopicStatsCollector(),  # type: ignore[arg-type]
+        redis_adapter=redis,
+    )
+
+    result = handler.handle(
+        {
+            "task_type": "collect_topic_stats",
+            "date_from": "2025-01-01",
+            "date_to": "2025-01-31",
+            "topic_ids": [1, 2],
+            "openalex_api_key": "secret",
+        }
+    )
+
+    assert result.success is True
+    assert redis.messages[0][0] == OPENALEX_TOPIC_STATS_PENDING_QUEUE
+    assert redis.messages[0][1]["topic_ids"] == [2]
+    assert redis.messages[0][1]["openalex_api_key"] == "secret"
+    assert redis.values[OPENALEX_COOLDOWN_KEY]["retry_after_seconds"] == 900
+    assert redis.ttls[OPENALEX_COOLDOWN_KEY] == 900
 
 
 def test_worker_handler_runs_bootstrap_papers_task() -> None:
