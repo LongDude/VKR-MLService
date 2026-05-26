@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from core.config import Settings
 from dto.charts import PeriodCountDTO
+from dto.external import ExternalKeywordDTO, ExternalPaperDTO
 from models import Paper, TopicQuarterReport
 from models.models import User
 from models.session import create_engine_from_settings, create_session_factory
@@ -160,6 +161,20 @@ def test_repository_classes_expose_required_docstring_methods() -> None:
         for method_name in method_names:
             method = getattr(repository_type, method_name)
             assert method.__doc__, f"{repository_type.__name__}.{method_name} lacks docstring"
+
+
+def test_openalex_keywords_are_not_written_to_extracted_keywords_values() -> None:
+    repository = PaperRepository(session=object())  # type: ignore[arg-type]
+    paper = ExternalPaperDTO(
+        external_id="https://openalex.org/W1",
+        title="Graph ranking",
+        extracted_keywords=["hybrid-ranker-output"],
+        keywords=[ExternalKeywordDTO(value="openalex keyword", score=0.7)],
+    )
+
+    values = repository._external_values(paper)
+
+    assert "extracted_keywords" not in values
 
 
 class _FakeDialect:

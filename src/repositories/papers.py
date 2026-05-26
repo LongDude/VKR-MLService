@@ -588,10 +588,6 @@ class PaperRepository(BaseRepository):
                         stmt.excluded.primary_topic_id,
                         Paper.primary_topic_id,
                     ),
-                    "extracted_keywords": func.coalesce(
-                        stmt.excluded.extracted_keywords,
-                        Paper.extracted_keywords,
-                    ),
                     "updated_at": func.now(),
                 },
             )
@@ -641,7 +637,6 @@ class PaperRepository(BaseRepository):
             "openalex_id": item.external_id,
             "references_count": item.references_count,
             "primary_topic_id": item.primary_topic_id,
-            "extracted_keywords": self._extracted_keywords_payload(item),
         }
 
     def _apply_external_values(
@@ -732,25 +727,6 @@ class PaperRepository(BaseRepository):
         if domain_ids:
             conditions.append(Field.domain_id.in_(domain_ids))
         return stmt.where(or_(*conditions)).distinct()
-
-    def _extracted_keywords_payload(
-        self,
-        item: ExternalPaperDTO,
-    ) -> list[str] | list[dict[str, Any]] | None:
-        if item.extracted_keywords is not None:
-            return item.extracted_keywords
-        if not item.keywords:
-            return None
-        payload: list[dict[str, Any]] = []
-        for keyword in item.keywords:
-            value = keyword.value.strip() if keyword.value else ""
-            if not value:
-                continue
-            item_payload: dict[str, Any] = {"keyword": value}
-            if keyword.score is not None:
-                item_payload["score"] = float(keyword.score)
-            payload.append(item_payload)
-        return payload or None
 
     def _unique_ids(self, paper_ids: Iterable[int]) -> list[int]:
         return list(dict.fromkeys(int(paper_id) for paper_id in paper_ids))
