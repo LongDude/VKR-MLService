@@ -14,6 +14,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from adapters import lmstudio_chat_adapter as lmstudio_chat_module
+from adapters import lmstudio_embedding_adapter as lmstudio_embedding_module
 from adapters.lmstudio_chat_adapter import LMStudioChatAdapter
 from adapters.lmstudio_embedding_adapter import LMStudioEmbeddingAdapter
 from adapters.openalex_adapter import OpenAlexAdapter
@@ -1125,6 +1127,25 @@ def test_qdrant_adapter_uses_client_without_hardcoded_collection() -> None:
     assert adapter.search("papers", [0.1, 0.2, 0.3], top_k=1)[0].payload == {"paper_id": 1}
 
 
+def test_qdrant_adapter_disables_startup_compatibility_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from adapters import qdrant_adapter as qdrant_module
+
+    captured_kwargs: dict[str, Any] = {}
+
+    class FakeRemoteQdrantClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr(qdrant_module, "QdrantClient", FakeRemoteQdrantClient)
+
+    qdrant_module.QdrantAdapter(url="http://qdrant.example")
+
+    assert captured_kwargs["url"] == "http://qdrant.example"
+    assert captured_kwargs["check_compatibility"] is False
+
+
 def test_qdrant_paper_payload_uses_paper_openalex_fields() -> None:
     payload = QdrantPayloadBuilder().build_paper_payload(
         SimpleNamespace(
@@ -1775,6 +1796,22 @@ def test_lmstudio_embedding_adapter_validates_response() -> None:
     assert result.token_count == 12
 
 
+def test_lmstudio_embedding_adapter_disables_environment_proxy_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+
+    class CapturingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr(lmstudio_embedding_module.httpx, "Client", CapturingClient)
+
+    LMStudioEmbeddingAdapter("http://lmstudio")
+
+    assert captured_kwargs["trust_env"] is False
+
+
 def test_lmstudio_embedding_adapter_rejects_invalid_vectors() -> None:
     client = httpx.Client(
         transport=httpx.MockTransport(
@@ -1808,6 +1845,22 @@ def test_lmstudio_chat_adapter_supports_json_response_format() -> None:
     assert result == {"summary": "ok"}
     assert captured_payload["response_format"]["type"] == "json_schema"
     assert captured_payload["response_format"]["json_schema"]["name"] == "json_response"
+
+
+def test_lmstudio_chat_adapter_disables_environment_proxy_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+
+    class CapturingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr(lmstudio_chat_module.httpx, "Client", CapturingClient)
+
+    LMStudioChatAdapter("http://lmstudio")
+
+    assert captured_kwargs["trust_env"] is False
 
 
 def test_lmstudio_chat_adapter_rejects_invalid_json_when_requested() -> None:

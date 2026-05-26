@@ -29,6 +29,7 @@ class QdrantAdapter:
         api_key: str | None = None,
         timeout_seconds: float | None = None,
         prefer_grpc: bool = False,
+        check_compatibility: bool = False,
     ) -> None:
         if client is None:
             if QdrantClient is None:
@@ -36,7 +37,10 @@ class QdrantAdapter:
                     "qdrant_client is not installed. Install qdrant-client to use QdrantAdapter.",
                     details={"qdrant_client_installed": False},
                 )
-            client_kwargs: dict[str, Any] = {"prefer_grpc": prefer_grpc}
+            client_kwargs: dict[str, Any] = {
+                "prefer_grpc": prefer_grpc,
+                "check_compatibility": check_compatibility,
+            }
             if url is not None:
                 client_kwargs["url"] = url
             if host is not None:

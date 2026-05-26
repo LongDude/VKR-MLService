@@ -15,11 +15,15 @@ class LMStudioEmbeddingAdapter:
         base_url: str = "http://localhost:1234",
         *,
         timeout_seconds: float = 30.0,
+        trust_env: bool = False,
         client: httpx.Client | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
-        self._client = client or httpx.Client(timeout=timeout_seconds)
+        self._client = client or httpx.Client(
+            timeout=timeout_seconds,
+            trust_env=trust_env,
+        )
 
     def embed_text(
         self,

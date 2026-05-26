@@ -122,6 +122,19 @@ class TopicQuarterReportFacade:
             request.period_end,
             period_stats,
         )
+        self._emit(
+            "topic_quarter_report_prerequisites_loaded",
+            entity_id=f"topic:{request.topic_id}:{period_key}",
+            stage="prepare",
+            current=1,
+            total=1,
+            message="Topic quarter report input data loaded",
+            payload={
+                "period_stats": len(period_stats),
+                "openalex_count_rows": len(openalex_counts),
+                "representative_papers": len(representative_papers),
+            },
+        )
         response_payload = self._generate_payload(
             topic={
                 "id": int(topic.id),
@@ -443,19 +456,59 @@ class TopicQuarterReportFacade:
         representative_papers: list[dict[str, Any]],
         report_language: str,
     ) -> dict[str, Any]:
-        content = self.chat_adapter.chat_completion(
-            messages=self.prompt_service.build_report_prompt(
-                topic=topic,
-                period=period,
-                metrics=metrics,
-                keyword_dynamics=keyword_dynamics,
-                openalex_counts=openalex_counts,
-                representative_papers=representative_papers,
-                report_language=report_language,
-            ),
-            model=self.chat_model,
-            temperature=0.2,
-            response_format=self.prompt_service.response_format(),
+        entity_id = f"topic:{topic['id']}:{period['period_key']}"
+        messages = self.prompt_service.build_report_prompt(
+            topic=topic,
+            period=period,
+            metrics=metrics,
+            keyword_dynamics=keyword_dynamics,
+            openalex_counts=openalex_counts,
+            representative_papers=representative_papers,
+            report_language=report_language,
+        )
+        self._emit(
+            "topic_quarter_report_lmstudio_started",
+            entity_id=entity_id,
+            stage="lmstudio",
+            current=0,
+            total=1,
+            message="Sending topic quarter report prompt to LMStudio",
+            payload={
+                "model": self.chat_model,
+                "messages": len(messages),
+                "representative_papers": len(representative_papers),
+                "openalex_count_rows": len(openalex_counts),
+            },
+        )
+        try:
+            content = self.chat_adapter.chat_completion(
+                messages=messages,
+                model=self.chat_model,
+                temperature=0.2,
+                response_format=self.prompt_service.response_format(),
+            )
+        except Exception as exc:
+            self._emit(
+                "topic_quarter_report_lmstudio_failed",
+                entity_id=entity_id,
+                stage="lmstudio",
+                current=1,
+                total=1,
+                message="LMStudio topic quarter report request failed",
+                payload={
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                },
+            )
+            raise
+        self._emit(
+            "topic_quarter_report_lmstudio_completed",
+            entity_id=entity_id,
+            stage="lmstudio",
+            current=1,
+            total=1,
+            message="LMStudio topic quarter report response received",
+            payload={"content_chars": len(content)},
         )
         try:
             payload = json.loads(content)
