@@ -1,19 +1,4 @@
 services:
-  minio:
-    image: minio/minio:latest
-    container_name: vkr-ml-minio
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    ports:
-      - 9001:9000
-      - 8083:9001
-    volumes:
-      - minio_data:/data
-      - ./scripts/minio-setup.sh:/etc/minio-setup.sh
-    networks:
-      - ml_network
-      - vkr-outer-network
-
   redis:
     image: redis:7-alpine
     container_name: vkr-ml-redis
@@ -107,8 +92,6 @@ services:
 volumes:
   redis_data:
     name: "vkr-volume-redis"
-  minio_data:
-    name: "vkr-volume-minio"
   qdrant_data:
     name: "vkr-volume-qdrant"
 
