@@ -39,6 +39,11 @@ from models import (
     TopicQuarterReport,
 )
 from models.session import create_db_engine, create_session_factory
+from ml.services.cluster_dynamics_tasks import (
+    acquire_cluster_dynamics_cluster_ids,
+    build_cluster_dynamics_message,
+    release_cluster_dynamics_dedupe_keys,
+)
 from ml.services.quarter_periods import QuarterPeriodService
 from repositories.openalex_yearly_topic_stats import OpenAlexYearlyTopicStatsRepository
 
@@ -1795,23 +1800,37 @@ def enqueue_missing_cluster_dynamics_tasks(
                 "Run analyzer with include_missing_topic_ids enabled."
             )
         cluster_ids = [f"topic:{int(topic_id)}" for topic_id in topic_ids]
+        date_from = _iso_date_value(period["period_start"])
+        date_to = _iso_date_value(period["period_end"])
+        accepted_cluster_ids = acquire_cluster_dynamics_cluster_ids(
+            redis_adapter,
+            cluster_ids,
+            date_from=date_from,
+            date_to=date_to,
+            granularity="month",
+        )
         for chunk in [
-            cluster_ids[index : index + batch_size]
-            for index in range(0, len(cluster_ids), batch_size)
+            accepted_cluster_ids[index : index + batch_size]
+            for index in range(0, len(accepted_cluster_ids), batch_size)
         ]:
             messages.append(
-                {
-                    "task_type": "cluster_dynamics_recompute",
-                    "cluster_ids": chunk,
-                    "date_from": _iso_date_value(period["period_start"]),
-                    "date_to": _iso_date_value(period["period_end"]),
-                    "granularity": "month",
-                }
+                build_cluster_dynamics_message(
+                    chunk,
+                    date_from=date_from,
+                    date_to=date_to,
+                    granularity="month",
+                )
             )
 
-    for message in messages:
-        redis_adapter.enqueue(queue_name, message)
+    try:
+        for message in messages:
+            redis_adapter.enqueue(queue_name, message)
+    except Exception:
+        for message in messages:
+            release_cluster_dynamics_dedupe_keys(redis_adapter, message)
+        raise
 
+    accepted_count = sum(len(message["cluster_ids"]) for message in messages)
     return {
         "queue": queue_name,
         "source_check": "cluster_dynamics",
@@ -1819,6 +1838,8 @@ def enqueue_missing_cluster_dynamics_tasks(
             cluster_dynamics.get("missing_topic_periods") or 0
         ),
         "messages": len(messages),
+        "dedupe_skipped": int(cluster_dynamics.get("missing_topic_periods") or 0)
+        - accepted_count,
         "batch_size": batch_size,
         "sample": messages[:3],
     }

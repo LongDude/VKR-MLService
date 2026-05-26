@@ -12,6 +12,11 @@ from ml.services.openalex_cooldown import (
     OPENALEX_COOLDOWN_KEY,
     OPENALEX_TOPIC_STATS_PENDING_QUEUE,
 )
+from ml.services.cluster_recompute_tasks import (
+    build_cluster_recompute_message,
+    release_cluster_recompute_dedupe_keys,
+)
+from ml.services.cluster_dynamics_tasks import release_cluster_dynamics_dedupe_keys
 from ml.services.events import EventSink, MLEvent, NoopEventSink, TqdmEventSink
 from ml.workers.task_handlers import MLTaskHandler
 
@@ -363,8 +368,9 @@ class RedisMLWorker:
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        grouped_topic_ids: dict[bool, list[int]] = defaultdict(list)
-        seen_by_force: dict[bool, set[int]] = defaultdict(set)
+        grouped_topic_ids: dict[tuple[Any, ...], list[int]] = defaultdict(list)
+        seen_by_options: dict[tuple[Any, ...], set[int]] = defaultdict(set)
+        messages_by_options: dict[tuple[Any, ...], dict[str, Any]] = {}
         result: list[dict[str, Any]] = []
 
         for message in messages:
@@ -372,21 +378,24 @@ class RedisMLWorker:
                 result.append(message)
                 continue
 
-            force_summary = bool(message.get("force_summary", False))
+            options = self._cluster_recompute_options(message)
+            messages_by_options.setdefault(options, message)
             for topic_id in self._topic_ids_from_message(message):
-                if topic_id in seen_by_force[force_summary]:
+                if topic_id in seen_by_options[options]:
                     continue
-                grouped_topic_ids[force_summary].append(topic_id)
-                seen_by_force[force_summary].add(topic_id)
+                grouped_topic_ids[options].append(topic_id)
+                seen_by_options[options].add(topic_id)
 
-        for force_summary, topic_ids in grouped_topic_ids.items():
+        for options, topic_ids in grouped_topic_ids.items():
             if topic_ids:
+                source = messages_by_options[options]
                 result.append(
-                    {
-                        "task_type": "recompute_topic_clusters",
-                        "topic_ids": topic_ids,
-                        "force_summary": force_summary,
-                    }
+                    build_cluster_recompute_message(
+                        topic_ids,
+                        force_summary=bool(source.get("force_summary", False)),
+                        cluster_workers=self._optional_cluster_workers(source),
+                        workflow_options=source,
+                    )
                 )
         return result
 
@@ -470,6 +479,10 @@ class RedisMLWorker:
                 },
             )
         finally:
+            if queue_name == CLUSTER_RECOMPUTE_QUEUE:
+                self._release_cluster_recompute_dedupe_keys(message)
+            if queue_name == CLUSTER_DYNAMICS_RECOMPUTE_QUEUE:
+                self._release_cluster_dynamics_dedupe_keys(message)
             self._current_queue_name = None
             self._current_message = None
 
@@ -559,29 +572,15 @@ class RedisMLWorker:
 
         force_summary = bool(message.get("force_summary", False))
         cluster_workers = message.get("cluster_workers")
-        workflow_fields = {
-            key: message[key]
-            for key in (
-                "source_topic_ids",
-                "workflow_date_from",
-                "workflow_date_to",
-                "workflow_granularity",
-                "enqueue_cluster_dynamics",
-            )
-            if key in message
-        }
         return [
-            {
-                "task_type": "recompute_topic_clusters",
-                "topic_ids": topic_ids[index : index + max_task_size],
-                "force_summary": force_summary,
-                **workflow_fields,
-                **(
-                    {"cluster_workers": int(cluster_workers)}
-                    if cluster_workers is not None
-                    else {}
+            build_cluster_recompute_message(
+                topic_ids[index : index + max_task_size],
+                force_summary=force_summary,
+                cluster_workers=(
+                    int(cluster_workers) if cluster_workers is not None else None
                 ),
-            }
+                workflow_options=message,
+            )
             for index in range(0, len(topic_ids), max_task_size)
         ]
 
@@ -725,16 +724,59 @@ class RedisMLWorker:
             "task_type",
             "topic_id",
             "topic_ids",
-            "keyword_ids",
-            "paper_id",
-            "paper_ids",
-            "text_hash",
-            "text_hashes",
             "force_summary",
+            "cluster_workers",
+            "workflow_date_from",
+            "workflow_date_to",
+            "workflow_granularity",
+            "enqueue_cluster_dynamics",
         }
         if set(message) - allowed_keys:
             return False
         return bool(self._topic_ids_from_message(message))
+
+    def _cluster_recompute_options(self, message: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            bool(message.get("force_summary", False)),
+            self._workflow_date_value(message, "workflow_date_from"),
+            self._workflow_date_value(message, "workflow_date_to"),
+            str(message.get("workflow_granularity") or "month"),
+            bool(message.get("enqueue_cluster_dynamics", False)),
+            self._optional_cluster_workers(message),
+        )
+
+    def _optional_cluster_workers(self, message: dict[str, Any]) -> int | None:
+        value = message.get("cluster_workers")
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _release_cluster_recompute_dedupe_keys(
+        self,
+        message: dict[str, Any],
+    ) -> None:
+        try:
+            release_cluster_recompute_dedupe_keys(self.redis_adapter, message)
+        except Exception:
+            self.logger.exception(
+                "Failed to release cluster recompute dedupe keys",
+                extra={"message": self._safe_message_summary(message)},
+            )
+
+    def _release_cluster_dynamics_dedupe_keys(
+        self,
+        message: dict[str, Any],
+    ) -> None:
+        try:
+            release_cluster_dynamics_dedupe_keys(self.redis_adapter, message)
+        except Exception:
+            self.logger.exception(
+                "Failed to release cluster dynamics dedupe keys",
+                extra={"message": self._safe_message_summary(message)},
+            )
 
     def _paper_ids_from_message(self, message: dict[str, Any]) -> list[int]:
         paper_ids: list[int] = []

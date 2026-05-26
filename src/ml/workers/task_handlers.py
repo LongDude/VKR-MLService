@@ -14,6 +14,11 @@ from ml.services.openalex_cooldown import (
     OPENALEX_TOPIC_STATS_PENDING_QUEUE,
     set_openalex_cooldown,
 )
+from ml.services.cluster_dynamics_tasks import (
+    acquire_cluster_dynamics_cluster_ids,
+    build_cluster_dynamics_message,
+    release_cluster_dynamics_dedupe_keys,
+)
 from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.pipelines.cluster_dynamics_pipeline import ClusterDynamicsPipeline
 from ml.pipelines.keyword_extraction_pipeline import KeywordExtractionPipeline
@@ -416,16 +421,26 @@ class MLTaskHandler:
         cluster_ids = [f"topic:{topic_id}" for topic_id in topic_ids]
         if not cluster_ids:
             return
-        self.redis_adapter.enqueue(
-            "queue:cluster_dynamics_recompute",
-            {
-                "task_type": "cluster_dynamics_recompute",
-                "cluster_ids": cluster_ids,
-                "date_from": date_from.isoformat(),
-                "date_to": date_to.isoformat(),
-                "granularity": granularity,
-            },
+        accepted_cluster_ids = acquire_cluster_dynamics_cluster_ids(
+            self.redis_adapter,
+            cluster_ids,
+            date_from=date_from,
+            date_to=date_to,
+            granularity=granularity,
         )
+        if not accepted_cluster_ids:
+            return
+        task_message = build_cluster_dynamics_message(
+            accepted_cluster_ids,
+            date_from=date_from,
+            date_to=date_to,
+            granularity=granularity,
+        )
+        try:
+            self.redis_adapter.enqueue("queue:cluster_dynamics_recompute", task_message)
+        except Exception:
+            release_cluster_dynamics_dedupe_keys(self.redis_adapter, task_message)
+            raise
 
     def _recompute_one_topic_cluster(
         self,

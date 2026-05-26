@@ -24,6 +24,16 @@ from core.exceptions import AppError
 from ml.constants import PAPERS_COLLECTION
 from ml.services.quarter_periods import QuarterPeriodService
 from ml.services.openalex_cooldown import OPENALEX_COOLDOWN_KEY
+from ml.services.cluster_recompute_tasks import (
+    acquire_cluster_recompute_topic_ids,
+    build_cluster_recompute_message,
+    release_cluster_recompute_dedupe_keys,
+)
+from ml.services.cluster_dynamics_tasks import (
+    acquire_cluster_dynamics_cluster_ids,
+    build_cluster_dynamics_message,
+    release_cluster_dynamics_dedupe_keys,
+)
 from ml.workers.redis_worker import (
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
@@ -71,20 +81,38 @@ class ClusterRecomputeTaskEnqueuer:
             raise ValueError("--batch-size must be a positive integer.")
         if cluster_workers <= 0:
             raise ValueError("--cluster-workers must be a positive integer.")
+        unique_topic_ids = list(dict.fromkeys(int(topic_id) for topic_id in topic_ids))
+        accepted_topic_ids = unique_topic_ids
+        if not dry_run:
+            if self.redis_adapter is None:
+                raise ValueError("Redis adapter is required unless --dry-run is used.")
+            accepted_topic_ids = acquire_cluster_recompute_topic_ids(
+                self.redis_adapter,
+                unique_topic_ids,
+                force_summary=bool(force_summary),
+            )
         messages = [
-            {
-                "task_type": "recompute_topic_clusters",
-                "topic_ids": chunk,
-                "force_summary": bool(force_summary),
-                "cluster_workers": int(cluster_workers),
-            }
-            for chunk in chunked(list(dict.fromkeys(topic_ids)), batch_size)
+            build_cluster_recompute_message(
+                chunk,
+                force_summary=bool(force_summary),
+                cluster_workers=(
+                    int(cluster_workers) if int(cluster_workers) != 1 else None
+                ),
+            )
+            for chunk in chunked(accepted_topic_ids, batch_size)
         ]
-        self._enqueue_messages(messages, dry_run=dry_run, show_progress=show_progress)
+        try:
+            self._enqueue_messages(messages, dry_run=dry_run, show_progress=show_progress)
+        except Exception:
+            if not dry_run and self.redis_adapter is not None:
+                for message in messages:
+                    release_cluster_recompute_dedupe_keys(self.redis_adapter, message)
+            raise
         return {
             "queue": self.queue_name,
             "dry_run": dry_run,
-            "topic_count": len(set(topic_ids)),
+            "topic_count": len(set(unique_topic_ids)),
+            "dedupe_skipped": len(unique_topic_ids) - len(accepted_topic_ids),
             "messages": len(messages),
             "batch_size": batch_size,
             "force_summary": bool(force_summary),
@@ -151,21 +179,41 @@ class ClusterDynamicsTaskEnqueuer:
         if batch_size <= 0:
             raise ValueError("--batch-size must be a positive integer.")
         unique_cluster_ids = list(dict.fromkeys(cluster_ids))
+        accepted_cluster_ids = unique_cluster_ids
+        if not dry_run:
+            if self.redis_adapter is None:
+                raise ValueError("Redis adapter is required unless --dry-run is used.")
+            accepted_cluster_ids = acquire_cluster_dynamics_cluster_ids(
+                self.redis_adapter,
+                unique_cluster_ids,
+                date_from=date_from,
+                date_to=date_to,
+                granularity=granularity,
+            )
         messages = [
-            {
-                "task_type": "cluster_dynamics_recompute",
-                "cluster_ids": chunk,
-                "date_from": date_from.isoformat(),
-                "date_to": date_to.isoformat(),
-                "granularity": granularity,
-            }
-            for chunk in chunked_strings(unique_cluster_ids, batch_size)
+            build_cluster_dynamics_message(
+                chunk,
+                date_from=date_from,
+                date_to=date_to,
+                granularity=granularity,
+            )
+            for chunk in chunked_strings(accepted_cluster_ids, batch_size)
         ]
-        self._enqueue_messages(messages, dry_run=dry_run, show_progress=show_progress)
+        try:
+            self._enqueue_messages(messages, dry_run=dry_run, show_progress=show_progress)
+        except Exception:
+            if not dry_run and self.redis_adapter is not None:
+                for message in messages:
+                    release_cluster_dynamics_dedupe_keys(
+                        self.redis_adapter,
+                        message,
+                    )
+            raise
         return {
             "queue": self.queue_name,
             "dry_run": dry_run,
             "cluster_count": len(unique_cluster_ids),
+            "dedupe_skipped": len(unique_cluster_ids) - len(accepted_cluster_ids),
             "messages": len(messages),
             "batch_size": batch_size,
             "date_from": date_from,
@@ -1745,16 +1793,14 @@ class FailedTaskRestorer:
                 force_summary = bool(message.get("force_summary", False))
                 cluster_workers = message.get("cluster_workers")
                 return [
-                    {
-                        "task_type": "recompute_topic_clusters",
-                        "topic_ids": chunk,
-                        "force_summary": force_summary,
-                        **(
-                            {"cluster_workers": int(cluster_workers)}
-                            if cluster_workers is not None
-                            else {}
+                    build_cluster_recompute_message(
+                        chunk,
+                        force_summary=force_summary,
+                        cluster_workers=(
+                            int(cluster_workers) if cluster_workers is not None else None
                         ),
-                    }
+                        workflow_options=message,
+                    )
                     for chunk in chunked(topic_ids, split_cluster_recompute_batch_size)
                 ]
 

@@ -51,6 +51,17 @@ class _CapturingRedis:
         if ttl_seconds is not None:
             self.ttls[key] = ttl_seconds
 
+    def acquire_lock(self, key: str, ttl_seconds: int) -> bool:
+        if key in self.values:
+            return False
+        self.values[key] = {"lock": True}
+        self.ttls[key] = ttl_seconds
+        return True
+
+    def release_lock(self, key: str) -> None:
+        self.values.pop(key, None)
+        self.ttls.pop(key, None)
+
 
 class _FakeTopicStatsCollector:
     def __init__(self) -> None:

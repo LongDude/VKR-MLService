@@ -19,7 +19,11 @@ from adapters.lmstudio_embedding_adapter import LMStudioEmbeddingAdapter
 from adapters.openalex_adapter import OpenAlexAdapter
 from adapters.qdrant_adapter import QdrantAdapter
 from adapters.redis_adapter import RedisAdapter
-from cli.tasks import FailedTaskRestorer
+from cli.tasks import (
+    ClusterDynamicsTaskEnqueuer,
+    ClusterRecomputeTaskEnqueuer,
+    FailedTaskRestorer,
+)
 from core.exceptions import (
     EmbeddingGenerationError,
     ExternalServiceRateLimitError,
@@ -49,6 +53,7 @@ from ml.services.qdrant_collections import QdrantCollectionInitializer
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.events import CompositeEventSink, MLEvent, RedisEventSink
 from ml.workers.redis_worker import (
+    CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
     FAILED_TASKS_QUEUE,
     KEYWORD_EXTRACTION_QUEUE,
@@ -500,6 +505,74 @@ def test_failed_task_restorer_can_disable_cluster_recompute_split() -> None:
     assert restored["topic_ids"] == topic_ids
 
 
+def test_cluster_recompute_enqueuer_uses_dedupe_keys() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    enqueuer = ClusterRecomputeTaskEnqueuer(redis_adapter=adapter)
+
+    first = enqueuer.enqueue(
+        topic_ids=[1, 2, 2],
+        batch_size=50,
+        dry_run=False,
+        show_progress=False,
+    )
+    second = enqueuer.enqueue(
+        topic_ids=[1, 2],
+        batch_size=50,
+        dry_run=False,
+        show_progress=False,
+    )
+
+    queued = adapter.dequeue_nowait(CLUSTER_RECOMPUTE_QUEUE)
+    assert first["topic_count"] == 2
+    assert first["dedupe_skipped"] == 0
+    assert second["dedupe_skipped"] == 2
+    assert adapter.queue_length(CLUSTER_RECOMPUTE_QUEUE) == 0
+    assert queued == {
+        "task_type": "recompute_topic_clusters",
+        "topic_ids": [1, 2],
+        "force_summary": False,
+    }
+
+
+def test_cluster_dynamics_enqueuer_uses_dedupe_keys() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    enqueuer = ClusterDynamicsTaskEnqueuer(redis_adapter=adapter)
+
+    first = enqueuer.enqueue(
+        cluster_ids=["topic:1", "topic:2", "topic:2"],
+        date_from=date(2026, 1, 1),
+        date_to=date(2026, 1, 31),
+        granularity="month",
+        batch_size=50,
+        dry_run=False,
+        show_progress=False,
+    )
+    second = enqueuer.enqueue(
+        cluster_ids=["topic:1", "topic:2"],
+        date_from=date(2026, 1, 1),
+        date_to=date(2026, 1, 31),
+        granularity="month",
+        batch_size=50,
+        dry_run=False,
+        show_progress=False,
+    )
+
+    queued = adapter.dequeue_nowait(CLUSTER_DYNAMICS_RECOMPUTE_QUEUE)
+    assert first["cluster_count"] == 2
+    assert first["dedupe_skipped"] == 0
+    assert second["dedupe_skipped"] == 2
+    assert adapter.queue_length(CLUSTER_DYNAMICS_RECOMPUTE_QUEUE) == 0
+    assert queued == {
+        "task_type": "cluster_dynamics_recompute",
+        "cluster_ids": ["topic:1", "topic:2"],
+        "date_from": "2026-01-01",
+        "date_to": "2026-01-31",
+        "granularity": "month",
+    }
+
+
 class CapturingTaskHandler:
     def __init__(self) -> None:
         self.messages: list[dict[str, Any]] = []
@@ -690,6 +763,102 @@ def test_redis_worker_splits_oversized_cluster_recompute_messages_before_handlin
     assert worker.run_once() is True
     assert [len(message["topic_ids"]) for message in handler.messages] == [4, 4, 2]
     assert all(message["force_summary"] is True for message in handler.messages)
+
+
+def test_redis_worker_coalesces_cluster_recompute_by_workflow_period() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    handler = CapturingTaskHandler()
+    for topic_id in (1, 2):
+        adapter.enqueue(
+            CLUSTER_RECOMPUTE_QUEUE,
+            {
+                "task_type": "recompute_topic_clusters",
+                "topic_ids": [topic_id],
+                "workflow_date_from": "2026-01-01",
+                "workflow_date_to": "2026-01-31",
+                "workflow_granularity": "month",
+                "enqueue_cluster_dynamics": True,
+            },
+        )
+    adapter.enqueue(
+        CLUSTER_RECOMPUTE_QUEUE,
+        {
+            "task_type": "recompute_topic_clusters",
+            "topic_ids": [3],
+            "workflow_date_from": "2026-02-01",
+            "workflow_date_to": "2026-02-28",
+            "workflow_granularity": "month",
+            "enqueue_cluster_dynamics": True,
+        },
+    )
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=handler,  # type: ignore[arg-type]
+        queues=(CLUSTER_RECOMPUTE_QUEUE,),
+        batch_sizes={CLUSTER_RECOMPUTE_QUEUE: 10},
+        max_task_sizes={CLUSTER_RECOMPUTE_QUEUE: 10},
+    )
+
+    assert worker.run_once() is True
+    assert [message["topic_ids"] for message in handler.messages] == [[1, 2], [3]]
+    assert handler.messages[0]["workflow_date_from"] == "2026-01-01"
+    assert handler.messages[0]["workflow_date_to"] == "2026-01-31"
+    assert handler.messages[0]["enqueue_cluster_dynamics"] is True
+
+
+def test_redis_worker_releases_cluster_recompute_dedupe_key_after_handling() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    handler = CapturingTaskHandler()
+    message = {
+        "task_type": "recompute_topic_clusters",
+        "topic_ids": [42],
+        "workflow_date_from": "2026-01-01",
+        "workflow_date_to": "2026-01-31",
+        "workflow_granularity": "month",
+        "enqueue_cluster_dynamics": True,
+    }
+    key = (
+        "ml:dedupe:cr:t:42:df:2026-01-01:dt:2026-01-31:"
+        "g:month:fs:0:dyn:1"
+    )
+    adapter.acquire_lock(key, ttl_seconds=60)
+    adapter.enqueue(CLUSTER_RECOMPUTE_QUEUE, message)
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=handler,  # type: ignore[arg-type]
+        queues=(CLUSTER_RECOMPUTE_QUEUE,),
+    )
+
+    assert adapter.exists(key) is True
+    assert worker.run_once() is True
+    assert adapter.exists(key) is False
+
+
+def test_redis_worker_releases_cluster_dynamics_dedupe_key_after_handling() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    handler = CapturingTaskHandler()
+    message = {
+        "task_type": "cluster_dynamics_recompute",
+        "cluster_ids": ["topic:42"],
+        "date_from": "2026-01-01",
+        "date_to": "2026-01-31",
+        "granularity": "month",
+    }
+    key = "ml:dedupe:cd:c:topic:42:df:2026-01-01:dt:2026-01-31:g:month"
+    adapter.acquire_lock(key, ttl_seconds=60)
+    adapter.enqueue(CLUSTER_DYNAMICS_RECOMPUTE_QUEUE, message)
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=handler,  # type: ignore[arg-type]
+        queues=(CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,),
+    )
+
+    assert adapter.exists(key) is True
+    assert worker.run_once() is True
+    assert adapter.exists(key) is False
 
 
 def test_redis_worker_emits_completed_result_summary() -> None:
@@ -1538,9 +1707,16 @@ def test_paper_indexing_batch_forwards_workflow_options_to_cluster_recompute() -
     class RedisAdapter:
         def __init__(self) -> None:
             self.messages: list[tuple[str, dict[str, Any]]] = []
+            self.locks: set[str] = set()
 
         def enqueue(self, queue_name: str, message: dict[str, Any]) -> None:
             self.messages.append((queue_name, message))
+
+        def acquire_lock(self, key: str, ttl_seconds: int) -> bool:
+            if key in self.locks:
+                return False
+            self.locks.add(key)
+            return True
 
     redis_adapter = RedisAdapter()
     facade = PaperIndexingFacade(
@@ -1568,11 +1744,15 @@ def test_paper_indexing_batch_forwards_workflow_options_to_cluster_recompute() -
     assert redis_adapter.messages
     queue_name, message = redis_adapter.messages[0]
     assert queue_name == CLUSTER_RECOMPUTE_QUEUE
-    assert message["source_topic_ids"] == [7]
+    assert message["topic_ids"] == [7]
     assert message["workflow_date_from"] == "2026-01-01"
     assert message["workflow_date_to"] == "2026-01-31"
     assert message["workflow_granularity"] == "month"
     assert message["enqueue_cluster_dynamics"] is True
+    assert "source_topic_ids" not in message
+    assert "paper_ids" not in message
+    assert "keyword_ids" not in message
+    assert "text_hashes" not in message
 
 
 def test_lmstudio_embedding_adapter_validates_response() -> None:

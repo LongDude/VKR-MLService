@@ -27,6 +27,11 @@ from repositories.taxonomy import TaxonomyRepository
 from utils.hashing import calculate_text_hash
 
 from ml.constants import DEFAULT_EMBEDDING_MODEL, PAPERS_COLLECTION
+from ml.services.cluster_recompute_tasks import (
+    acquire_cluster_recompute_topic_ids,
+    build_cluster_recompute_message,
+    release_cluster_recompute_dedupe_keys,
+)
 from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.text_preparation import TextPreparationService
@@ -214,10 +219,7 @@ class PaperIndexingFacade:
             self._mark_processing_indexed({request.paper_id: text_hash})
             qdrant_indexed = True
             self._enqueue_cluster_recompute(
-                paper_id=request.paper_id,
                 topic_ids=payload.get("topic_ids", []),
-                keyword_ids=payload.get("keyword_ids", []),
-                text_hash=text_hash,
                 workflow_options=self._workflow_options(request),
             )
         except AppError as exc:
@@ -412,7 +414,6 @@ class PaperIndexingFacade:
 
         pending_records: list[dict[str, Any]] = []
         indexed_topic_ids: set[int] = set()
-        indexed_keyword_ids: set[int] = set()
         indexed_text_hashes: dict[int, str] = {}
         skipped_text_hashes: dict[int, str] = {}
 
@@ -552,7 +553,6 @@ class PaperIndexingFacade:
                 if getattr(keyword, "id", None) is not None
             ]
             indexed_topic_ids.update(int(topic_id) for topic_id in topic_ids)
-            indexed_keyword_ids.update(int(keyword_id) for keyword_id in keyword_ids)
             indexed_text_hashes[paper_id] = record["text_hash"]
 
             payload = self.payload_builder.build_paper_payload(
@@ -613,10 +613,7 @@ class PaperIndexingFacade:
             self._mark_processing_indexed(indexed_text_hashes)
             result.updated += len(points)
             self._enqueue_cluster_recompute_batch(
-                paper_ids=[int(point.id) for point in points],
                 topic_ids=sorted(indexed_topic_ids),
-                keyword_ids=sorted(indexed_keyword_ids),
-                text_hashes=indexed_text_hashes,
                 workflow_options=workflow_options,
             )
 
@@ -705,44 +702,48 @@ class PaperIndexingFacade:
     def _enqueue_cluster_recompute(
         self,
         *,
-        paper_id: int,
         topic_ids: list[int],
-        keyword_ids: list[int],
-        text_hash: str,
         workflow_options: dict[str, Any] | None = None,
     ) -> None:
-        self.redis_adapter.enqueue(
-            CLUSTER_RECOMPUTE_QUEUE,
-            {
-                "task_type": "recompute_topic_clusters",
-                "paper_id": paper_id,
-                "topic_ids": topic_ids,
-                "keyword_ids": keyword_ids,
-                "text_hash": text_hash,
-                **(workflow_options or {}),
-            },
+        accepted_topic_ids = acquire_cluster_recompute_topic_ids(
+            self.redis_adapter,
+            topic_ids,
+            workflow_options=workflow_options,
         )
+        if not accepted_topic_ids:
+            return
+        message = build_cluster_recompute_message(
+            accepted_topic_ids,
+            workflow_options=workflow_options,
+        )
+        try:
+            self.redis_adapter.enqueue(CLUSTER_RECOMPUTE_QUEUE, message)
+        except Exception:
+            release_cluster_recompute_dedupe_keys(self.redis_adapter, message)
+            raise
 
     def _enqueue_cluster_recompute_batch(
         self,
         *,
-        paper_ids: list[int],
         topic_ids: list[int],
-        keyword_ids: list[int],
-        text_hashes: dict[int, str],
         workflow_options: dict[str, Any] | None = None,
     ) -> None:
-        self.redis_adapter.enqueue(
-            CLUSTER_RECOMPUTE_QUEUE,
-            {
-                "task_type": "recompute_topic_clusters",
-                "paper_ids": paper_ids,
-                "topic_ids": topic_ids,
-                "keyword_ids": keyword_ids,
-                "text_hashes": {str(key): value for key, value in text_hashes.items()},
-                **(workflow_options or {}),
-            },
+        accepted_topic_ids = acquire_cluster_recompute_topic_ids(
+            self.redis_adapter,
+            topic_ids,
+            workflow_options=workflow_options,
         )
+        if not accepted_topic_ids:
+            return
+        message = build_cluster_recompute_message(
+            accepted_topic_ids,
+            workflow_options=workflow_options,
+        )
+        try:
+            self.redis_adapter.enqueue(CLUSTER_RECOMPUTE_QUEUE, message)
+        except Exception:
+            release_cluster_recompute_dedupe_keys(self.redis_adapter, message)
+            raise
 
     def _workflow_options(self, request: Any) -> dict[str, Any]:
         if not getattr(request, "enqueue_cluster_dynamics", False):
