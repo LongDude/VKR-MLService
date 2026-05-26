@@ -26,6 +26,7 @@ CLUSTER_DYNAMICS_RECOMPUTE_QUEUE = "queue:cluster_dynamics_recompute"
 TOPIC_QUARTER_REPORT_QUEUE = "queue:topic_quarter_reports"
 USER_PROFILE_RECOMPUTE_QUEUE = "queue:user_profile_recompute"
 FAILED_TASKS_QUEUE = "queue:failed_tasks"
+ML_WORKER_SHUTDOWN_KEY = "ml:worker:shutdown"
 
 DEFAULT_QUEUE_ORDER = (
     OPENALEX_TOPIC_STATS_PENDING_QUEUE,
@@ -100,6 +101,8 @@ class RedisMLWorker:
 
     def run_once(self, max_messages: int | None = None) -> bool:
         self.last_processed_message_count = 0
+        if self._consume_soft_shutdown_request():
+            return False
         if max_messages is not None and max_messages <= 0:
             return False
 
@@ -140,6 +143,10 @@ class RedisMLWorker:
 
     def stop(self) -> None:
         self._stop_requested = True
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested
 
     def _dequeue_batch(
         self,
@@ -210,6 +217,37 @@ class RedisMLWorker:
             return None
         return ttl if ttl > 0 else None
 
+    def _consume_soft_shutdown_request(self) -> bool:
+        try:
+            payload = self.redis_adapter.consume_json(ML_WORKER_SHUTDOWN_KEY)
+        except Exception:
+            self.logger.exception(
+                "Failed to consume worker shutdown request",
+                extra={"shutdown_key": ML_WORKER_SHUTDOWN_KEY},
+            )
+            return False
+        if payload is None:
+            return False
+        self._stop_requested = True
+        self.logger.info(
+            "Worker soft shutdown requested",
+            extra={"shutdown_key": ML_WORKER_SHUTDOWN_KEY, "shutdown_payload": payload},
+        )
+        self._emit_worker_event(
+            "worker_soft_shutdown_requested",
+            {
+                "queue_name": "worker",
+                "task_type": "worker",
+                "item_count": 0,
+                "item_field": "shutdown",
+            },
+            current=0,
+            total=0,
+            message="Worker soft shutdown requested",
+            payload={"shutdown_key": ML_WORKER_SHUTDOWN_KEY, "request": payload},
+        )
+        return True
+
     def _dequeue_timeout_seconds(self) -> int:
         ttl = self._openalex_cooldown_ttl()
         if ttl is None:
@@ -239,31 +277,51 @@ class RedisMLWorker:
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        grouped_ids: dict[bool, list[int]] = defaultdict(list)
-        seen_by_force: dict[bool, set[int]] = defaultdict(set)
         result: list[dict[str, Any]] = []
+        current_key: tuple[Any, ...] | None = None
+        current_message: dict[str, Any] | None = None
+        current_seen: set[int] = set()
+        max_task_size = self.max_task_sizes.get(
+            PAPER_INDEXING_QUEUE,
+            self.batch_sizes.get(PAPER_INDEXING_QUEUE, 1),
+        )
 
         for message in messages:
             if not self._is_simple_paper_indexing_message(message):
                 result.append(message)
+                current_key = None
+                current_message = None
+                current_seen = set()
                 continue
 
-            force_reindex = bool(message.get("force_reindex", False))
+            paper_ids = []
             for paper_id in self._paper_ids_from_message(message):
-                if paper_id in seen_by_force[force_reindex]:
-                    continue
-                grouped_ids[force_reindex].append(paper_id)
-                seen_by_force[force_reindex].add(paper_id)
-
-        for force_reindex, paper_ids in grouped_ids.items():
-            if paper_ids:
-                result.append(
-                    {
-                        "task_type": "paper_indexing",
-                        "paper_ids": paper_ids,
-                        "force_reindex": force_reindex,
-                    }
+                if paper_id not in paper_ids:
+                    paper_ids.append(paper_id)
+            key = self._paper_indexing_coalesce_key(message)
+            can_extend = (
+                current_message is not None
+                and current_key == key
+                and len(current_message["paper_ids"])
+                + len([paper_id for paper_id in paper_ids if paper_id not in current_seen])
+                <= max_task_size
+            )
+            if not can_extend:
+                current_message = self._paper_indexing_coalesced_message(
+                    message,
+                    paper_ids=[],
                 )
+                result.append(current_message)
+                current_key = key
+                current_seen = set()
+
+            for paper_id in paper_ids:
+                if paper_id in current_seen:
+                    continue
+                current_message["paper_ids"].append(paper_id)
+                current_seen.add(paper_id)
+            self._merge_paper_indexing_workflow_fields(current_message, message)
+
         return result
 
     def _coalesce_keyword_extraction_messages(
@@ -444,11 +502,13 @@ class RedisMLWorker:
             return [message]
 
         force_reindex = bool(message.get("force_reindex", False))
+        workflow_fields = self._paper_indexing_workflow_fields(message)
         return [
             {
                 "task_type": "paper_indexing",
                 "paper_ids": paper_ids[index : index + max_task_size],
                 "force_reindex": force_reindex,
+                **workflow_fields,
             }
             for index in range(0, len(paper_ids), max_task_size)
         ]
@@ -528,10 +588,104 @@ class RedisMLWorker:
     def _is_simple_paper_indexing_message(self, message: dict[str, Any]) -> bool:
         if message.get("task_type") != "paper_indexing":
             return False
-        allowed_keys = {"task_type", "paper_id", "paper_ids", "force_reindex"}
+        allowed_keys = {
+            "task_type",
+            "paper_id",
+            "paper_ids",
+            "force_reindex",
+            "source_topic_ids",
+            "topic_ids",
+            "workflow_date_from",
+            "workflow_date_to",
+            "workflow_granularity",
+            "enqueue_cluster_dynamics",
+        }
         if set(message) - allowed_keys:
             return False
         return bool(self._paper_ids_from_message(message))
+
+    def _paper_indexing_coalesce_key(self, message: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            bool(message.get("force_reindex", False)),
+            self._workflow_date_value(message, "workflow_date_from"),
+            self._workflow_date_value(message, "workflow_date_to"),
+            str(message.get("workflow_granularity") or "month"),
+            bool(message.get("enqueue_cluster_dynamics", False)),
+        )
+
+    def _paper_indexing_coalesced_message(
+        self,
+        message: dict[str, Any],
+        *,
+        paper_ids: list[int],
+    ) -> dict[str, Any]:
+        return {
+            "task_type": "paper_indexing",
+            "paper_ids": list(paper_ids),
+            "force_reindex": bool(message.get("force_reindex", False)),
+            **self._paper_indexing_workflow_fields(message),
+        }
+
+    def _paper_indexing_workflow_fields(
+        self,
+        message: dict[str, Any],
+    ) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        for key in (
+            "workflow_date_from",
+            "workflow_date_to",
+            "workflow_granularity",
+            "enqueue_cluster_dynamics",
+        ):
+            if key in message:
+                fields[key] = message[key]
+        source_topic_ids = self._source_topic_ids_from_message(message)
+        if source_topic_ids:
+            fields["source_topic_ids"] = source_topic_ids
+        return fields
+
+    def _merge_paper_indexing_workflow_fields(
+        self,
+        target: dict[str, Any],
+        source: dict[str, Any],
+    ) -> None:
+        source_topic_ids = self._source_topic_ids_from_message(source)
+        if source_topic_ids:
+            existing = self._source_topic_ids_from_message(target)
+            seen = set(existing)
+            merged = list(existing)
+            for topic_id in source_topic_ids:
+                if topic_id in seen:
+                    continue
+                merged.append(topic_id)
+                seen.add(topic_id)
+            target["source_topic_ids"] = merged
+
+    def _source_topic_ids_from_message(self, message: dict[str, Any]) -> list[int]:
+        raw_ids = message.get("source_topic_ids")
+        if raw_ids is None:
+            raw_ids = message.get("topic_ids")
+        if raw_ids is None:
+            return []
+        if not isinstance(raw_ids, list):
+            return []
+        result: list[int] = []
+        for raw_id in raw_ids:
+            try:
+                topic_id = int(raw_id)
+            except (TypeError, ValueError):
+                return []
+            if topic_id not in result:
+                result.append(topic_id)
+        return result
+
+    def _workflow_date_value(self, message: dict[str, Any], key: str) -> str | None:
+        value = message.get(key)
+        if value is None:
+            return None
+        if hasattr(value, "isoformat"):
+            return str(value.isoformat())
+        return str(value)
 
     def _is_simple_keyword_extraction_message(self, message: dict[str, Any]) -> bool:
         if message.get("task_type") != "keyword_extraction":
@@ -817,6 +971,7 @@ __all__ = [
     "ENTITY_INDEXING_QUEUE",
     "FAILED_TASKS_QUEUE",
     "KEYWORD_EXTRACTION_QUEUE",
+    "ML_WORKER_SHUTDOWN_KEY",
     "OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE",
     "OPENALEX_TOPIC_STATS_QUEUE",
     "OPENALEX_BOOTSTRAP_PAPERS_QUEUE",

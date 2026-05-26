@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,7 @@ from ml.workers.redis_worker import (
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
     FAILED_TASKS_QUEUE,
+    ML_WORKER_SHUTDOWN_KEY,
     OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     OPENALEX_TOPIC_STATS_QUEUE,
     PAPER_INDEXING_QUEUE,
@@ -864,6 +865,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     add_redis_args(cooldown_parser)
 
+    shutdown_parser = subparsers.add_parser(
+        "request-worker-shutdown",
+        help="Publish a soft shutdown request for one Redis ML worker.",
+    )
+    shutdown_parser.add_argument(
+        "--reason",
+        default="operator_request",
+        help="Reason stored in the shutdown request payload.",
+    )
+    shutdown_parser.add_argument(
+        "--ttl-seconds",
+        type=int,
+        default=3600,
+        help="How long the shutdown request remains valid. Defaults to 3600.",
+    )
+    shutdown_parser.add_argument(
+        "--env-file",
+        default=str(PROJECT_DIR / ".env"),
+        help="Path to .env file. Defaults to project .env.",
+    )
+    add_redis_args(shutdown_parser)
+
     cluster_parser = subparsers.add_parser(
         "enqueue-cluster-recompute",
         help="Enqueue static topic cluster recomputation tasks.",
@@ -1113,6 +1136,8 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_enqueue_bootstrap_papers(args)
         elif args.command == "openalex-cooldown-status":
             payload = run_openalex_cooldown_status(args)
+        elif args.command == "request-worker-shutdown":
+            payload = run_request_worker_shutdown(args)
         elif args.command == "enqueue-cluster-recompute":
             payload = run_enqueue_cluster_recompute(args)
         elif args.command == "enqueue-cluster-dynamics":
@@ -1295,6 +1320,28 @@ def run_openalex_cooldown_status(args: argparse.Namespace) -> dict[str, Any]:
         "exists": exists,
         "ttl_seconds": redis_adapter.ttl(OPENALEX_COOLDOWN_KEY) if exists else -2,
         "payload": redis_adapter.get_json(OPENALEX_COOLDOWN_KEY) if exists else None,
+    }
+
+
+def run_request_worker_shutdown(args: argparse.Namespace) -> dict[str, Any]:
+    """Publish a soft shutdown request consumed by one worker."""
+    if args.ttl_seconds <= 0:
+        raise ValueError("--ttl-seconds must be a positive integer.")
+    payload = {
+        "reason": str(args.reason),
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+    }
+    redis_adapter = RedisAdapter(build_redis_client(args))
+    redis_adapter.set_json(
+        ML_WORKER_SHUTDOWN_KEY,
+        payload,
+        ttl_seconds=int(args.ttl_seconds),
+    )
+    return {
+        "command": "request-worker-shutdown",
+        "key": ML_WORKER_SHUTDOWN_KEY,
+        "ttl_seconds": int(args.ttl_seconds),
+        "payload": payload,
     }
 
 

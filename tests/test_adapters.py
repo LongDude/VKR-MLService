@@ -52,6 +52,7 @@ from ml.workers.redis_worker import (
     CLUSTER_RECOMPUTE_QUEUE,
     FAILED_TASKS_QUEUE,
     KEYWORD_EXTRACTION_QUEUE,
+    ML_WORKER_SHUTDOWN_KEY,
     OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE,
     OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     OPENALEX_TOPIC_STATS_PENDING_QUEUE,
@@ -537,6 +538,104 @@ def test_redis_worker_splits_oversized_paper_indexing_messages_before_handling()
 
     assert worker.run_once() is True
     assert [len(message["paper_ids"]) for message in handler.messages] == [4, 4, 2]
+
+
+def test_redis_worker_coalesces_paper_indexing_by_workflow_period_and_limit() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    handler = CapturingTaskHandler()
+    for paper_id in (1, 2, 3):
+        adapter.enqueue(
+            PAPER_INDEXING_QUEUE,
+            {
+                "task_type": "paper_indexing",
+                "paper_id": paper_id,
+                "workflow_date_from": "2026-01-01",
+                "workflow_date_to": "2026-01-31",
+                "source_topic_ids": [paper_id],
+                "enqueue_cluster_dynamics": True,
+            },
+        )
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=handler,  # type: ignore[arg-type]
+        queues=(PAPER_INDEXING_QUEUE,),
+        batch_sizes={PAPER_INDEXING_QUEUE: 10},
+        max_task_sizes={PAPER_INDEXING_QUEUE: 2},
+    )
+
+    assert worker.run_once() is True
+    assert [message["paper_ids"] for message in handler.messages] == [[1, 2], [3]]
+    assert handler.messages[0]["workflow_date_from"] == "2026-01-01"
+    assert handler.messages[0]["workflow_date_to"] == "2026-01-31"
+    assert handler.messages[0]["source_topic_ids"] == [1, 2]
+    assert handler.messages[0]["enqueue_cluster_dynamics"] is True
+
+
+def test_redis_worker_keeps_paper_indexing_periods_separate() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    handler = CapturingTaskHandler()
+    adapter.enqueue(
+        PAPER_INDEXING_QUEUE,
+        {
+            "task_type": "paper_indexing",
+            "paper_id": 1,
+            "workflow_date_from": "2026-01-01",
+            "workflow_date_to": "2026-01-31",
+            "enqueue_cluster_dynamics": True,
+        },
+    )
+    adapter.enqueue(
+        PAPER_INDEXING_QUEUE,
+        {
+            "task_type": "paper_indexing",
+            "paper_id": 2,
+            "workflow_date_from": "2026-02-01",
+            "workflow_date_to": "2026-02-28",
+            "enqueue_cluster_dynamics": True,
+        },
+    )
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=handler,  # type: ignore[arg-type]
+        queues=(PAPER_INDEXING_QUEUE,),
+        batch_sizes={PAPER_INDEXING_QUEUE: 10},
+        max_task_sizes={PAPER_INDEXING_QUEUE: 10},
+    )
+
+    assert worker.run_once() is True
+    assert [message["paper_ids"] for message in handler.messages] == [[1], [2]]
+    assert [message["workflow_date_from"] for message in handler.messages] == [
+        "2026-01-01",
+        "2026-02-01",
+    ]
+
+
+def test_redis_worker_consumes_soft_shutdown_before_new_work() -> None:
+    client = FakeRedisClient()
+    adapter = RedisAdapter(client)
+    handler = CapturingTaskHandler()
+    adapter.set_json(
+        ML_WORKER_SHUTDOWN_KEY,
+        {"reason": "test"},
+        ttl_seconds=60,
+    )
+    adapter.enqueue(
+        PAPER_INDEXING_QUEUE,
+        {"task_type": "paper_indexing", "paper_id": 1},
+    )
+    worker = RedisMLWorker(
+        redis_adapter=adapter,
+        task_handler=handler,  # type: ignore[arg-type]
+        queues=(PAPER_INDEXING_QUEUE,),
+    )
+
+    assert worker.run_once() is False
+    assert worker.stop_requested is True
+    assert handler.messages == []
+    assert adapter.exists(ML_WORKER_SHUTDOWN_KEY) is False
+    assert adapter.queue_length(PAPER_INDEXING_QUEUE) == 1
 
 
 def test_redis_worker_splits_oversized_keyword_extraction_messages_before_handling() -> None:

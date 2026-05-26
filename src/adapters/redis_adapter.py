@@ -27,6 +27,29 @@ class RedisAdapter:
                 details={"key": key, "reason": str(exc)},
             ) from exc
 
+    def consume_json(self, key: str) -> dict[str, Any] | None:
+        """Read a JSON object and remove the key after reading it."""
+        try:
+            if hasattr(self._client, "getdel"):
+                value = self._client.getdel(key)
+            else:
+                value = self._client.get(key)
+                if value is not None:
+                    self._client.delete(key)
+            if value is None:
+                return None
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            parsed = json.loads(value)
+            if not isinstance(parsed, dict):
+                raise ValueError("Redis value is not a JSON object")
+            return parsed
+        except Exception as exc:
+            raise RedisOperationError(
+                f"Failed to consume JSON value from Redis key {key!r}",
+                details={"key": key, "reason": str(exc)},
+            ) from exc
+
     def set_json(
         self,
         key: str,

@@ -958,6 +958,8 @@ def run_limited_worker(
     )
     while processed < max_tasks:
         handled = worker.run_once(max_messages=max_tasks - processed)
+        if worker.stop_requested:
+            break
         if handled:
             processed += worker.last_processed_message_count
             worker.event_sink.emit(
