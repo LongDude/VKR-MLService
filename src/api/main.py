@@ -3,11 +3,21 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Iterator
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session, sessionmaker
 
 from adapters.qdrant_adapter import QdrantAdapter
 from core.config import Settings
+from core.exceptions import (
+    AppError,
+    DuplicateEntityError,
+    EntityNotFoundError,
+    ExternalServiceRateLimitError,
+    ExternalServiceUnavailableError,
+    InsufficientUserProfileDataError,
+    InvalidRequestError,
+)
 from dto.recommendations import RecommendationRequestDTO, RecommendationResponseDTO, UserProfileDTO
 from dto.topic_analytics import TopicAnalyticsInsightRequestDTO, TopicAnalyticsInsightResponseDTO
 from ml.facades.recommendations import RecommendationFacade
@@ -57,6 +67,30 @@ def get_session() -> Iterator[Session]:
 
 
 app = FastAPI(title="VKR MLService", version="1.0.0")
+
+
+def app_error_status_code(error: AppError) -> int:
+    if isinstance(error, EntityNotFoundError):
+        return 404
+    if isinstance(error, DuplicateEntityError):
+        return 409
+    if isinstance(error, InvalidRequestError):
+        return 400
+    if isinstance(error, InsufficientUserProfileDataError):
+        return 422
+    if isinstance(error, ExternalServiceRateLimitError):
+        return 429
+    if isinstance(error, ExternalServiceUnavailableError):
+        return 503
+    return 500
+
+
+@app.exception_handler(AppError)
+async def handle_app_error(_request: Request, error: AppError) -> JSONResponse:
+    return JSONResponse(
+        status_code=app_error_status_code(error),
+        content=error.to_dict(),
+    )
 
 
 @app.get("/health")
