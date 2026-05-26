@@ -20,6 +20,8 @@ class RecommendationRequestDTO(BaseDTO):
     user_id: int | None = None
     seed_paper_ids: list[int] = Field(default_factory=list)
     domain_ids: list[int] = Field(default_factory=list)
+    field_ids: list[int] = Field(default_factory=list)
+    subfield_ids: list[int] = Field(default_factory=list)
     topic_ids: list[int] = Field(default_factory=list)
     keyword_ids: list[int] = Field(default_factory=list)
     date_from: date | None = None
@@ -34,6 +36,7 @@ class RecommendationRequestDTO(BaseDTO):
 class RecommendationScoreDetailsDTO(BaseDTO):
     semantic_score: float | None = None
     profile_score: float | None = None
+    tag_match_score: float | None = None
     trend_score: float | None = None
     recency_score: float | None = None
     citation_score: float | None = None
@@ -53,6 +56,7 @@ class RecommendationResponseDTO(BaseDTO):
     items: list[RecommendationItemDTO] = Field(default_factory=list)
     total: int = 0
     strategy: str | None = None
+    errors: list[str] = Field(default_factory=list)
 
 
 __all__ = [

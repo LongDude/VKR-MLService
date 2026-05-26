@@ -361,6 +361,34 @@ class TaxonomyRepository(BaseRepository):
         }
         return [topics[topic_id] for topic_id in unique_ids if topic_id in topics]
 
+    def list_topic_ids_for_filters(
+        self,
+        *,
+        domain_ids: list[int] | None = None,
+        field_ids: list[int] | None = None,
+        subfield_ids: list[int] | None = None,
+        topic_ids: list[int] | None = None,
+    ) -> dict[str, list[int]]:
+        """Expand broad taxonomy filters into topic ids for search filters/boosts."""
+        explicit_topics = self._existing_topic_ids(topic_ids or [])
+        by_subfields = self._topic_ids_by_subfields(subfield_ids or [])
+        by_fields = self._topic_ids_by_fields(field_ids or [])
+        by_domains = self._topic_ids_by_domains(domain_ids or [])
+        all_ids = sorted(
+            set(explicit_topics)
+            | set(by_subfields)
+            | set(by_fields)
+            | set(by_domains)
+        )
+
+        return {
+            "topics": explicit_topics,
+            "subfields": by_subfields,
+            "fields": by_fields,
+            "domains": by_domains,
+            "all": all_ids,
+        }
+
     def list_fields_by_ids(self, field_ids: list[int]) -> list[Field]:
         """List fields by ids preserving caller order where possible."""
         if not field_ids:
@@ -388,6 +416,46 @@ class TaxonomyRepository(BaseRepository):
             for subfield_id in unique_ids
             if subfield_id in subfields
         ]
+
+    def _existing_topic_ids(self, topic_ids: list[int]) -> list[int]:
+        unique_ids = self._unique_ints(topic_ids)
+        if not unique_ids:
+            return []
+        stmt = select(Topic.id).where(Topic.id.in_(unique_ids))
+        return sorted(int(topic_id) for topic_id in self.session.scalars(stmt).all())
+
+    def _topic_ids_by_subfields(self, subfield_ids: list[int]) -> list[int]:
+        unique_ids = self._unique_ints(subfield_ids)
+        if not unique_ids:
+            return []
+        stmt = select(Topic.id).where(Topic.subfield_id.in_(unique_ids))
+        return sorted(int(topic_id) for topic_id in self.session.scalars(stmt).all())
+
+    def _topic_ids_by_fields(self, field_ids: list[int]) -> list[int]:
+        unique_ids = self._unique_ints(field_ids)
+        if not unique_ids:
+            return []
+        stmt = (
+            select(Topic.id)
+            .join(Subfield, Topic.subfield_id == Subfield.id)
+            .where(Subfield.field_id.in_(unique_ids))
+        )
+        return sorted(int(topic_id) for topic_id in self.session.scalars(stmt).all())
+
+    def _topic_ids_by_domains(self, domain_ids: list[int]) -> list[int]:
+        unique_ids = self._unique_ints(domain_ids)
+        if not unique_ids:
+            return []
+        stmt = (
+            select(Topic.id)
+            .join(Subfield, Topic.subfield_id == Subfield.id)
+            .join(Field, Subfield.field_id == Field.id)
+            .where(Field.domain_id.in_(unique_ids))
+        )
+        return sorted(int(topic_id) for topic_id in self.session.scalars(stmt).all())
+
+    def _unique_ints(self, values: list[int]) -> list[int]:
+        return list(dict.fromkeys(int(value) for value in values if int(value) > 0))
 
     def list_topics_for_stats(
         self,

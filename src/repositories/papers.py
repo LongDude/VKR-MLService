@@ -4,13 +4,13 @@ from collections.abc import Iterable
 from datetime import date, datetime, timezone
 from typing import Any, Literal
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.exceptions import EntityNotFoundError, InvalidRequestError
 from dto.external import ExternalPaperDTO
 from dto.papers import PaperCreateDTO, PaperUpdateDTO
-from models import Paper, PaperTopic, Subfield, Topic
+from models import Field, Paper, PaperTopic, Subfield, Topic
 
 from .base import BaseRepository
 
@@ -406,6 +406,34 @@ class PaperRepository(BaseRepository):
         )
         return list(self.session.scalars(stmt).all())
 
+    def list_recent_indexed(
+        self,
+        date_from: date,
+        limit: int,
+        *,
+        domain_ids: list[int] | None = None,
+        field_ids: list[int] | None = None,
+        subfield_ids: list[int] | None = None,
+        topic_ids: list[int] | None = None,
+    ) -> list[Paper]:
+        """List indexed papers, optionally filtered by taxonomy hierarchy."""
+        stmt = (
+            select(Paper)
+            .where(Paper.is_indexed.is_(True), Paper.publication_date >= date_from)
+            .order_by(Paper.publication_date.desc().nullslast(), Paper.id.desc())
+            .limit(limit)
+        )
+        taxonomy_filter = self._paper_ids_for_taxonomy_filter(
+            domain_ids=domain_ids or [],
+            field_ids=field_ids or [],
+            subfield_ids=subfield_ids or [],
+            topic_ids=topic_ids or [],
+        )
+        if taxonomy_filter is not None:
+            stmt = stmt.where(Paper.id.in_(taxonomy_filter))
+
+        return list(self.session.scalars(stmt).all())
+
     def get_indexed_text_hashes(self, paper_ids: list[int]) -> dict[int, str]:
         """Return text hashes for papers currently marked as indexed."""
         if not paper_ids:
@@ -672,6 +700,38 @@ class PaperRepository(BaseRepository):
                 ).where(Subfield.field_id == int(field_id))
             stmt = stmt.where(Paper.id.in_(paper_ids))
         return stmt
+
+    def _paper_ids_for_taxonomy_filter(
+        self,
+        *,
+        domain_ids: list[int],
+        field_ids: list[int],
+        subfield_ids: list[int],
+        topic_ids: list[int],
+    ) -> Any | None:
+        domain_ids = self._unique_ids(domain_ids)
+        field_ids = self._unique_ids(field_ids)
+        subfield_ids = self._unique_ids(subfield_ids)
+        topic_ids = self._unique_ids(topic_ids)
+        if not domain_ids and not field_ids and not subfield_ids and not topic_ids:
+            return None
+
+        stmt = (
+            select(PaperTopic.paper_id)
+            .join(Topic, Topic.id == PaperTopic.topic_id)
+            .outerjoin(Subfield, Subfield.id == Topic.subfield_id)
+            .outerjoin(Field, Field.id == Subfield.field_id)
+        )
+        conditions = []
+        if topic_ids:
+            conditions.append(PaperTopic.topic_id.in_(topic_ids))
+        if subfield_ids:
+            conditions.append(Topic.subfield_id.in_(subfield_ids))
+        if field_ids:
+            conditions.append(Subfield.field_id.in_(field_ids))
+        if domain_ids:
+            conditions.append(Field.domain_id.in_(domain_ids))
+        return stmt.where(or_(*conditions)).distinct()
 
     def _extracted_keywords_payload(
         self,

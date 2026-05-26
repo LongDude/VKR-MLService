@@ -18,6 +18,7 @@ from dto.recommendations import (
 )
 from repositories.favourites import FavouriteRepository
 from repositories.papers import PaperRepository
+from repositories.taxonomy import TaxonomyRepository
 from utils.hashing import calculate_text_hash
 
 from ml.constants import PAPERS_COLLECTION, TREND_CLUSTERS_COLLECTION
@@ -34,10 +35,11 @@ class RecommendationFacade:
     def __init__(
         self,
         *,
-        user_profile_facade: UserProfileFacade,
-        qdrant_adapter: QdrantAdapter,
+        user_profile_facade: UserProfileFacade | None,
+        qdrant_adapter: QdrantAdapter | None,
         paper_repository: PaperRepository,
         favourite_repository: FavouriteRepository,
+        taxonomy_repository: TaxonomyRepository | None = None,
         scoring_service: ScoringService | None = None,
         summary_facade: SummaryFacade | None = None,
         redis_adapter: RedisAdapter | None = None,
@@ -49,6 +51,7 @@ class RecommendationFacade:
         self.qdrant_adapter = qdrant_adapter
         self.paper_repository = paper_repository
         self.favourite_repository = favourite_repository
+        self.taxonomy_repository = taxonomy_repository
         self.scoring_service = scoring_service or ScoringService()
         self.summary_facade = summary_facade
         self.redis_adapter = redis_adapter
@@ -70,25 +73,39 @@ class RecommendationFacade:
         if cached is not None:
             return cached
 
+        tag_topic_sets = self._topic_sets_by_selected_tags(request)
         try:
+            if self.user_profile_facade is None or self.qdrant_adapter is None:
+                raise InsufficientUserProfileDataError("Qdrant profile search is unavailable")
             profile_vector = self.user_profile_facade.get_user_profile_vector(
                 request.user_id,
                 recompute_if_missing=True,
             )
         except InsufficientUserProfileDataError as exc:
-            response = self._fallback_trending_response(request)
-            if response.items:
-                self._set_cached_response(cache_key, response)
-                return response
-            raise exc
+            response = self._fallback_trending_response(
+                request,
+                tag_topic_sets=tag_topic_sets,
+                errors=[str(exc)],
+            )
+            self._set_cached_response(cache_key, response)
+            return response
 
         favourite_ids = self._favourite_ids(request)
-        qdrant_hits = self.qdrant_adapter.search(
-            self.papers_collection,
-            profile_vector,
-            top_k=self._candidate_limit(request),
-            filters=self._build_qdrant_filter(request),
-        )
+        try:
+            qdrant_hits = self.qdrant_adapter.search(
+                self.papers_collection,
+                profile_vector,
+                top_k=self._candidate_limit(request),
+                filters=self._build_qdrant_filter(request, tag_topic_sets.get("all", [])),
+            )
+        except Exception as exc:
+            response = self._fallback_trending_response(
+                request,
+                tag_topic_sets=tag_topic_sets,
+                errors=[str(exc)],
+            )
+            self._set_cached_response(cache_key, response)
+            return response
         candidate_ids = [
             paper_id
             for paper_id in (self._paper_id_from_hit(hit) for hit in qdrant_hits)
@@ -117,11 +134,13 @@ class RecommendationFacade:
                 if payload.get("cited_by_count") is not None
                 else getattr(paper_by_id.get(paper_id), "cited_by_count", None)
             )
+            tag_match_score = self._tag_match_score(payload, tag_topic_sets)
             score = self.scoring_service.calculate_recommendation_score(
                 semantic_score=hit.score,
                 trend_score=trend_score,
                 recency_score=recency_score,
                 citation_score=citation_score,
+                tag_match_score=tag_match_score,
             )
             explanation = self._explanation(request, paper, payload)
             items.append(
@@ -132,6 +151,7 @@ class RecommendationFacade:
                     score_details=RecommendationScoreDetailsDTO(
                         semantic_score=hit.score,
                         profile_score=hit.score,
+                        tag_match_score=tag_match_score,
                         trend_score=trend_score,
                         recency_score=recency_score,
                         citation_score=citation_score,
@@ -152,10 +172,21 @@ class RecommendationFacade:
     def _fallback_trending_response(
         self,
         request: RecommendationRequestDTO,
+        *,
+        tag_topic_sets: dict[str, list[int]] | None = None,
+        errors: list[str] | None = None,
     ) -> RecommendationResponseDTO:
         date_from = request.date_from or date.today() - timedelta(days=FALLBACK_TRENDING_WINDOW_DAYS)
-        papers = self.paper_repository.list_recent(date_from, limit=self._candidate_limit(request))
+        papers = self.paper_repository.list_recent_indexed(
+            date_from,
+            limit=self._candidate_limit(request),
+            domain_ids=request.domain_ids,
+            field_ids=request.field_ids,
+            subfield_ids=request.subfield_ids,
+            topic_ids=request.topic_ids,
+        )
         favourite_ids = self._favourite_ids(request)
+        tag_topic_sets = tag_topic_sets or self._topic_sets_by_selected_tags(request)
         items: list[RecommendationItemDTO] = []
         for paper in papers:
             paper_id = int(getattr(paper, "id"))
@@ -169,10 +200,15 @@ class RecommendationFacade:
             citation_score = self.scoring_service.calculate_citation_score(
                 getattr(paper, "cited_by_count", None)
             )
+            tag_match_score = self._tag_match_score(
+                {"topic_ids": self._paper_topic_ids_from_model(paper)},
+                tag_topic_sets,
+            )
             score = self.scoring_service.calculate_recommendation_score(
                 semantic_score=0.0,
                 recency_score=recency_score,
                 citation_score=citation_score,
+                tag_match_score=tag_match_score,
             )
             paper_short = self._paper_short_from_model(paper)
             items.append(
@@ -182,6 +218,8 @@ class RecommendationFacade:
                     reason=self._explanation(request, paper_short, {}),
                     score_details=RecommendationScoreDetailsDTO(
                         semantic_score=0.0,
+                        profile_score=0.0,
+                        tag_match_score=tag_match_score,
                         recency_score=recency_score,
                         citation_score=citation_score,
                         meta={"fallback": "trending_recent"},
@@ -194,11 +232,13 @@ class RecommendationFacade:
             items=items[: request.limit],
             total=len(items),
             strategy="trending_fallback",
+            errors=errors or [],
         )
 
     def _build_qdrant_filter(
         self,
         request: RecommendationRequestDTO,
+        topic_filter_ids: list[int] | None = None,
     ) -> dict[str, Any] | None:
         must: list[dict[str, Any]] = []
         if request.date_from is not None:
@@ -217,8 +257,7 @@ class RecommendationFacade:
                     "match": {"value": request.is_open_access},
                 }
             )
-        self._append_any_filter(must, "domain_ids", request.domain_ids)
-        self._append_any_filter(must, "topic_ids", request.topic_ids)
+        self._append_any_filter(must, "topic_ids", topic_filter_ids or request.topic_ids)
         self._append_any_filter(must, "keyword_ids", request.keyword_ids)
         return {"must": must} if must else None
 
@@ -231,10 +270,81 @@ class RecommendationFacade:
         if values:
             must.append({"key": field_name, "match": {"any": values}})
 
+    def _topic_sets_by_selected_tags(
+        self,
+        request: RecommendationRequestDTO,
+    ) -> dict[str, list[int]]:
+        empty = {"domains": [], "fields": [], "subfields": [], "topics": [], "all": []}
+        if not self._has_selected_taxonomy(request):
+            return empty
+        if self.taxonomy_repository is None:
+            topic_ids = sorted(set(int(topic_id) for topic_id in request.topic_ids))
+            return {
+                "domains": [],
+                "fields": [],
+                "subfields": [],
+                "topics": topic_ids,
+                "all": topic_ids,
+            }
+        return self.taxonomy_repository.list_topic_ids_for_filters(
+            domain_ids=request.domain_ids,
+            field_ids=request.field_ids,
+            subfield_ids=request.subfield_ids,
+            topic_ids=request.topic_ids,
+        )
+
+    def _has_selected_taxonomy(self, request: RecommendationRequestDTO) -> bool:
+        return bool(
+            request.domain_ids
+            or request.field_ids
+            or request.subfield_ids
+            or request.topic_ids
+        )
+
+    def _tag_match_score(
+        self,
+        payload: dict[str, Any],
+        tag_topic_sets: dict[str, list[int]],
+    ) -> float | None:
+        if not tag_topic_sets.get("all"):
+            return None
+        paper_topic_ids = self._payload_int_set(payload.get("topic_ids", []))
+        if not paper_topic_ids:
+            return 0.0
+        weighted_sets = [
+            ("topics", 1.0),
+            ("subfields", 0.70),
+            ("fields", 0.45),
+            ("domains", 0.25),
+        ]
+        score = 0.0
+        for key, weight in weighted_sets:
+            if paper_topic_ids.intersection(tag_topic_sets.get(key, [])):
+                score = max(score, weight)
+        return score
+
+    def _paper_topic_ids_from_model(self, paper: Any) -> list[int]:
+        topic_ids: set[int] = set()
+        primary_topic_id = getattr(paper, "primary_topic_id", None)
+        if primary_topic_id is not None:
+            try:
+                topic_ids.add(int(primary_topic_id))
+            except (TypeError, ValueError):
+                pass
+        for link in getattr(paper, "topic_links", []) or []:
+            topic_id = getattr(link, "topic_id", None)
+            try:
+                topic_ids.add(int(topic_id))
+            except (TypeError, ValueError):
+                continue
+        return sorted(topic_ids)
+
     def _cluster_trend_scores(
         self,
         hits: list[QdrantSearchHitDTO],
     ) -> dict[int, float]:
+        if self.qdrant_adapter is None:
+            return {}
         topic_ids: set[int] = set()
         for hit in hits:
             for topic_id in hit.payload.get("topic_ids", []):
@@ -294,6 +404,10 @@ class RecommendationFacade:
             language=payload.get("language"),
             is_open_access=payload.get("is_open_access"),
             cited_by_count=self._payload_int(payload.get("cited_by_count")) or 0,
+            openalex_id=payload.get("openalex_id"),
+            references_count=self._payload_int(payload.get("references_count")) or 0,
+            primary_topic_id=self._payload_int(payload.get("primary_topic_id")),
+            extracted_keywords=payload.get("extracted_keywords"),
         )
 
     def _paper_short_from_model(
@@ -317,6 +431,14 @@ class RecommendationFacade:
             cited_by_count=getattr(paper, "cited_by_count", None)
             if getattr(paper, "cited_by_count", None) is not None
             else self._payload_int(payload.get("cited_by_count")) or 0,
+            openalex_id=getattr(paper, "openalex_id", None) or payload.get("openalex_id"),
+            references_count=getattr(paper, "references_count", None)
+            if getattr(paper, "references_count", None) is not None
+            else self._payload_int(payload.get("references_count")) or 0,
+            primary_topic_id=getattr(paper, "primary_topic_id", None)
+            or self._payload_int(payload.get("primary_topic_id")),
+            extracted_keywords=getattr(paper, "extracted_keywords", None)
+            or payload.get("extracted_keywords"),
         )
 
     def _paper_matches_request(
@@ -357,6 +479,8 @@ class RecommendationFacade:
     def _interests_from_request(self, request: RecommendationRequestDTO) -> list[str]:
         interests: list[str] = []
         interests.extend(f"domain:{domain_id}" for domain_id in request.domain_ids)
+        interests.extend(f"field:{field_id}" for field_id in request.field_ids)
+        interests.extend(f"subfield:{subfield_id}" for subfield_id in request.subfield_ids)
         interests.extend(f"topic:{topic_id}" for topic_id in request.topic_ids)
         interests.extend(f"keyword:{keyword_id}" for keyword_id in request.keyword_ids)
         return interests
@@ -401,6 +525,16 @@ class RecommendationFacade:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _payload_int_set(self, value: Any) -> set[int]:
+        if not isinstance(value, list | tuple | set):
+            value = [value]
+        result: set[int] = set()
+        for item in value:
+            parsed = self._payload_int(item)
+            if parsed is not None:
+                result.add(parsed)
+        return result
 
     def _payload_float(self, value: Any) -> float:
         if isinstance(value, Decimal):

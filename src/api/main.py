@@ -3,15 +3,24 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Iterator
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session, sessionmaker
 
 from adapters.qdrant_adapter import QdrantAdapter
 from core.config import Settings
+from dto.recommendations import RecommendationRequestDTO, RecommendationResponseDTO, UserProfileDTO
 from dto.topic_analytics import TopicAnalyticsInsightRequestDTO, TopicAnalyticsInsightResponseDTO
+from ml.facades.recommendations import RecommendationFacade
 from ml.facades.topic_analytics import TopicAnalyticsFacade
+from ml.facades.user_profile import UserProfileFacade
+from ml.pipelines.recommendation_pipeline import RecommendationPipeline
 from ml.pipelines.topic_analytics_pipeline import TopicAnalyticsPipeline
+from ml.pipelines.user_profile_pipeline import UserProfilePipeline
 from models.session import create_engine_from_settings, create_session_factory
+from repositories.favourites import FavouriteRepository
+from repositories.papers import PaperRepository
+from repositories.taxonomy import TaxonomyRepository
+from repositories.tracked_areas import TrackedAreaRepository
 
 
 @lru_cache(maxsize=1)
@@ -64,3 +73,50 @@ def topic_analytics_insights(
         TopicAnalyticsFacade(session, qdrant_adapter=get_qdrant_adapter())
     )
     return pipeline.insights(request)
+
+
+@app.post("/v1/user-profiles/{user_id}/recompute", response_model=UserProfileDTO)
+def recompute_user_profile(
+    user_id: int,
+    session: Session = Depends(get_session),
+) -> UserProfileDTO:
+    qdrant_adapter = get_qdrant_adapter()
+    if qdrant_adapter is None:
+        raise HTTPException(status_code=503, detail="Qdrant is unavailable.")
+    pipeline = UserProfilePipeline(
+        UserProfileFacade(
+            favourite_repository=FavouriteRepository(session),
+            tracked_area_repository=TrackedAreaRepository(session),
+            taxonomy_repository=TaxonomyRepository(session),
+            qdrant_adapter=qdrant_adapter,
+        )
+    )
+    return pipeline.recompute_user(user_id)
+
+
+@app.post("/v1/recommendations/papers", response_model=RecommendationResponseDTO)
+def recommend_papers(
+    request: RecommendationRequestDTO,
+    session: Session = Depends(get_session),
+) -> RecommendationResponseDTO:
+    qdrant_adapter = get_qdrant_adapter()
+    user_profile_facade = (
+        UserProfileFacade(
+            favourite_repository=FavouriteRepository(session),
+            tracked_area_repository=TrackedAreaRepository(session),
+            taxonomy_repository=TaxonomyRepository(session),
+            qdrant_adapter=qdrant_adapter,
+        )
+        if qdrant_adapter is not None
+        else None
+    )
+    pipeline = RecommendationPipeline(
+        RecommendationFacade(
+            user_profile_facade=user_profile_facade,
+            qdrant_adapter=qdrant_adapter,
+            paper_repository=PaperRepository(session),
+            favourite_repository=FavouriteRepository(session),
+            taxonomy_repository=TaxonomyRepository(session),
+        )
+    )
+    return pipeline.recommend(request)

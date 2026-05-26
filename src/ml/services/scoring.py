@@ -15,6 +15,11 @@ class ScoringService:
     RECOMMENDATION_TREND_WEIGHT = 0.25
     RECOMMENDATION_RECENCY_WEIGHT = 0.15
     RECOMMENDATION_CITATION_WEIGHT = 0.05
+    RECOMMENDATION_SEMANTIC_WITH_TAGS_WEIGHT = 0.45
+    RECOMMENDATION_TAG_MATCH_WEIGHT = 0.25
+    RECOMMENDATION_TREND_WITH_TAGS_WEIGHT = 0.15
+    RECOMMENDATION_RECENCY_WITH_TAGS_WEIGHT = 0.10
+    RECOMMENDATION_CITATION_WITH_TAGS_WEIGHT = 0.05
 
     GROWTH_RATE_MIN = -1.0
     GROWTH_RATE_MAX = 1.0
@@ -102,7 +107,18 @@ class ScoringService:
         trend_score: float = 0.0,
         recency_score: float = 0.0,
         citation_score: float = 0.0,
+        tag_match_score: float | None = None,
     ) -> float:
+        if tag_match_score is not None:
+            score = (
+                self.RECOMMENDATION_SEMANTIC_WITH_TAGS_WEIGHT * self._clamp_score(semantic_score)
+                + self.RECOMMENDATION_TAG_MATCH_WEIGHT * self._clamp_score(tag_match_score)
+                + self.RECOMMENDATION_TREND_WITH_TAGS_WEIGHT * self._clamp_score(trend_score)
+                + self.RECOMMENDATION_RECENCY_WITH_TAGS_WEIGHT * self._clamp_score(recency_score)
+                + self.RECOMMENDATION_CITATION_WITH_TAGS_WEIGHT * self._clamp_score(citation_score)
+            )
+            return self._clamp_score(score)
+
         score = (
             self.RECOMMENDATION_SEMANTIC_WEIGHT * self._clamp_score(semantic_score)
             + self.RECOMMENDATION_TREND_WEIGHT * self._clamp_score(trend_score)
@@ -136,4 +152,3 @@ class ScoringService:
 
 
 __all__ = ["ScoringService"]
-
