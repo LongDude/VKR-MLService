@@ -132,34 +132,34 @@ class TopicAnalyticsFacade:
             index=pd.to_datetime([row["period_start"] for row in observed_rows]),
         )
         subfield_series = pd.Series(
-            [float(row["subfield_count"]) for row in observed_rows],
+            [float(row["topic_count"]) for row in observed_rows],
             index=pd.to_datetime([row["period_start"] for row in observed_rows]),
         )
         share_forecast = self._forecast_series(share_series, horizon)
-        subfield_forecast = self._forecast_series(subfield_series, horizon)
+        topic_forecast = self._forecast_series(subfield_series, horizon)
         result: list[TopicForecastPointDTO] = []
-        for index in range(min(len(share_forecast), len(subfield_forecast))):
+        for index in range(min(len(share_forecast), len(topic_forecast))):
             share = max(0.0, min(1.0, float(share_forecast[index]["forecast"])))
             lower_share = max(0.0, min(1.0, float(share_forecast[index]["lower_bound"])))
             upper_share = max(0.0, min(1.0, float(share_forecast[index]["upper_bound"])))
-            subfield = max(0.0, float(subfield_forecast[index]["forecast"]))
-            lower_subfield = max(0.0, float(subfield_forecast[index]["lower_bound"]))
-            upper_subfield = max(0.0, float(subfield_forecast[index]["upper_bound"]))
+            topic = max(0.0, float(topic_forecast[index]["forecast"]))
+            lower_subfield = max(0.0, float(topic_forecast[index]["lower_bound"]))
+            upper_subfield = max(0.0, float(topic_forecast[index]["upper_bound"]))
             result.append(
                 TopicForecastPointDTO(
                     period_start=share_forecast[index]["period_start"],
-                    forecast_count=share * subfield,
+                    forecast_count=topic,
                     lower_bound=lower_share * lower_subfield,
                     upper_bound=upper_share * upper_subfield,
                     forecast_share=share,
                     lower_share=lower_share,
                     upper_share=upper_share,
-                    model_name=f"{share_forecast[index]['model_name']} x {subfield_forecast[index]['model_name']}",
+                    model_name=f"{share_forecast[index]['model_name']} x {topic_forecast[index]['model_name']}",
                     share_model_name=share_forecast[index]["model_name"],
-                    subfield_model_name=subfield_forecast[index]["model_name"],
-                    backtest_error_mae=subfield_forecast[index].get("backtest_error_mae"),
-                    backtest_error_mape=subfield_forecast[index].get("backtest_error_mape"),
-                    backtest_error_smape=subfield_forecast[index].get("backtest_error_smape"),
+                    subfield_model_name=topic_forecast[index]["model_name"],
+                    backtest_error_mae=topic_forecast[index].get("backtest_error_mae"),
+                    backtest_error_mape=topic_forecast[index].get("backtest_error_mape"),
+                    backtest_error_smape=topic_forecast[index].get("backtest_error_smape"),
                 )
             )
         return result
@@ -184,7 +184,6 @@ class TopicAnalyticsFacade:
             if len(train) >= 60:
                 try:
                     from statsmodels.tsa.statespace.sarimax import SARIMAX
-
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         model = SARIMAX(
@@ -199,7 +198,7 @@ class TopicAnalyticsFacade:
                     pass
             try:
                 from statsmodels.tsa.holtwinters import ExponentialSmoothing
-
+                print("y")
                 seasonal = "add" if len(train) >= season_length * 2 else None
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
@@ -381,47 +380,66 @@ class TopicAnalyticsFacade:
         rows = self.session.execute(
             text(
                 """
-                WITH selected_keywords AS (
-                    SELECT DISTINCT pk.keyword_id
+                WITH selected_papers AS MATERIALIZED (
+                    SELECT p.id, COALESCE(p.cited_by_count, 0) AS cited_by_count
                     FROM paper_topics pt
                     JOIN papers p ON p.id = pt.paper_id
-                    JOIN paper_keywords pk ON pk.paper_id = p.id
                     WHERE pt.topic_id = :topic_id
                       AND p.publication_date BETWEEN :period_start AND :period_end
                 ),
-                related AS (
-                    SELECT
+                selected_keywords AS MATERIALIZED (
+                    SELECT DISTINCT pk.keyword_id
+                    FROM selected_papers sp
+                    JOIN paper_keywords pk ON pk.paper_id = sp.id
+                ),
+                matches AS MATERIALIZED (
+                    SELECT DISTINCT
                         pt.topic_id,
-                        COUNT(DISTINCT pk.keyword_id)::int AS shared_count,
-                        COUNT(DISTINCT p.id)::int AS common_papers,
-                        SUM(COALESCE(p.cited_by_count, 0))::int AS common_citations
-                    FROM paper_topics pt
-                    JOIN papers p ON p.id = pt.paper_id
-                    JOIN paper_keywords pk ON pk.paper_id = p.id
-                    JOIN selected_keywords sk ON sk.keyword_id = pk.keyword_id
+                        pk.keyword_id,
+                        p.id AS paper_id,
+                        COALESCE(p.cited_by_count, 0) AS cited_by_count
+                    FROM selected_keywords sk
+                    JOIN paper_keywords pk ON pk.keyword_id = sk.keyword_id
+                    JOIN papers p ON p.id = pk.paper_id
+                    JOIN paper_topics pt ON pt.paper_id = p.id
                     WHERE pt.topic_id <> :topic_id
                       AND p.publication_date BETWEEN :period_start AND :period_end
-                    GROUP BY pt.topic_id
+                ),
+                related AS MATERIALIZED (
+                    SELECT
+                        topic_id,
+                        COUNT(DISTINCT keyword_id)::int AS shared_count,
+                        COUNT(DISTINCT paper_id)::int AS common_papers
+                    FROM matches
+                    GROUP BY topic_id
+                    ORDER BY shared_count DESC, common_papers DESC
+                    LIMIT :limit
+                ),
+                related_citations AS (
+                    SELECT selected.topic_id, SUM(selected.cited_by_count)::int AS common_citations
+                    FROM (
+                        SELECT DISTINCT m.topic_id, m.paper_id, m.cited_by_count
+                        FROM matches m
+                        JOIN related r ON r.topic_id = m.topic_id
+                    ) selected
+                    GROUP BY selected.topic_id
                 )
                 SELECT
                     t.id,
                     t.name,
                     r.shared_count,
                     r.common_papers,
-                    r.common_citations,
+                    COALESCE(rc.common_citations, 0)::int AS common_citations,
                     COALESCE(keywords.values, ARRAY[]::text[]) AS shared_keyphrases
                 FROM related r
                 JOIN topics t ON t.id = r.topic_id
+                LEFT JOIN related_citations rc ON rc.topic_id = r.topic_id
                 LEFT JOIN LATERAL (
                     SELECT array_agg(k.value ORDER BY k.value) AS values
                     FROM (
-                        SELECT DISTINCT pk.keyword_id
-                        FROM paper_topics pt
-                        JOIN papers p ON p.id = pt.paper_id
-                        JOIN paper_keywords pk ON pk.paper_id = p.id
-                        JOIN selected_keywords sk ON sk.keyword_id = pk.keyword_id
-                        WHERE pt.topic_id = t.id
-                          AND p.publication_date BETWEEN :period_start AND :period_end
+                        SELECT DISTINCT m.keyword_id
+                        FROM matches m
+                        WHERE m.topic_id = r.topic_id
                         LIMIT 8
                     ) ids
                     JOIN keywords k ON k.id = ids.keyword_id
