@@ -470,7 +470,23 @@ class KeywordExtractionFacade:
                 extracted_by_id: dict[int, list[str]] = {}
                 for paper, response in zip(chunk_papers, responses):
                     paper_id = int(paper.id)
-                    extracted_by_id[paper_id] = response.keywords
+                    keywords = [
+                        str(keyword).strip()
+                        for keyword in response.keywords
+                        if str(keyword).strip()
+                    ]
+                    if not keywords:
+                        result.failed += 1
+                        result.errors.append(
+                            {
+                                "paper_id": paper_id,
+                                "code": "keyword_extraction_empty",
+                                "message": "Keyword extraction produced no keywords",
+                                "details": {"paper_id": paper_id},
+                            }
+                        )
+                        continue
+                    extracted_by_id[paper_id] = keywords
                     result.updated += 1
                 if extracted_by_id:
                     self.paper_repository.save_extracted_keywords(extracted_by_id)
@@ -850,6 +866,9 @@ class KeywordExtractionFacade:
         documents: pd.DataFrame,
     ) -> dict[str, dict[str, list[tuple[str, float]]]]:
         scores: dict[str, dict[str, list[tuple[str, float]]]] = {}
+        attempts = 0
+        successes = 0
+        errors: list[str] = []
         for _, row in documents.iterrows():
             doc_id = str(row["id"])
             text = str(row["text"])
@@ -857,15 +876,25 @@ class KeywordExtractionFacade:
             if not text.strip():
                 continue
             for spec in self._pke_specs():
+                attempts += 1
                 try:
                     keyphrases = self._score_single_pke_document(text, spec)
                 except Exception as exc:
                     logger.debug("PKE failed doc=%s model=%s error=%s", doc_id, spec.name, exc)
+                    if len(errors) < 3:
+                        errors.append(f"{spec.name}: {exc}")
                     keyphrases = []
+                else:
+                    successes += 1
                 scores[doc_id][spec.name] = [
                     (str(candidate), float(score))
                     for candidate, score in keyphrases
                 ]
+        if attempts > 0 and successes == 0 and errors:
+            raise RuntimeError(
+                "PKE candidate extraction failed for all documents: "
+                + "; ".join(errors)
+            )
         return scores
 
     def _pke_scores_dataframe(
