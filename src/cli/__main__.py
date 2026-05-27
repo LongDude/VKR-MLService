@@ -14,11 +14,6 @@ class CliModule:
 
 CLI_MODULES = [
     CliModule(
-        module="cli.openalex",
-        command="python -m cli.openalex",
-        description="OpenAlex ingestion: paper bootstrap and topic statistics.",
-    ),
-    CliModule(
         module="cli.data",
         command="python -m cli.data",
         description="Local data validation, coverage analysis, and OpenAlex stats maintenance.",
