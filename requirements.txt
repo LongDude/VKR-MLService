@@ -1,0 +1,28 @@
+# Control flow
+uvicorn
+fastapi
+typer
+
+# Services
+psycopg2
+SQLAlchemy>=2
+redis
+minio
+qdrant_client
+httpx
+pandas
+numpy
+statsmodels
+
+# MISC
+dotenv
+pydantic>=2
+pytest
+tqdm
+
+# KE
+nltk
+catboost
+xgboost
+scikit-learn
+git+https://github.com/boudinfl/pke.git

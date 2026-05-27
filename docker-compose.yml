@@ -1,54 +1,35 @@
 services:
-  minio:
-    image: minio/minio:latest
-    container_name: vkr-ml-minio
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    env_file:
-      - ./core/.env
-    ports:
-      - 9000:9000  # API порт
-      - 8083:9001  # Console порт - 
-    volumes:
-      - minio_data:/data
-      - ./core/minio-setup.sh:/etc/minio-setup.sh
-    networks:
-      - ml_network # В остальном пусть не мешает
-      - vkr-outer-network # открываем доступ вовне для console
-    profiles:
-      - service
-      - manual
-
   redis:
     image: redis:7-alpine
     container_name: vkr-ml-redis
     restart: unless-stopped
-    env_file:
-      - ./core/.env
-    command: ["/bin/sh",  "-c",  "redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru --requirepass \"$${REDIS_PASSWORD:-redis123}\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis123}
+    command: ["/bin/sh", "-c", "redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru --requirepass \"$${REDIS_PASSWORD:-redis123}\""]
     ports:
       - 6379:6379
     volumes:
       - redis_data:/data
     networks:
+      - vkr-outer-network
       - ml_network
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD:-redis123}\" redis-cli ping | grep -q '^PONG$'"]
       interval: 10s
       timeout: 3s
       retries: 3
-    profiles:
-      - service
-      - manual
+    deploy:
+      resources:
+        limits:
+          cpus: 1
+          memory: 2G
 
   redis-commander:
     image: rediscommander/redis-commander:latest
     container_name: vkr-ml-redis-commander
-    restart: unless-stopped
-    env_file:
-      - ./core/.env
     environment:
       - REDIS_HOST=redis
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redis123}
       - REDIS_PORT=6379
       - REDIS_DB=0
     ports:
@@ -58,98 +39,102 @@ services:
     networks:
       - ml_network
       - vkr-outer-network
-    profiles:
-      - service
-      - manual
-
-  ml-service:
-    build: 
-      context: .
-      dockerfile: ./core/TransformersBase.dockerfile
-    container_name: vkr-ml-service
-    restart: unless-stopped
-    env_file:
-      - ./core/.env
-    depends_on:
-      redis:
-        condition: service_healthy
-      minio:
-        condition: service_started
-    networks:
-      - ml_network
-      - vkr-inner-network
-      - vkr-outer-network
-    environment:
-      - PYTHONPATH=/app/src
-      - PYTHONUNBUFFERED=1
-    volumes:
-      - ./core:/app/core
-      - ./src:/app/src
-      - ./logs:/app/logs
-      - ./.models:/app/.models
-      - ./.cache:/root/.cache
-      - ./.venv-lin:/app/.venv-lin
-    ports:
-      - 8000:8000  # FastAPI порт
-    command: ["/app/.venv-lin/bin/python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-    profiles:
-      - service
-    deploy:
-        resources:
-          reservations:
-            devices:
-              - driver: nvidia
-                count: 1
-                capabilities: [gpu]
-
-  ml-console:
-    build: 
-      context: .
-      dockerfile: ./core/TransformersBase.dockerfile
-    container_name: vkr-ml-console
-    restart: unless-stopped
-    env_file:
-      - ./core/.env
-    depends_on:
-      redis:
-        condition: service_healthy
-      minio:
-        condition: service_started
-    networks:
-      - ml_network
-      - vkr-inner-network
-      - vkr-outer-network
-    environment:
-      - PYTHONPATH=/app/src
-      - PYTHONUNBUFFERED=1
-    volumes:
-      - ./core:/app/core
-      - ./src:/app/src
-      - ./logs:/app/logs
-      - ./.models:/app/.models
-      - ./.cache:/root/.cache
-      - ./.venv-lin:/app/.venv-lin
-    stdin_open: true
-    tty: true
-    command: ["/bin/bash", "-c", "/app/core/update-venv.sh && exec /bin/bash"]
-    profiles:
-      - manual
     deploy:
       resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+        limits:
+          cpus: 1
+          memory: 1G
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: vkr-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - ml_network
+      - vkr-outer-network
+    deploy:
+      resources:
+        limits:
+          cpus: 4
+          memory: 8G
+
+  vkr-ml-api:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    container_name: vkr-ml-api
+    restart: unless-stopped
+    networks:
+      - ml_network
+      - vkr-inner-network
+    environment:
+      - PYTHONPATH=/app/src
+      - PYTHONUNBUFFERED=1
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-gresP0st}@vkr-database:5432/${POSTGRES_DB:-vkr-db}
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+    volumes:
+      - ./:/app
+    ports:
+      - 8000:8000
+    deploy:
+      resources:
+        limits:
+          cpus: 2
+          memory: 2G
+
+  vkr-ml-worker:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    container_name: vkr-ml-worker
+    restart: unless-stopped
+    command: ["python", "-m", "cli.worker", "run", "--no-progress", "--event-redis"]
+    networks:
+      - ml_network
+      - vkr-inner-network
+      - vkr-outer-network
+    environment:
+      - PYTHONPATH=/app/src
+      - PYTHONUNBUFFERED=1
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-gresP0st}@vkr-database:5432/${POSTGRES_DB:-vkr-db}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redis123}
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - LMSTUDIO_BASE_URL=http://host.docker.internal:1234
+    volumes:
+      - ./:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          cpus: 4
+          memory: 8G
+
 
 volumes:
-  minio_data:
-    name: "vkr-volume-minio" 
   redis_data:
     name: "vkr-volume-redis"
+  qdrant_data:
+    name: "vkr-volume-qdrant"
 
 networks:
-  ml_network: # Локальная сеть для данного контейнера
+  ml_network:
     name: vkr-scinside-ml-network
     driver: bridge
     internal: true

@@ -1,9 +1,0 @@
-uvicorn
-redis
-pymupdf
-psycopg2-binary
-fastapi
-minio
-dotenv
-aiohttp
-pdfplumber

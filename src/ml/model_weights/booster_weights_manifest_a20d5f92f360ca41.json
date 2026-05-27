@@ -1,0 +1,46 @@
+{
+  "created_at": "2026-05-11 00:28:36",
+  "run_key": "a20d5f92f360ca41",
+  "config_vers": 35,
+  "train_dataset_names": [
+    "inspec",
+    "semeval2010",
+    "semeval2017"
+  ],
+  "feature_columns": [
+    "contains_hyphen",
+    "ends_with_noun",
+    "pke_yake_w8_rrank_doc_z",
+    "pke_singlerank_w4_rrank_doc_z",
+    "pke_rrank_max",
+    "pke_rrank_mean",
+    "pke_rrank_range",
+    "pke_top5_count",
+    "pke_top10_count",
+    "pke_rrank_delta_yake_singlerank",
+    "pke_yake_beats_singlerank",
+    "pke_singlerank_beats_yake",
+    "embedrank_best_sentence_cosine",
+    "candidate_substring_of_other",
+    "candidate_contains_other",
+    "candidate_token_overlap_max"
+  ],
+  "models": [
+    {
+      "name": "xgb_lambdarank",
+      "backend": "xgboost",
+      "class_name": "XGBRanker",
+      "module": "xgboost.sklearn",
+      "filename": "xgb_lambdarank_booster_weights_a20d5f92f360ca41.json",
+      "path": "artifacts\\pke_hybrid_contour_v3_2\\models\\xgb_lambdarank_booster_weights_a20d5f92f360ca41.json"
+    },
+    {
+      "name": "catboost_lambdamart",
+      "backend": "catboost",
+      "class_name": "CatBoostRanker",
+      "module": "catboost.core",
+      "filename": "catboost_lambdamart_booster_weights_a20d5f92f360ca41.cbm",
+      "path": "artifacts\\pke_hybrid_contour_v3_2\\models\\catboost_lambdamart_booster_weights_a20d5f92f360ca41.cbm"
+    }
+  ]
+}

@@ -1,5 +1,7 @@
-.venv*
-.env
+.*
+!.git*
 __pycache__
-.cache
-.models
+
+!.env.example
+logs/
+*.sql

@@ -1,0 +1,601 @@
+from __future__ import annotations
+
+import sys
+from datetime import date
+from pathlib import Path
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from cli.data import (  # noqa: E402
+    DataCoverageAnalyzer,
+    OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+    OPENALEX_TOPIC_STATS_QUEUE,
+    enqueue_missing_cluster_dynamics_tasks,
+    enqueue_missing_sample_tasks,
+    enqueue_missing_topic_stats_tasks,
+    parse_args,
+)
+from cli.tasks import (  # noqa: E402
+    OpenAlexTopicStatsTaskEnqueuer,
+    parse_args as parse_task_args,
+)
+from ingestion.openalex_topic_stats import OpenAlexTopicStatsCollectionResult  # noqa: E402
+from ml.services.openalex_cooldown import (  # noqa: E402
+    OPENALEX_COOLDOWN_KEY,
+    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
+)
+from ml.workers.redis_worker import (  # noqa: E402
+    DEFAULT_QUEUE_ORDER,
+    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
+)
+from ml.workers.task_handlers import MLTaskHandler  # noqa: E402
+
+
+class _CapturingRedis:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, dict]] = []
+        self.values: dict[str, dict] = {}
+        self.ttls: dict[str, int] = {}
+
+    def enqueue(self, queue_name: str, message: dict) -> None:
+        self.messages.append((queue_name, message))
+
+    def set_json(
+        self,
+        key: str,
+        value: dict,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        self.values[key] = value
+        if ttl_seconds is not None:
+            self.ttls[key] = ttl_seconds
+
+    def acquire_lock(self, key: str, ttl_seconds: int) -> bool:
+        if key in self.values:
+            return False
+        self.values[key] = {"lock": True}
+        self.ttls[key] = ttl_seconds
+        return True
+
+    def release_lock(self, key: str) -> None:
+        self.values.pop(key, None)
+        self.ttls.pop(key, None)
+
+
+class _FakeTopicStatsCollector:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def collect_and_store(self, **kwargs: object) -> OpenAlexTopicStatsCollectionResult:
+        self.calls.append(dict(kwargs))
+        return OpenAlexTopicStatsCollectionResult(
+            date_from=kwargs["date_from"],  # type: ignore[arg-type]
+            date_to=kwargs["date_to"],  # type: ignore[arg-type]
+            collected=2,
+        )
+
+
+class _DeferredTopicStatsCollector:
+    def collect_and_store(self, **kwargs: object) -> OpenAlexTopicStatsCollectionResult:
+        return OpenAlexTopicStatsCollectionResult(
+            date_from=kwargs["date_from"],  # type: ignore[arg-type]
+            date_to=kwargs["date_to"],  # type: ignore[arg-type]
+            collected=1,
+            deferred=True,
+            retry_after_seconds=None,
+            pending_tasks=[
+                {
+                    "task_type": "collect_topic_stats",
+                    "date_from": "2025-01-01",
+                    "date_to": "2025-01-31",
+                    "taxonomy_scope": "topic",
+                    "topic_ids": [2],
+                }
+            ],
+        )
+
+
+def test_data_coverage_months_and_missing_topic_periods() -> None:
+    analyzer = DataCoverageAnalyzer(session=None, sample_limit=1)  # type: ignore[arg-type]
+    months = analyzer._month_periods(date(2025, 12, 15), date(2026, 1, 1))
+    topics = [
+        {
+            "topic_id": 1,
+            "topic_name": "Graph learning",
+            "field_id": 17,
+            "field_name": "Computer science",
+        },
+        {
+            "topic_id": 2,
+            "topic_name": "Vision",
+            "field_id": 17,
+            "field_name": "Computer science",
+        },
+    ]
+
+    coverage = analyzer._topic_period_coverage(
+        code="publication_stats",
+        description="coverage",
+        period_unit="month",
+        topics=topics,
+        periods=months,
+        existing={(1, "2025-12"), (2, "2026-01")},
+    )
+
+    assert [period["key"] for period in months] == ["2025-12", "2026-01"]
+    assert months[-1]["date_to"] == date(2026, 1, 31)
+    assert coverage["expected_topic_periods"] == 4
+    assert coverage["covered_topic_periods"] == 2
+    assert coverage["missing_topic_periods"] == 2
+    assert coverage["missing_by_period"] == [
+        {
+            "period": "2025-12",
+            "period_start": date(2025, 12, 1),
+            "period_end": date(2025, 12, 31),
+            "missing_topics": 1,
+            "topic_sample": [
+                {
+                    "topic_id": 2,
+                    "topic_name": "Vision",
+                    "field_id": 17,
+                    "field_name": "Computer science",
+                }
+            ],
+        },
+        {
+            "period": "2026-01",
+            "period_start": date(2026, 1, 1),
+            "period_end": date(2026, 1, 31),
+            "missing_topics": 1,
+            "topic_sample": [
+                {
+                    "topic_id": 1,
+                    "topic_name": "Graph learning",
+                    "field_id": 17,
+                    "field_name": "Computer science",
+                }
+            ],
+        },
+    ]
+    assert len(coverage["missing_by_topic_sample"]) == 1
+
+
+def test_data_coverage_cli_parser_accepts_field_scope() -> None:
+    args = parse_args(
+        [
+            "analyze-coverage",
+            "--field-ids",
+            "17",
+            "--date-from",
+            "2025-01-15",
+            "--date-to",
+            "2025-12-01",
+        ]
+    )
+
+    assert args.command == "analyze-coverage"
+    assert args.field_ids == "17"
+    assert args.date_to == date(2025, 12, 1)
+
+    alias_args = parse_args(
+        [
+            "analyze-data-coverage",
+            "--topic-ids",
+            "1",
+            "--date-from",
+            "2025-01-01",
+            "--date-to",
+            "2025-01-31",
+        ]
+    )
+    assert alias_args.command == "analyze-data-coverage"
+
+
+def test_sample_month_coverage_cli_parser_accepts_field_scope() -> None:
+    args = parse_args(
+        [
+            "analyze-sample-month-coverage",
+            "--field-id",
+            "17",
+            "--topic-ids",
+            "1,2",
+            "--date-from",
+            "2025-01-15",
+            "--date-to",
+            "2025-02-01",
+        ]
+    )
+
+    assert args.command == "analyze-sample-month-coverage"
+    assert args.field_id == 17
+    assert args.topic_ids == "1,2"
+    assert args.date_to == date(2025, 2, 1)
+
+
+def test_sample_month_coverage_cli_parser_accepts_enqueue_flags() -> None:
+    args = parse_args(
+        [
+            "analyze-sample-month-coverage",
+            "--field-id",
+            "17",
+            "--date-from",
+            "2025-01-01",
+            "--date-to",
+            "2025-01-31",
+            "--enqueue-missing-samples",
+            "--enqueue-task-batch-size",
+            "2",
+            "--target-count",
+            "50",
+        ]
+    )
+
+    assert args.enqueue_missing_samples is True
+    assert args.enqueue_queue == OPENALEX_BOOTSTRAP_PAPERS_QUEUE
+    assert args.enqueue_task_batch_size == 2
+    assert args.target_count == 50
+
+
+def test_sample_month_coverage_report_is_limited_to_samples_check() -> None:
+    class _Analyzer(DataCoverageAnalyzer):
+        def _load_topics(self, *, field_ids, topic_ids):  # type: ignore[no-untyped-def]
+            assert field_ids == [17]
+            assert topic_ids == [1, 2]
+            return [
+                {
+                    "topic_id": 1,
+                    "topic_name": "Graph learning",
+                    "field_id": 17,
+                    "field_name": "Computer science",
+                },
+                {
+                    "topic_id": 2,
+                    "topic_name": "Vision",
+                    "field_id": 17,
+                    "field_name": "Computer science",
+                },
+            ]
+
+        def _load_sample_counts(self, topic_ids, months):  # type: ignore[no-untyped-def]
+            assert topic_ids == [1, 2]
+            return {(1, "2025-01"): 3, (2, "2025-02"): 4}
+
+    report = _Analyzer(session=None, sample_limit=2).analyze_sample_month_coverage(  # type: ignore[arg-type]
+        date_from=date(2025, 1, 15),
+        date_to=date(2025, 2, 1),
+        field_id=17,
+        topic_ids=[1, 2],
+    )
+
+    assert report["command"] == "analyze-sample-month-coverage"
+    assert report["scope"]["field_id"] == 17
+    assert report["summary"]["months"] == 2
+    assert report["summary"]["sample_missing"] == 2
+    assert list(report["checks"]) == ["samples"]
+    assert report["checks"]["samples"]["missing_by_period"][0]["period"] == "2025-01"
+
+
+def test_sample_month_coverage_can_include_missing_topic_ids() -> None:
+    class _Analyzer(DataCoverageAnalyzer):
+        def _load_topics(self, *, field_ids, topic_ids):  # type: ignore[no-untyped-def]
+            return [
+                {
+                    "topic_id": 1,
+                    "topic_name": "Graph learning",
+                    "field_id": 17,
+                    "field_name": "Computer science",
+                },
+                {
+                    "topic_id": 2,
+                    "topic_name": "Vision",
+                    "field_id": 17,
+                    "field_name": "Computer science",
+                },
+            ]
+
+        def _load_sample_counts(self, topic_ids, months):  # type: ignore[no-untyped-def]
+            return {(1, "2025-01"): 3}
+
+    report = _Analyzer(session=None, sample_limit=2).analyze_sample_month_coverage(  # type: ignore[arg-type]
+        date_from=date(2025, 1, 1),
+        date_to=date(2025, 1, 31),
+        field_id=17,
+        include_missing_topic_ids=True,
+    )
+
+    assert report["checks"]["samples"]["missing_by_period"][0]["topic_ids"] == [2]
+
+
+def test_coverage_enqueue_missing_samples_uses_full_missing_topic_ids() -> None:
+    redis = _CapturingRedis()
+    report = {
+        "scope": {"field_id": 17},
+        "checks": {
+            "samples": {
+                "missing_topic_periods": 3,
+                "missing_by_period": [
+                    {
+                        "period": "2025-01",
+                        "period_start": date(2025, 1, 1),
+                        "period_end": date(2025, 1, 31),
+                        "topic_ids": [1, 2, 3],
+                    }
+                ],
+            }
+        },
+    }
+
+    result = enqueue_missing_sample_tasks(
+        report,
+        redis_adapter=redis,
+        queue_name=OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+        task_batch_size=2,
+        target_count=50,
+        languages=["en"],
+        types=["article"],
+        batch_size=500,
+        request_workers=4,
+        db_workers=2,
+        rate_limit_rps=10,
+        seed=42,
+        per_page=100,
+        max_retries=5,
+    )
+
+    assert result["messages"] == 2
+    assert [message["topic_ids"] for _, message in redis.messages] == [[1, 2], [3]]
+    assert all(queue == OPENALEX_BOOTSTRAP_PAPERS_QUEUE for queue, _ in redis.messages)
+    assert {message["task_type"] for _, message in redis.messages} == {"bootstrap_papers"}
+    assert all(message["field_id"] == 17 for _, message in redis.messages)
+    assert all(message["target_scope"] == "month" for _, message in redis.messages)
+    assert all(message["enqueue_indexing"] is False for _, message in redis.messages)
+    assert all(message["enqueue_cluster_dynamics"] is True for _, message in redis.messages)
+    assert all(message["workflow_granularity"] == "month" for _, message in redis.messages)
+
+
+def test_coverage_enqueue_missing_cluster_dynamics_uses_full_missing_topic_ids() -> None:
+    redis = _CapturingRedis()
+    report = {
+        "checks": {
+            "cluster_dynamics": {
+                "missing_topic_periods": 2,
+                "missing_by_period": [
+                    {
+                        "period": "2025-01",
+                        "period_start": date(2025, 1, 1),
+                        "period_end": date(2025, 1, 31),
+                        "topic_ids": [1, 2],
+                    }
+                ],
+            }
+        }
+    }
+
+    result = enqueue_missing_cluster_dynamics_tasks(
+        report,
+        redis_adapter=redis,
+        queue_name="queue:cluster_dynamics_recompute",
+        batch_size=1,
+    )
+
+    assert result["messages"] == 2
+    assert [message["cluster_ids"] for _, message in redis.messages] == [
+        ["topic:1"],
+        ["topic:2"],
+    ]
+    assert all(
+        message["task_type"] == "cluster_dynamics_recompute"
+        for _, message in redis.messages
+    )
+
+
+def test_data_coverage_cli_parser_topic_stats_flags_default_to_enabled() -> None:
+    args = parse_args(
+        [
+            "analyze-coverage",
+            "--field-ids",
+            "17",
+            "--date-from",
+            "2025-01-01",
+            "--date-to",
+            "2025-01-31",
+        ]
+    )
+
+    assert args.normalize_january_first is True
+    assert args.primary_topic_only is True
+
+    disabled_args = parse_args(
+        [
+            "analyze-coverage",
+            "--field-ids",
+            "17",
+            "--date-from",
+            "2025-01-01",
+            "--date-to",
+            "2025-01-31",
+            "--no-normalize-january-first",
+            "--no-primary-topic-only",
+        ]
+    )
+    assert disabled_args.normalize_january_first is False
+    assert disabled_args.primary_topic_only is False
+
+
+def test_openalex_topic_stats_queue_has_max_worker_priority() -> None:
+    assert DEFAULT_QUEUE_ORDER[0] == OPENALEX_TOPIC_STATS_PENDING_QUEUE
+    assert OPENALEX_TOPIC_STATS_QUEUE in DEFAULT_QUEUE_ORDER
+    assert OPENALEX_BOOTSTRAP_PAPERS_QUEUE in DEFAULT_QUEUE_ORDER
+
+
+def test_topic_stats_cli_parser_topic_filter_flags_default_to_enabled() -> None:
+    args = parse_task_args(
+        [
+            "enqueue-topic-stats",
+            "--topic-ids",
+            "1",
+            "--date-from",
+            "2025-01-01",
+            "--date-to",
+            "2025-01-31",
+        ]
+    )
+
+    assert args.normalize_january_first is True
+    assert args.primary_topic_only is True
+
+    disabled_args = parse_task_args(
+        [
+            "enqueue-topic-stats",
+            "--topic-ids",
+            "1",
+            "--date-from",
+            "2025-01-01",
+            "--date-to",
+            "2025-01-31",
+            "--no-normalize-january-first",
+            "--no-primary-topic-only",
+        ]
+    )
+    assert disabled_args.normalize_january_first is False
+    assert disabled_args.primary_topic_only is False
+
+
+def test_topic_stats_task_enqueuer_builds_high_priority_messages() -> None:
+    redis = _CapturingRedis()
+    result = OpenAlexTopicStatsTaskEnqueuer(redis_adapter=redis).enqueue(
+        date_from=date(2025, 1, 1),
+        date_to=date(2025, 2, 28),
+        topic_ids=[1, 2, 3],
+        taxonomy_scope="topic",
+        task_batch_size=2,
+        dry_run=False,
+        show_progress=False,
+    )
+
+    assert result["queue"] == OPENALEX_TOPIC_STATS_QUEUE
+    assert result["priority"] == "max"
+    assert result["messages"] == 2
+    assert [message["topic_ids"] for _, message in redis.messages] == [[1, 2], [3]]
+    assert {message["task_type"] for _, message in redis.messages} == {
+        "collect_topic_stats"
+    }
+    assert all(
+        message["normalize_january_first"] is True for _, message in redis.messages
+    )
+    assert all(message["primary_topic_only"] is True for _, message in redis.messages)
+
+
+def test_coverage_enqueue_missing_topic_stats_uses_full_missing_topic_ids() -> None:
+    redis = _CapturingRedis()
+    report = {
+        "checks": {
+            "publication_stats": {
+                "missing_topic_periods": 3,
+                "missing_by_period": [
+                    {
+                        "period": "2025-01",
+                        "period_start": date(2025, 1, 1),
+                        "period_end": date(2025, 1, 31),
+                        "topic_ids": [1, 2, 3],
+                    }
+                ],
+            }
+        }
+    }
+
+    result = enqueue_missing_topic_stats_tasks(
+        report,
+        redis_adapter=redis,
+        queue_name=OPENALEX_TOPIC_STATS_QUEUE,
+        task_batch_size=2,
+        languages=["en"],
+        types=["article"],
+        batch_size=500,
+        request_workers=4,
+        rate_limit_rps=10,
+        max_retries=5,
+    )
+
+    assert result["messages"] == 2
+    assert [message["topic_ids"] for _, message in redis.messages] == [[1, 2], [3]]
+    assert all(queue == OPENALEX_TOPIC_STATS_QUEUE for queue, _ in redis.messages)
+    assert all(
+        message["normalize_january_first"] is True for _, message in redis.messages
+    )
+    assert all(message["primary_topic_only"] is True for _, message in redis.messages)
+
+
+def test_worker_handler_runs_collect_topic_stats_task() -> None:
+    collector = _FakeTopicStatsCollector()
+    handler = MLTaskHandler(
+        openalex_topic_stats_collector_factory=lambda _message: collector,
+    )
+
+    result = handler.handle(
+        {
+            "task_type": "collect_topic_stats",
+            "date_from": "2025-01-01",
+            "date_to": "2025-01-31",
+            "topic_ids": [1, 2],
+            "languages": ["en"],
+            "types": ["article"],
+            "request_workers": 2,
+            "rate_limit_rps": 10,
+        }
+    )
+
+    assert result.success is True
+    assert result.details["task_type"] == "collect_topic_stats"
+    assert collector.calls[0]["topic_ids"] == [1, 2]
+    assert collector.calls[0]["date_from"] == date(2025, 1, 1)
+
+
+def test_worker_handler_enqueues_deferred_topic_stats_and_cooldown() -> None:
+    redis = _CapturingRedis()
+    handler = MLTaskHandler(
+        openalex_topic_stats_collector_factory=lambda _message: _DeferredTopicStatsCollector(),  # type: ignore[arg-type]
+        redis_adapter=redis,
+    )
+
+    result = handler.handle(
+        {
+            "task_type": "collect_topic_stats",
+            "date_from": "2025-01-01",
+            "date_to": "2025-01-31",
+            "topic_ids": [1, 2],
+            "openalex_api_key": "secret",
+        }
+    )
+
+    assert result.success is True
+    assert redis.messages[0][0] == OPENALEX_TOPIC_STATS_PENDING_QUEUE
+    assert redis.messages[0][1]["topic_ids"] == [2]
+    assert redis.messages[0][1]["openalex_api_key"] == "secret"
+    assert redis.values[OPENALEX_COOLDOWN_KEY]["retry_after_seconds"] == 900
+    assert redis.ttls[OPENALEX_COOLDOWN_KEY] == 900
+
+
+def test_worker_handler_runs_bootstrap_papers_task() -> None:
+    calls: list[dict] = []
+
+    def runner(message: dict) -> dict:
+        calls.append(message)
+        return {"fetched": 2, "imported": 2, "failed": 0}
+
+    handler = MLTaskHandler(openalex_paper_bootstrap_runner=runner)
+
+    result = handler.handle(
+        {
+            "task_type": "bootstrap_papers",
+            "date_from": "2025-01-01",
+            "date_to": "2025-01-31",
+            "topic_ids": [1, 2],
+        }
+    )
+
+    assert result.success is True
+    assert result.details["task_type"] == "bootstrap_papers"
+    assert result.details["imported"] == 2
+    assert calls[0]["topic_ids"] == [1, 2]
