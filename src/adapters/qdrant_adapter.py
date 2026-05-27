@@ -37,6 +37,10 @@ class QdrantAdapter:
                     "qdrant_client is not installed. Install qdrant-client to use QdrantAdapter.",
                     details={"qdrant_client_installed": False},
                 )
+            if isinstance(api_key, str):
+                normalized_api_key = api_key.strip() or None
+            else:
+                normalized_api_key = api_key
             client_kwargs: dict[str, Any] = {
                 "prefer_grpc": prefer_grpc,
                 "check_compatibility": check_compatibility,
@@ -47,8 +51,8 @@ class QdrantAdapter:
                 client_kwargs["host"] = host
             if port is not None:
                 client_kwargs["port"] = port
-            if api_key is not None:
-                client_kwargs["api_key"] = api_key
+            if normalized_api_key is not None:
+                client_kwargs["api_key"] = normalized_api_key
             if timeout_seconds is not None:
                 client_kwargs["timeout"] = timeout_seconds
             client = QdrantClient(**client_kwargs)

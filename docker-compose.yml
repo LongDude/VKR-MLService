@@ -71,11 +71,11 @@ services:
     networks:
       - ml_network
       - vkr-inner-network
-      - vkr-outer-network
     environment:
       - PYTHONPATH=/app/src
       - PYTHONUNBUFFERED=1
       - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-gresP0st}@vkr-database:5432/${POSTGRES_DB:-vkr-db}
+      - QDRANT_URL=http://qdrant:6333
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
@@ -88,6 +88,44 @@ services:
         limits:
           cpus: 2
           memory: 2G
+
+  vkr-ml-worker:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    container_name: vkr-ml-worker
+    restart: unless-stopped
+    command: ["python", "-m", "cli.worker", "run", "--no-progress", "--event-redis"]
+    networks:
+      - ml_network
+      - vkr-inner-network
+      - vkr-outer-network
+    environment:
+      - PYTHONPATH=/app/src
+      - PYTHONUNBUFFERED=1
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-gresP0st}@vkr-database:5432/${POSTGRES_DB:-vkr-db}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redis123}
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - LMSTUDIO_BASE_URL=http://host.docker.internal:1234
+    volumes:
+      - ./:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          cpus: 4
+          memory: 8G
+
 
 volumes:
   redis_data:

@@ -1146,6 +1146,25 @@ def test_qdrant_adapter_disables_startup_compatibility_check(
     assert captured_kwargs["check_compatibility"] is False
 
 
+def test_qdrant_adapter_ignores_blank_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from adapters import qdrant_adapter as qdrant_module
+
+    captured_kwargs: dict[str, Any] = {}
+
+    class FakeRemoteQdrantClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr(qdrant_module, "QdrantClient", FakeRemoteQdrantClient)
+
+    qdrant_module.QdrantAdapter(url="http://qdrant.example", api_key="   ")
+
+    assert captured_kwargs["url"] == "http://qdrant.example"
+    assert "api_key" not in captured_kwargs
+
+
 def test_qdrant_paper_payload_uses_paper_openalex_fields() -> None:
     payload = QdrantPayloadBuilder().build_paper_payload(
         SimpleNamespace(
@@ -1654,6 +1673,35 @@ def test_keyword_extraction_loaded_papers_updates_progress_by_internal_chunks() 
         2: ["kw-2"],
         3: ["kw-3"],
     }
+
+
+def test_keyword_extraction_loaded_papers_treats_empty_keywords_as_failed() -> None:
+    facade = object.__new__(KeywordExtractionFacade)
+    facade.paper_repository = FakeKeywordPaperRepository()
+    facade.event_sink = NoopEventSink()
+    facade.paper_extraction_chunk_size = 25
+
+    def fake_extract_batch(request: Any) -> list[KeywordExtractionResponseDTO]:
+        return [
+            KeywordExtractionResponseDTO(
+                paper_id=metadata.paper_id,
+                keywords=[],
+            )
+            for metadata in request.items
+        ]
+
+    facade.extract_batch = fake_extract_batch  # type: ignore[method-assign]
+    result = facade._extract_loaded_papers(
+        [SimpleNamespace(id=1, title="One", abstract="Abstract", language="en")],
+        top_k=10,
+        min_score=None,
+        skip_non_english=False,
+    )
+
+    assert result.updated == 0
+    assert result.failed == 1
+    assert result.errors[0]["code"] == "keyword_extraction_empty"
+    assert facade.paper_repository.saved == {}
 
 
 def test_paper_indexing_merges_extracted_keywords_without_keyword_ids() -> None:
