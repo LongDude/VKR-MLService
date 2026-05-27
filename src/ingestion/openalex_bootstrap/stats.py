@@ -11,7 +11,7 @@ from tqdm.auto import tqdm
 
 from adapters.redis_adapter import RedisAdapter
 from ingestion.openalex_bootstrap.monthly_counts import MonthlyCount, MonthlyCountsLoader
-from ingestion.openalex_bootstrap.rate_limiter import AsyncRateLimiter
+from ml.services.openalex_rate_limiter import AsyncRateLimiter
 
 
 @dataclass
