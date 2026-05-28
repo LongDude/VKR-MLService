@@ -21,6 +21,7 @@ from core.exceptions import (
     ExternalServiceRateLimitError,
     ExternalServiceUnavailableError,
 )
+from ml.services.openalex_rate_limiter import SyncRateLimiter
 from dto.external import OpenAlexSearchFiltersDTO
 from models import Topic
 from repositories.openalex_topic_stats import (
@@ -98,31 +99,6 @@ class _GroupedFetchResult:
 class _JanuaryNormalizationResult:
     expected_real_count: int
     estimated_artificial_count: int
-
-
-class SyncRateLimiter:
-    """Thread-safe sliding-window request limiter for synchronous OpenAlex calls."""
-
-    def __init__(self, requests_per_second: float) -> None:
-        if requests_per_second <= 0:
-            raise ValueError("requests_per_second must be positive")
-        self.requests_per_second = requests_per_second
-        self._timestamps: deque[float] = deque()
-        self._lock = threading.Lock()
-
-    def acquire(self) -> None:
-        """Block until a request slot is available."""
-        while True:
-            with self._lock:
-                now = time.monotonic()
-                while self._timestamps and now - self._timestamps[0] >= 1.0:
-                    self._timestamps.popleft()
-                if len(self._timestamps) < self.requests_per_second:
-                    self._timestamps.append(now)
-                    return
-                sleep_for = max(0.0, 1.0 - (now - self._timestamps[0]))
-            time.sleep(sleep_for)
-
 
 class OpenAlexTopicStatsCollector:
     """Collect topic/month OpenAlex work counts and upsert them into PostgreSQL."""

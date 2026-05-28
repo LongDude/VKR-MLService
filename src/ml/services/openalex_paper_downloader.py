@@ -20,7 +20,6 @@ from dto.openalex import (
 )
 from ml.services.openalex_rate_limiter import AsyncRateLimiter
 
-
 OPENALEX_WORKS_SELECT = ",".join(
     [
         "id",
@@ -46,7 +45,7 @@ OPENALEX_WORKS_SELECT = ",".join(
 
 @dataclass
 class OpenAlexDownloadResult:
-    papers: list[ExternalPaperDTO] = field(default_factory=list)
+    papers: list[ExternalPaperDTO] = field(default_factory=list[ExternalPaperDTO])
     fetched: int = 0
     normalized: int = 0
     skipped_empty_title: int = 0
@@ -54,13 +53,18 @@ class OpenAlexDownloadResult:
     failed: int = 0
     openalex_requests: int = 0
     deferred: bool = False
-    pending_pages: list[OpenAlexPendingPageDTO] = field(default_factory=list)
+    pending_pages: list[OpenAlexPendingPageDTO] = field(
+        default_factory=list[OpenAlexPendingPageDTO]
+    )
     retry_after_seconds: float | None = None
-    unit_summaries: dict[str, OpenAlexUnitSummaryDTO] = field(default_factory=dict)
-    paper_unit_keys: dict[str, list[str]] = field(default_factory=dict)
-    errors: list[dict[str, Any]] = field(default_factory=list)
+    unit_summaries: dict[str, OpenAlexUnitSummaryDTO] = field(
+        default_factory=dict[str, OpenAlexUnitSummaryDTO]
+    )
+    paper_unit_keys: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
+    errors: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
 
 
+#! Error client
 class _UnusedClient:
     def get(self, *_args: Any, **_kwargs: Any) -> Any:
         raise RuntimeError("Synchronous OpenAlex client is not used by paper loader")
@@ -91,6 +95,7 @@ class OpenAlexPaperDownloader:
         self.mailto = mailto.strip() if mailto and mailto.strip() else None
         self.rate_limit_defer_after_seconds = max(0.0, rate_limit_defer_after_seconds)
         self.transport = transport
+        #! Why?
         self._normalizer = OpenAlexAdapter(base_url=base_url, client=_UnusedClient())
 
     async def fetch_plan(
@@ -175,7 +180,9 @@ class OpenAlexPaperDownloader:
                         if page_result.get("deferred")
                         and page_result.get("retry_after_seconds") is not None
                     ]
-                    result.retry_after_seconds = max(retry_values) if retry_values else None
+                    result.retry_after_seconds = (
+                        max(retry_values) if retry_values else None
+                    )
             finally:
                 if progress_bar is not None:
                     progress_bar.close()
@@ -332,7 +339,9 @@ class OpenAlexPaperDownloader:
                         ],
                     }
 
-                raw_results = payload.get("results") if isinstance(payload, dict) else []
+                raw_results = (
+                    payload.get("results") if isinstance(payload, dict) else []
+                )
                 if not isinstance(raw_results, list):
                     return {
                         **self._page_identity(pending_page),
@@ -352,7 +361,9 @@ class OpenAlexPaperDownloader:
                 remaining = max(0, pending_page.sample_size - page_offset)
                 expected_count = min(pending_page.per_page, remaining)
                 raw_results = raw_results[:expected_count]
-                valid_items = [value for value in raw_results if isinstance(value, dict)]
+                valid_items = [
+                    value for value in raw_results if isinstance(value, dict)
+                ]
                 exhausted = len(valid_items) < expected_count
                 return {
                     **self._page_identity(pending_page),
@@ -394,11 +405,15 @@ class OpenAlexPaperDownloader:
                     requested=int(page_result.get("requested_count") or 0),
                 ),
             )
-            fetched_count = int(page_result.get("fetched_count") or len(page_result["items"]))
+            fetched_count = int(
+                page_result.get("fetched_count") or len(page_result["items"])
+            )
             summary.fetched += fetched_count
             if page_result.get("exhausted") and not summary.exhausted:
                 summary.exhausted = True
-                summary.reason = str(page_result.get("exhausted_reason") or "short_page")
+                summary.reason = str(
+                    page_result.get("exhausted_reason") or "short_page"
+                )
 
             result.openalex_requests += int(page_result["requests"])
             result.errors.extend(page_result["errors"])
@@ -406,7 +421,7 @@ class OpenAlexPaperDownloader:
             for raw_item in page_result["items"]:
                 result.fetched += 1
                 try:
-                    paper = self._normalizer._normalize_work(raw_item)
+                    paper = self._normalizer.normalize_work(raw_item)
                 except Exception as exc:
                     result.failed += 1
                     result.errors.append(

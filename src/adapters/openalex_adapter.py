@@ -39,20 +39,24 @@ class OpenAlexAdapter:
         self._client = client or httpx.Client(timeout=timeout_seconds)
 
     def get_work_by_doi(self, doi: str) -> ExternalPaperDTO | None:
-        payload = self._get_json(f"/works/doi:{quote(doi, safe='')}", allow_not_found=True)
+        payload = self._get_json(
+            f"/works/doi:{quote(doi, safe='')}", allow_not_found=True
+        )
         if payload is None:
             return None
-        return self._normalize_work(payload)
+        return self.normalize_work(payload)
 
     def get_work_by_external_id(
         self,
         external_id: str,
     ) -> ExternalPaperDTO | None:
         work_id = self._normalize_work_identifier(external_id)
-        payload = self._get_json(f"/works/{quote(work_id, safe='')}", allow_not_found=True)
+        payload = self._get_json(
+            f"/works/{quote(work_id, safe='')}", allow_not_found=True
+        )
         if payload is None:
             return None
-        return self._normalize_work(payload)
+        return self.normalize_work(payload)
 
     def count_works(
         self,
@@ -78,10 +82,14 @@ class OpenAlexAdapter:
 
         payload = self._get_json("/works", params=params, allow_not_found=False)
         if not isinstance(payload, dict):
-            raise ExternalResponseFormatError("OpenAlex/OpenAlex count response is not an object")
+            raise ExternalResponseFormatError(
+                "OpenAlex/OpenAlex count response is not an object"
+            )
         meta = payload.get("meta")
         if not isinstance(meta, dict):
-            raise ExternalResponseFormatError("OpenAlex/OpenAlex count response has no meta")
+            raise ExternalResponseFormatError(
+                "OpenAlex/OpenAlex count response has no meta"
+            )
         try:
             return int(meta.get("count") or 0)
         except (TypeError, ValueError) as exc:
@@ -113,10 +121,14 @@ class OpenAlexAdapter:
 
         payload = self._get_json("/works", params=params, allow_not_found=False)
         if not isinstance(payload, dict):
-            raise ExternalResponseFormatError("OpenAlex/OpenAlex group response is not an object")
+            raise ExternalResponseFormatError(
+                "OpenAlex/OpenAlex group response is not an object"
+            )
         groups = payload.get("group_by")
         if not isinstance(groups, list):
-            raise ExternalResponseFormatError("OpenAlex/OpenAlex group_by payload is not a list")
+            raise ExternalResponseFormatError(
+                "OpenAlex/OpenAlex group_by payload is not a list"
+            )
         meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
         next_cursor = meta.get("next_cursor") if isinstance(meta, dict) else None
         return [item for item in groups if isinstance(item, dict)], (
@@ -144,7 +156,9 @@ class OpenAlexAdapter:
                     "status_code": response.status_code,
                     "body": response.text,
                     "retry_after": response.headers.get("Retry-After"),
-                    "rate_limit_remaining": response.headers.get("X-RateLimit-Remaining"),
+                    "rate_limit_remaining": response.headers.get(
+                        "X-RateLimit-Remaining"
+                    ),
                     "rate_limit_reset": response.headers.get("X-RateLimit-Reset"),
                     "rate_limit_credits_used": response.headers.get(
                         "X-RateLimit-Credits-Used"
@@ -186,7 +200,8 @@ class OpenAlexAdapter:
             result.setdefault("mailto", self._mailto)
         return result
 
-    def _normalize_work(self, data: dict[str, Any]) -> ExternalPaperDTO:
+    def normalize_work(self, data: dict[str, Any]) -> ExternalPaperDTO:
+
         authors, institutions_from_authors = self._normalize_authors(data)
         institutions = self._dedupe_institutions(
             [
@@ -200,10 +215,7 @@ class OpenAlexAdapter:
             ),
             doi=self._string_or_none(data.get("doi")),
             title=str(
-                data.get("title")
-                or data.get("display_name")
-                or data.get("name")
-                or ""
+                data.get("title") or data.get("display_name") or data.get("name") or ""
             ),
             abstract=self._normalize_abstract(data),
             publication_year=self._int_or_none(data.get("publication_year")),
@@ -260,7 +272,9 @@ class OpenAlexAdapter:
         for index, item in enumerate(raw_authors):
             if not isinstance(item, dict):
                 continue
-            author_data = item.get("author") if isinstance(item.get("author"), dict) else item
+            author_data = (
+                item.get("author") if isinstance(item.get("author"), dict) else item
+            )
             author_institutions = self._normalize_top_level_institutions(
                 item.get("institutions")
             )
@@ -271,12 +285,11 @@ class OpenAlexAdapter:
                         author_data.get("id") or author_data.get("external_id")
                     ),
                     display_name=str(
-                        author_data.get("display_name")
-                        or author_data.get("name")
-                        or ""
+                        author_data.get("display_name") or author_data.get("name") or ""
                     ),
                     orcid=self._string_or_none(author_data.get("orcid")),
-                    author_order=self._int_or_none(item.get("author_order")) or index + 1,
+                    author_order=self._int_or_none(item.get("author_order"))
+                    or index + 1,
                     is_corresponding=self._bool_or_none(item.get("is_corresponding")),
                     institutions=author_institutions,
                     raw=item,
@@ -300,9 +313,7 @@ class OpenAlexAdapter:
                         item.get("id") or item.get("external_id")
                     ),
                     display_name=str(
-                        item.get("display_name")
-                        or item.get("name")
-                        or ""
+                        item.get("display_name") or item.get("name") or ""
                     ),
                     ror=self._string_or_none(item.get("ror")),
                     country_code=self._string_or_none(item.get("country_code")),
@@ -335,7 +346,9 @@ class OpenAlexAdapter:
                 continue
             domain = item.get("domain") if isinstance(item.get("domain"), dict) else {}
             field = item.get("field") if isinstance(item.get("field"), dict) else {}
-            subfield = item.get("subfield") if isinstance(item.get("subfield"), dict) else {}
+            subfield = (
+                item.get("subfield") if isinstance(item.get("subfield"), dict) else {}
+            )
             topics.append(
                 ExternalTopicDTO(
                     external_id=self._string_or_none(item.get("id")),
@@ -393,7 +406,9 @@ class OpenAlexAdapter:
                 candidates.append((value, is_best))
         locations = data.get("locations")
         if isinstance(locations, list):
-            candidates.extend((item, None) for item in locations if isinstance(item, dict))
+            candidates.extend(
+                (item, None) for item in locations if isinstance(item, dict)
+            )
 
         landings: list[ExternalLandingDTO] = []
         seen: set[str] = set()
@@ -437,7 +452,9 @@ class OpenAlexAdapter:
         if filters.date_from is not None:
             values.append(f"from_publication_date:{filters.date_from.isoformat()}")
         elif filters.publication_year_from is not None:
-            values.append(f"from_publication_date:{filters.publication_year_from}-01-01")
+            values.append(
+                f"from_publication_date:{filters.publication_year_from}-01-01"
+            )
         if filters.date_to is not None:
             values.append(f"to_publication_date:{filters.date_to.isoformat()}")
         elif filters.publication_year_to is not None:

@@ -24,7 +24,9 @@ class ExternalAuthorDTO(BaseDTO):
     orcid: str | None = None
     author_order: int | None = None
     is_corresponding: bool | None = None
-    institutions: list[ExternalInstitutionDTO] = Field(default_factory=list)
+    institutions: list[ExternalInstitutionDTO] = Field(
+        default_factory=list[ExternalInstitutionDTO]
+    )
     raw: dict[str, Any] | None = None
 
 
@@ -67,11 +69,13 @@ class ExternalPaperDTO(BaseDTO):
     references_count: int | None = None
     primary_topic_id: int | None = None
     extracted_keywords: list[str] | list[dict[str, Any]] | None = None
-    authors: list[ExternalAuthorDTO] = Field(default_factory=list)
-    institutions: list[ExternalInstitutionDTO] = Field(default_factory=list)
-    topics: list[ExternalTopicDTO] = Field(default_factory=list)
-    keywords: list[ExternalKeywordDTO] = Field(default_factory=list)
-    landings: list[ExternalLandingDTO] = Field(default_factory=list)
+    authors: list[ExternalAuthorDTO] = Field(default_factory=list[ExternalAuthorDTO])
+    institutions: list[ExternalInstitutionDTO] = Field(
+        default_factory=list[ExternalInstitutionDTO]
+    )
+    topics: list[ExternalTopicDTO] = Field(default_factory=list[ExternalTopicDTO])
+    keywords: list[ExternalKeywordDTO] = Field(default_factory=list[ExternalKeywordDTO])
+    landings: list[ExternalLandingDTO] = Field(default_factory=list[ExternalLandingDTO])
     raw: dict[str, Any] | None = None
 
 
