@@ -18,6 +18,8 @@ services:
       interval: 10s
       timeout: 3s
       retries: 3
+    profiles:
+      - worker
     deploy:
       resources:
         limits:
@@ -39,6 +41,8 @@ services:
     networks:
       - ml_network
       - vkr-outer-network
+    profiles:
+      - monitoring
     deploy:
       resources:
         limits:
@@ -120,6 +124,8 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_started
+    profiles:
+      - worker
     deploy:
       resources:
         limits:
