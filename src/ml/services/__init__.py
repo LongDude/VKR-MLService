@@ -10,6 +10,7 @@ from .events import (
     RedisEventSink,
     TqdmEventSink,
 )
+from .forecast_model import PublicationForecastService
 from .qdrant_collections import QdrantCollectionInitializer
 from .qdrant_payloads import QdrantPayloadBuilder
 from .scoring import ScoringService
@@ -32,4 +33,5 @@ __all__ = [
     "TqdmEventSink",
     "TrendStatusService",
     "VectorMathService",
+    "PublicationForecastService",
 ]

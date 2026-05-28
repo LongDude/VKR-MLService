@@ -7,7 +7,6 @@ from pydantic import Field, model_validator
 
 from .common import BaseDTO
 
-
 MetricLevel = Literal["low", "medium", "high"]
 RelationType = Literal["same subfield", "embedding similarity", "shared keyphrases"]
 TrendStatus = Literal["emerging", "popular", "declining", "stable"]
@@ -38,7 +37,7 @@ class TopicForecastPointDTO(BaseDTO):
     upper_share: float | None = None
     model_name: str
     share_model_name: str | None = None
-    subfield_model_name: str | None = None
+    count_model_name: str | None = None
     backtest_error_mae: float | None = None
     backtest_error_mape: float | None = None
     backtest_error_smape: float | None = None

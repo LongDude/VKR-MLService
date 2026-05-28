@@ -38,6 +38,7 @@ from repositories.favourites import FavouriteRepository
 from repositories.papers import PaperRepository
 from repositories.taxonomy import TaxonomyRepository
 from repositories.tracked_areas import TrackedAreaRepository
+from src.ml.services.forecast_model import PublicationForecastService
 
 
 @lru_cache(maxsize=1)
@@ -67,6 +68,17 @@ def get_qdrant_adapter() -> QdrantAdapter | None:
     except Exception:
         return None
     return None
+
+
+@lru_cache
+def get_publication_forecast_service() -> PublicationForecastService:
+    return PublicationForecastService(
+        season_length=12,
+        min_backtest_points=24,
+        min_sarimax_points=36,
+        max_sarimax_candidates=24,
+        winsorize_count_quantile=None,
+    )
 
 
 def get_session() -> Iterator[Session]:
@@ -113,9 +125,16 @@ def health() -> dict[str, bool]:
 def topic_analytics_insights(
     request: TopicAnalyticsInsightRequestDTO,
     session: Session = Depends(get_session),
+    forecast_service: PublicationForecastService = Depends(
+        get_publication_forecast_service
+    ),
 ) -> TopicAnalyticsInsightResponseDTO:
     pipeline = TopicAnalyticsPipeline(
-        TopicAnalyticsFacade(session, qdrant_adapter=get_qdrant_adapter())
+        TopicAnalyticsFacade(
+            session,
+            forecast_service=forecast_service,
+            qdrant_adapter=get_qdrant_adapter(),
+        )
     )
     return pipeline.insights(request)
 

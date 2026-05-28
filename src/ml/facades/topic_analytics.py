@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from datetime import date
 from typing import Any
-import warnings
 
+import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -17,23 +17,30 @@ from dto.topic_analytics import (
     TopicForecastPointDTO,
 )
 from ml.constants import RESEARCH_ENTITIES_COLLECTION
+from ml.services import PublicationForecastService
 
 
 class TopicAnalyticsFacade:
-    """Read-only analytics calculations for one OpenAlex Topic."""
+    """Analytics calculations for one OpenAlex Topic."""
 
     def __init__(
         self,
         session: Session,
         *,
+        forecast_service: PublicationForecastService,
         qdrant_adapter: QdrantAdapter | None = None,
     ) -> None:
         self.session = session
         self.qdrant_adapter = qdrant_adapter
+        self._forecast_service = forecast_service
 
-    def insights(self, request: TopicAnalyticsInsightRequestDTO) -> TopicAnalyticsInsightResponseDTO:
+    def insights(
+        self, request: TopicAnalyticsInsightRequestDTO
+    ) -> TopicAnalyticsInsightResponseDTO:
         errors: list[str] = []
-        monthly = self._monthly_series(request.topic_id, request.period_start, request.period_end)
+        monthly = self._monthly_series(
+            request.topic_id, request.period_start, request.period_end
+        )
         forecast: list[TopicForecastPointDTO] = []
         try:
             forecast = self._forecast(monthly, request.forecast_months)
@@ -59,7 +66,9 @@ class TopicAnalyticsFacade:
             errors=errors,
         )
 
-    def _monthly_series(self, topic_id: int, period_start: date, period_end: date) -> list[dict[str, Any]]:
+    def _monthly_series(
+        self, topic_id: int, period_start: date, period_end: date
+    ) -> list[dict[str, Any]]:
         rows = self.session.execute(
             text(
                 """
@@ -117,151 +126,212 @@ class TopicAnalyticsFacade:
                     "is_observed": bool(row["is_observed"]),
                     "topic_count": topic_count,
                     "subfield_count": subfield_count,
-                    "share": topic_count / subfield_count if subfield_count > 0 else 0.0,
+                    "share": topic_count / subfield_count
+                    if subfield_count > 0
+                    else 0.0,
                 }
             )
         return result
 
-    def _forecast(self, rows: list[dict[str, Any]], horizon: int) -> list[TopicForecastPointDTO]:
+    def _forecast(
+        self, rows: list[dict[str, Any]], horizon: int
+    ) -> list[TopicForecastPointDTO]:
         observed_rows = [row for row in rows if row.get("is_observed", True)]
         if not observed_rows:
             return []
-        pd = self._import_pandas()
         share_series = pd.Series(
             [float(row["share"]) for row in observed_rows],
             index=pd.to_datetime([row["period_start"] for row in observed_rows]),
         )
-        subfield_series = pd.Series(
+        topic_series = pd.Series(
             [float(row["topic_count"]) for row in observed_rows],
             index=pd.to_datetime([row["period_start"] for row in observed_rows]),
         )
-        share_forecast = self._forecast_series(share_series, horizon)
-        topic_forecast = self._forecast_series(subfield_series, horizon)
+        share_forecast = self._forecast_service.forecast_series(
+            share_series, horizon, kind="share"
+        )
+
+        topic_forecast = self._forecast_service.forecast_series(
+            topic_series, horizon, kind="count"
+        )
+
+        # share_forecast = self._forecast_series(share_series, horizon)
+        # topic_forecast = self._forecast_series(subfield_series, horizon)
         result: list[TopicForecastPointDTO] = []
         for index in range(min(len(share_forecast), len(topic_forecast))):
             share = max(0.0, min(1.0, float(share_forecast[index]["forecast"])))
-            lower_share = max(0.0, min(1.0, float(share_forecast[index]["lower_bound"])))
-            upper_share = max(0.0, min(1.0, float(share_forecast[index]["upper_bound"])))
+            lower_share = max(
+                0.0, min(1.0, float(share_forecast[index]["lower_bound"]))
+            )
+            upper_share = max(
+                0.0, min(1.0, float(share_forecast[index]["upper_bound"]))
+            )
             topic = max(0.0, float(topic_forecast[index]["forecast"]))
-            lower_subfield = max(0.0, float(topic_forecast[index]["lower_bound"]))
-            upper_subfield = max(0.0, float(topic_forecast[index]["upper_bound"]))
+            lower_topic = max(0.0, float(topic_forecast[index]["lower_bound"]))
+            upper_topic = max(0.0, float(topic_forecast[index]["upper_bound"]))
             result.append(
                 TopicForecastPointDTO(
                     period_start=share_forecast[index]["period_start"],
                     forecast_count=topic,
-                    lower_bound=lower_share * lower_subfield,
-                    upper_bound=upper_share * upper_subfield,
+                    lower_bound=lower_topic,
+                    upper_bound=upper_topic,
                     forecast_share=share,
                     lower_share=lower_share,
                     upper_share=upper_share,
                     model_name=f"{share_forecast[index]['model_name']} x {topic_forecast[index]['model_name']}",
                     share_model_name=share_forecast[index]["model_name"],
-                    subfield_model_name=topic_forecast[index]["model_name"],
+                    count_model_name=topic_forecast[index]["model_name"],
                     backtest_error_mae=topic_forecast[index].get("backtest_error_mae"),
-                    backtest_error_mape=topic_forecast[index].get("backtest_error_mape"),
-                    backtest_error_smape=topic_forecast[index].get("backtest_error_smape"),
+                    backtest_error_mape=topic_forecast[index].get(
+                        "backtest_error_mape"
+                    ),
+                    backtest_error_smape=topic_forecast[index].get(
+                        "backtest_error_smape"
+                    ),
                 )
             )
         return result
 
-    def _forecast_series(self, series: Any, horizon: int, season_length: int = 12) -> list[dict[str, Any]]:
-        np = self._import_numpy()
-        pd = self._import_pandas()
-        clean = pd.to_numeric(series, errors="coerce").fillna(0).astype(float).sort_index()
-        if clean.empty:
-            return []
-        residual_std = float(clean.std(ddof=0)) if len(clean) > 1 else max(1.0, float(clean.mean()))
+    # ! Deprecated
+    # def _forecast_series(
+    #     self, series: Any, horizon: int, season_length: int = 12
+    # ) -> list[dict[str, Any]]:
+    #     clean = (
+    #         pd.to_numeric(series, errors="coerce").fillna(0).astype(float).sort_index()
+    #     )
+    #     if clean.empty:
+    #         return []
+    #     residual_std = (
+    #         float(clean.std(ddof=0))
+    #         if len(clean) > 1
+    #         else max(1.0, float(clean.mean()))
+    #     )
 
-        def seasonal_naive(train: Any, steps: int) -> Any:
-            if len(train) >= season_length:
-                base = train.iloc[-season_length:].to_numpy(dtype=float)
-                return np.array([base[index % season_length] for index in range(steps)])
-            value = train.tail(min(6, len(train))).mean() if len(train) else 0.0
-            return np.repeat(float(value), steps)
+    #     def seasonal_naive(train: Any, steps: int) -> Any:
+    #         if len(train) >= season_length:
+    #             base = train.iloc[-season_length:].to_numpy(dtype=float)
+    #             return np.array([base[index % season_length] for index in range(steps)])
+    #         value = train.tail(min(6, len(train))).mean() if len(train) else 0.0
+    #         return np.repeat(float(value), steps)
 
-        def fit_predict(train: Any, steps: int) -> tuple[Any, str]:
-            train = train.astype(float)
-            if len(train) >= 60:
-                try:
-                    from statsmodels.tsa.statespace.sarimax import SARIMAX
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        model = SARIMAX(
-                            train,
-                            order=(1, 1, 1),
-                            seasonal_order=(1, 1, 1, season_length),
-                            enforce_stationarity=False,
-                            enforce_invertibility=False,
-                        ).fit(disp=False)
-                    return model.forecast(steps).to_numpy(dtype=float), "SARIMA(1,1,1)(1,1,1,12)"
-                except Exception:
-                    pass
-            try:
-                from statsmodels.tsa.holtwinters import ExponentialSmoothing
-                print("y")
-                seasonal = "add" if len(train) >= season_length * 2 else None
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    model = ExponentialSmoothing(
-                        train,
-                        trend="add",
-                        seasonal=seasonal,
-                        seasonal_periods=season_length if seasonal else None,
-                        initialization_method="estimated",
-                    ).fit(optimized=True)
-                return model.forecast(steps).to_numpy(dtype=float), "ETS/Holt-Winters"
-            except Exception:
-                fallback = "seasonal_naive" if len(train) >= season_length else "rolling_mean"
-                return seasonal_naive(train, steps), fallback
+    #     def fit_predict(train: Any, steps: int) -> tuple[Any, str]:
+    #         train = train.astype(float)
+    #         if len(train) >= 60:
+    #             try:
+    #                 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-        backtest_metrics = {"MAE": None, "MAPE": None, "SMAPE": None}
-        if len(clean) >= 24:
-            backtest_window = min(12, max(6, len(clean) // 5))
-            train = clean.iloc[:-backtest_window]
-            actual = clean.iloc[-backtest_window:]
-            predicted, _ = fit_predict(train, backtest_window)
-            predicted = np.clip(predicted, 0, None)
-            errors = actual.to_numpy(dtype=float) - predicted
-            residual_std = float(np.std(errors)) if len(errors) else residual_std
-            backtest_metrics = {
-                "MAE": float(np.mean(np.abs(errors))),
-                "MAPE": float(np.mean(np.abs(errors) / np.maximum(actual.to_numpy(dtype=float), 1)) * 100),
-                "SMAPE": float(
-                    np.mean(
-                        2 * np.abs(errors) / np.maximum(np.abs(actual.to_numpy(dtype=float)) + np.abs(predicted), 1)
-                    )
-                    * 100
-                ),
-            }
+    #                 with warnings.catch_warnings():
+    #                     warnings.simplefilter("ignore")
+    #                     model = SARIMAX(
+    #                         train,
+    #                         order=(0, 1, 1),
+    #                         seasonal_order=(0, 1, 1, season_length),
+    #                         enforce_stationarity=False,
+    #                         enforce_invertibility=False,
+    #                     ).fit(disp=False)
+    #                 return model.forecast(steps).to_numpy(
+    #                     dtype=float
+    #                 ), "SARIMA(0,1,1)(0,1,1,12)"
+    #             except Exception:
+    #                 pass
+    #         try:
+    #             from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
-        values, model_name = fit_predict(clean, horizon)
-        values = np.clip(values, 0, None)
-        forecast_index = pd.date_range(clean.index.max() + pd.DateOffset(months=1), periods=horizon, freq="MS")
-        lower = np.clip(values - 1.96 * residual_std, 0, None)
-        upper = values + 1.96 * residual_std
-        return [
-            {
-                "period_start": forecast_index[index].date(),
-                "forecast": float(values[index]),
-                "lower_bound": float(lower[index]),
-                "upper_bound": float(upper[index]),
-                "model_name": model_name,
-                "backtest_error_mae": backtest_metrics["MAE"],
-                "backtest_error_mape": backtest_metrics["MAPE"],
-                "backtest_error_smape": backtest_metrics["SMAPE"],
-            }
-            for index in range(horizon)
-        ]
+    #             print("y")
+    #             seasonal = "add" if len(train) >= season_length * 2 else None
+    #             with warnings.catch_warnings():
+    #                 warnings.simplefilter("ignore")
+    #                 model = ExponentialSmoothing(
+    #                     train,
+    #                     trend="add",
+    #                     seasonal=seasonal,
+    #                     seasonal_periods=season_length if seasonal else None,
+    #                     initialization_method="estimated",
+    #                 ).fit(optimized=True)
+    #             return model.forecast(steps).to_numpy(dtype=float), "ETS/Holt-Winters"
+    #         except Exception:
+    #             fallback = (
+    #                 "seasonal_naive" if len(train) >= season_length else "rolling_mean"
+    #             )
+    #             return seasonal_naive(train, steps), fallback
 
-    def _decomposition(self, request: TopicAnalyticsInsightRequestDTO) -> list[TopicDecompositionMetricDTO]:
+    #     backtest_metrics = {"MAE": None, "MAPE": None, "SMAPE": None}
+    #     if len(clean) >= 24:
+    #         backtest_window = min(12, max(6, len(clean) // 5))
+    #         train = clean.iloc[:-backtest_window]
+    #         actual = clean.iloc[-backtest_window:]
+    #         predicted, _ = fit_predict(train, backtest_window)
+    #         predicted = np.clip(predicted, 0, None)
+    #         errors = actual.to_numpy(dtype=float) - predicted
+    #         residual_std = float(np.std(errors)) if len(errors) else residual_std
+    #         backtest_metrics = {
+    #             "MAE": float(np.mean(np.abs(errors))),
+    #             "MAPE": float(
+    #                 np.mean(
+    #                     np.abs(errors) / np.maximum(actual.to_numpy(dtype=float), 1)
+    #                 )
+    #                 * 100
+    #             ),
+    #             "SMAPE": float(
+    #                 np.mean(
+    #                     2
+    #                     * np.abs(errors)
+    #                     / np.maximum(
+    #                         np.abs(actual.to_numpy(dtype=float)) + np.abs(predicted), 1
+    #                     )
+    #                 )
+    #                 * 100
+    #             ),
+    #         }
+
+    #     values, model_name = fit_predict(clean, horizon)
+    #     values = np.clip(values, 0, None)
+    #     forecast_index = pd.date_range(
+    #         clean.index.max() + pd.DateOffset(months=1), periods=horizon, freq="MS"
+    #     )
+    #     lower = np.clip(values - 1.96 * residual_std, 0, None)
+    #     upper = values + 1.96 * residual_std
+    #     return [
+    #         {
+    #             "period_start": forecast_index[index].date(),
+    #             "forecast": float(values[index]),
+    #             "lower_bound": float(lower[index]),
+    #             "upper_bound": float(upper[index]),
+    #             "model_name": model_name,
+    #             "backtest_error_mae": backtest_metrics["MAE"],
+    #             "backtest_error_mape": backtest_metrics["MAPE"],
+    #             "backtest_error_smape": backtest_metrics["SMAPE"],
+    #         }
+    #         for index in range(horizon)
+    #     ]
+
+    def _decomposition(
+        self, request: TopicAnalyticsInsightRequestDTO
+    ) -> list[TopicDecompositionMetricDTO]:
         keyphrase_novelty = self._keyphrase_novelty(request)
-        semantic_drift = self._semantic_drift(request.topic_id, request.period_start, request.period_end)
+        semantic_drift = self._semantic_drift(
+            request.topic_id, request.period_start, request.period_end
+        )
         return [
-            self._metric("keyphrase_novelty", "Keyphrase novelty", keyphrase_novelty, "percent", keyphrase_novelty),
-            self._metric("semantic_drift", "Semantic drift", semantic_drift, "score", None if semantic_drift is None else min(1.0, semantic_drift / 0.30)),
+            self._metric(
+                "keyphrase_novelty",
+                "Keyphrase novelty",
+                keyphrase_novelty,
+                "percent",
+                keyphrase_novelty,
+            ),
+            self._metric(
+                "semantic_drift",
+                "Semantic drift",
+                semantic_drift,
+                "score",
+                None if semantic_drift is None else min(1.0, semantic_drift / 0.30),
+            ),
         ]
 
-    def _keyphrase_novelty(self, request: TopicAnalyticsInsightRequestDTO) -> float | None:
+    def _keyphrase_novelty(
+        self, request: TopicAnalyticsInsightRequestDTO
+    ) -> float | None:
         rows = self.session.execute(
             text(
                 """
@@ -304,7 +374,9 @@ class TopicAnalyticsFacade:
             return None
         return len(current - previous) / len(current)
 
-    def _semantic_drift(self, topic_id: int, period_start: date, period_end: date) -> float | None:
+    def _semantic_drift(
+        self, topic_id: int, period_start: date, period_end: date
+    ) -> float | None:
         value = self.session.execute(
             text(
                 """
@@ -325,7 +397,9 @@ class TopicAnalyticsFacade:
         ).scalar()
         return None if value is None else float(value)
 
-    def _related_topics(self, request: TopicAnalyticsInsightRequestDTO, errors: list[str]) -> list[RelatedTopicDTO]:
+    def _related_topics(
+        self, request: TopicAnalyticsInsightRequestDTO, errors: list[str]
+    ) -> list[RelatedTopicDTO]:
         related: OrderedDict[int, RelatedTopicDTO] = OrderedDict()
         for item in self._same_subfield_related(request):
             related[item.topic_id] = item
@@ -334,14 +408,18 @@ class TopicAnalyticsFacade:
         try:
             for item in self._embedding_related(request):
                 existing = related.get(item.topic_id)
-                if existing is None or (item.similarity or 0) > (existing.similarity or 0):
+                if existing is None or (item.similarity or 0) > (
+                    existing.similarity or 0
+                ):
                     related[item.topic_id] = item
         except Exception as exc:
             errors.append(f"Embedding similarity unavailable: {exc}")
 
         return list(related.values())[: request.max_related]
 
-    def _same_subfield_related(self, request: TopicAnalyticsInsightRequestDTO) -> list[RelatedTopicDTO]:
+    def _same_subfield_related(
+        self, request: TopicAnalyticsInsightRequestDTO
+    ) -> list[RelatedTopicDTO]:
         rows = self.session.execute(
             text(
                 """
@@ -363,7 +441,11 @@ class TopicAnalyticsFacade:
                 LIMIT :limit
                 """
             ),
-            {"topic_id": request.topic_id, "period_end": request.period_end, "limit": request.max_related},
+            {
+                "topic_id": request.topic_id,
+                "period_end": request.period_end,
+                "limit": request.max_related,
+            },
         ).mappings()
         return [
             RelatedTopicDTO(
@@ -376,7 +458,9 @@ class TopicAnalyticsFacade:
             for row in rows
         ]
 
-    def _shared_keyphrase_related(self, request: TopicAnalyticsInsightRequestDTO) -> list[RelatedTopicDTO]:
+    def _shared_keyphrase_related(
+        self, request: TopicAnalyticsInsightRequestDTO
+    ) -> list[RelatedTopicDTO]:
         rows = self.session.execute(
             text(
                 """
@@ -469,10 +553,16 @@ class TopicAnalyticsFacade:
             for row in rows
         ]
 
-    def _embedding_related(self, request: TopicAnalyticsInsightRequestDTO) -> list[RelatedTopicDTO]:
+    def _embedding_related(
+        self, request: TopicAnalyticsInsightRequestDTO
+    ) -> list[RelatedTopicDTO]:
         if self.qdrant_adapter is None:
             return []
-        point = self.qdrant_adapter.retrieve(RESEARCH_ENTITIES_COLLECTION, [f"topic:{request.topic_id}"], with_vectors=True)
+        point = self.qdrant_adapter.retrieve(
+            RESEARCH_ENTITIES_COLLECTION,
+            [f"topic:{request.topic_id}"],
+            with_vectors=True,
+        )
         if not point or not point[0].vector:
             return []
         hits = self.qdrant_adapter.search(
@@ -501,9 +591,20 @@ class TopicAnalyticsFacade:
             )
         return result[: request.max_related]
 
-    def _metric(self, key: str, label: str, value: float | None, unit: str, normalized: float | None) -> TopicDecompositionMetricDTO:
+    def _metric(
+        self,
+        key: str,
+        label: str,
+        value: float | None,
+        unit: str,
+        normalized: float | None,
+    ) -> TopicDecompositionMetricDTO:
         score = None if normalized is None else max(0.0, min(1.0, float(normalized)))
-        level = None if score is None else ("high" if score >= 0.66 else "medium" if score >= 0.33 else "low")
+        level = (
+            None
+            if score is None
+            else ("high" if score >= 0.66 else "medium" if score >= 0.33 else "low")
+        )
         return TopicDecompositionMetricDTO(
             key=key,
             label=label,
@@ -512,16 +613,6 @@ class TopicAnalyticsFacade:
             normalized=score,
             level=level,
         )
-
-    def _import_pandas(self) -> Any:
-        import pandas as pd
-
-        return pd
-
-    def _import_numpy(self) -> Any:
-        import numpy as np
-
-        return np
 
 
 __all__ = ["TopicAnalyticsFacade"]
