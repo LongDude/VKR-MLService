@@ -13,7 +13,6 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-
 BASE_DIR = Path(__file__).resolve().parent
 SRC_DIR = BASE_DIR.parent
 PROJECT_DIR = SRC_DIR.parent
@@ -64,6 +63,10 @@ from ml.services.events import (
     RedisEventSink,
     TqdmEventSink,
 )
+from ml.services.openalex_paper_downloader import OpenAlexPaperDownloader
+from ml.services.openalex_paper_importer import OpenAlexPaperImporter
+from ml.services.openalex_paper_plan import OpenAlexPaperPlanService
+from ml.services.openalex_rate_limiter import AsyncRateLimiter
 from ml.workers.redis_worker import (
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
@@ -80,11 +83,6 @@ from ml.workers.redis_worker import (
     RedisMLWorker,
 )
 from ml.workers.task_handlers import MLTaskHandler
-from ingestion.openalex_topic_stats import OpenAlexTopicStatsCollector, SyncRateLimiter
-from ml.services.openalex_paper_downloader import OpenAlexPaperDownloader
-from ml.services.openalex_paper_importer import OpenAlexPaperImporter
-from ml.services.openalex_paper_plan import OpenAlexPaperPlanService
-from ml.services.openalex_rate_limiter import AsyncRateLimiter
 from models.session import create_db_engine, create_session_factory
 from repositories import (
     AuthorRepository,
@@ -99,7 +97,10 @@ from repositories import (
     TopicQuarterReportRepository,
     TrackedAreaRepository,
 )
-
+from src.ml.services.openalex_topic_stats import (
+    OpenAlexTopicStatsCollector,
+    SyncRateLimiter,
+)
 
 QUEUE_ALIASES = {
     "openalex_topic_stats": OPENALEX_TOPIC_STATS_QUEUE,
@@ -327,7 +328,9 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--max-cluster-task-size must be a positive integer.")
     if args.event_ttl_seconds <= 0:
         raise ValueError("--event-ttl-seconds must be a positive integer.")
-    max_keyword_task_size = args.max_keyword_task_size or args.keyword_extraction_batch_size
+    max_keyword_task_size = (
+        args.max_keyword_task_size or args.keyword_extraction_batch_size
+    )
     max_paper_task_size = args.max_paper_task_size or args.paper_indexing_batch_size
     max_cluster_task_size = (
         args.max_cluster_task_size or args.cluster_recompute_batch_size
@@ -720,7 +723,9 @@ def build_openalex_bootstrap_request(
         if topic_ids
         else []
     )
-    target_unit = str(message.get("target_unit") or ("topic" if topic_targets else "aggregate"))
+    target_unit = str(
+        message.get("target_unit") or ("topic" if topic_targets else "aggregate")
+    )
     if target_unit not in {"aggregate", "topic"}:
         raise ValueError("bootstrap_papers target_unit must be aggregate or topic.")
 
@@ -827,7 +832,9 @@ def build_openalex_topic_targets(
         topics = TaxonomyRepository(session).list_topics_by_ids(topic_ids)
     missing = sorted(set(topic_ids) - {int(topic.id) for topic in topics})
     if missing:
-        raise ValueError(f"Cannot build OpenAlex topic filters: missing_topic_ids={missing}")
+        raise ValueError(
+            f"Cannot build OpenAlex topic filters: missing_topic_ids={missing}"
+        )
     without_openalex = [int(topic.id) for topic in topics if not topic.openalex_id]
     if without_openalex:
         raise ValueError(
@@ -1079,7 +1086,9 @@ def build_redis_client(args: argparse.Namespace) -> Any:
     return Redis(
         host=args.redis_host or os.getenv("REDIS_HOST") or "localhost",
         port=args.redis_port or _optional_int_env("REDIS_PORT") or 6379,
-        db=args.redis_db if args.redis_db is not None else _optional_int_env("REDIS_DB") or 0,
+        db=args.redis_db
+        if args.redis_db is not None
+        else _optional_int_env("REDIS_DB") or 0,
         password=os.getenv("REDIS_PASSWORD") or None,
     )
 

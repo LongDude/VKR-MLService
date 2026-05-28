@@ -3,23 +3,12 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, is_dataclass
 from datetime import date
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, cast
 
 from core.exceptions import AppError, InvalidRequestError
 from dto.common import BatchOperationResultDTO, OperationResultDTO
 from dto.keywords import PaperKeywordExtractionBatchRequestDTO
 from dto.topic_reports import TopicQuarterReportGenerateRequestDTO
-from ingestion.openalex_topic_stats import OpenAlexTopicStatsCollector
-from ml.services.openalex_cooldown import (
-    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
-    set_openalex_cooldown,
-)
-from ml.services.cluster_dynamics_tasks import (
-    acquire_cluster_dynamics_cluster_ids,
-    build_cluster_dynamics_message,
-    release_cluster_dynamics_dedupe_keys,
-)
-from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.pipelines.cluster_dynamics_pipeline import ClusterDynamicsPipeline
 from ml.pipelines.keyword_extraction_pipeline import KeywordExtractionPipeline
 from ml.pipelines.paper_indexing_pipeline import PaperIndexingPipeline
@@ -27,7 +16,17 @@ from ml.pipelines.research_entities_pipeline import ResearchEntitiesPipeline
 from ml.pipelines.topic_quarter_report_pipeline import TopicQuarterReportPipeline
 from ml.pipelines.trend_recompute_pipeline import TrendRecomputePipeline
 from ml.pipelines.user_profile_pipeline import UserProfilePipeline
-
+from ml.services.cluster_dynamics_tasks import (
+    acquire_cluster_dynamics_cluster_ids,
+    build_cluster_dynamics_message,
+    release_cluster_dynamics_dedupe_keys,
+)
+from ml.services.events import EventSink, MLEvent, NoopEventSink
+from ml.services.openalex_cooldown import (
+    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
+    set_openalex_cooldown,
+)
+from src.ml.services.openalex_topic_stats import OpenAlexTopicStatsCollector
 
 Granularity = Literal["week", "month"]
 
@@ -44,12 +43,18 @@ class MLTaskHandler:
         cluster_dynamics_pipeline: ClusterDynamicsPipeline | None = None,
         topic_quarter_report_pipeline: TopicQuarterReportPipeline | None = None,
         user_profile_pipeline: UserProfilePipeline | None = None,
-        openalex_topic_stats_collector_factory: Callable[[dict[str, Any]], OpenAlexTopicStatsCollector] | None = None,
+        openalex_topic_stats_collector_factory: Callable[
+            [dict[str, Any]], OpenAlexTopicStatsCollector
+        ]
+        | None = None,
         openalex_paper_bootstrap_runner: Callable[[dict[str, Any]], Any] | None = None,
         redis_adapter: Any | None = None,
         event_sink: EventSink | None = None,
         cluster_recompute_workers: int = 1,
-        cluster_recompute_pipeline_factory: Callable[[], tuple[TrendRecomputePipeline, Any]] | None = None,
+        cluster_recompute_pipeline_factory: Callable[
+            [], tuple[TrendRecomputePipeline, Any]
+        ]
+        | None = None,
     ) -> None:
         self.session = session
         self.keyword_extraction_pipeline = keyword_extraction_pipeline
@@ -59,14 +64,16 @@ class MLTaskHandler:
         self.cluster_dynamics_pipeline = cluster_dynamics_pipeline
         self.topic_quarter_report_pipeline = topic_quarter_report_pipeline
         self.user_profile_pipeline = user_profile_pipeline
-        self.openalex_topic_stats_collector_factory = openalex_topic_stats_collector_factory
+        self.openalex_topic_stats_collector_factory = (
+            openalex_topic_stats_collector_factory
+        )
         self.openalex_paper_bootstrap_runner = openalex_paper_bootstrap_runner
         self.redis_adapter = redis_adapter
         self.event_sink = event_sink or NoopEventSink()
         self.cluster_recompute_workers = max(1, int(cluster_recompute_workers))
         self.cluster_recompute_pipeline_factory = cluster_recompute_pipeline_factory
 
-    def handle(self, message: dict) -> OperationResultDTO:
+    def handle(self, message: dict[str, Any]) -> OperationResultDTO:
         try:
             result = self._handle(message)
         except Exception:
@@ -77,16 +84,21 @@ class MLTaskHandler:
             self.session.commit()
         return result
 
-    def _handle(self, message: dict) -> OperationResultDTO:
+    def _handle(self, message: Any) -> OperationResultDTO:
         if not isinstance(message, dict):
             raise InvalidRequestError("Task message must be a JSON object")
+        message = cast(dict[str, Any], message)  # purely for type-checking
 
         task_type = self._required_str(message, "task_type")
         if task_type == "keyword_extraction":
             return self._handle_keyword_extraction(message)
         if task_type in {"collect_topic_stats", "collect-topic-stats"}:
             return self._handle_collect_topic_stats(message)
-        if task_type in {"bootstrap_papers", "bootstrap-papers", "resume_bootstrap_papers"}:
+        if task_type in {
+            "bootstrap_papers",
+            "bootstrap-papers",
+            "resume_bootstrap_papers",
+        }:
             return self._handle_bootstrap_papers(message)
         if task_type == "paper_indexing":
             return self._handle_paper_indexing(message)
@@ -126,8 +138,12 @@ class MLTaskHandler:
                 paper_ids=paper_ids,
                 top_k=10 if top_k is None else top_k,
                 min_score=self._optional_float(message, "min_score"),
-                skip_processed=self._bool_field(message, "skip_processed", default=True),
-                skip_non_english=self._bool_field(message, "skip_non_english", default=False),
+                skip_processed=self._bool_field(
+                    message, "skip_processed", default=True
+                ),
+                skip_non_english=self._bool_field(
+                    message, "skip_non_english", default=False
+                ),
             )
         )
         return self._batch_result(
@@ -167,7 +183,9 @@ class MLTaskHandler:
             details=self._dump_dto(response),
         )
 
-    def _handle_collect_topic_stats(self, message: dict[str, Any]) -> OperationResultDTO:
+    def _handle_collect_topic_stats(
+        self, message: dict[str, Any]
+    ) -> OperationResultDTO:
         if self.openalex_topic_stats_collector_factory is None:
             raise InvalidRequestError(
                 "Pipeline is not configured",
@@ -238,7 +256,9 @@ class MLTaskHandler:
         set_openalex_cooldown(
             self.redis_adapter,
             retry_after_seconds=result.get("retry_after_seconds"),
-            source_queue=str(source_message.get("source_queue") or "queue:openalex_topic_stats"),
+            source_queue=str(
+                source_message.get("source_queue") or "queue:openalex_topic_stats"
+            ),
             task_type="collect_topic_stats",
         )
 
@@ -307,7 +327,10 @@ class MLTaskHandler:
         topic_ids = self._topic_ids_from_message(message)
         if topic_ids:
             result = BatchOperationResultDTO(total=len(topic_ids))
-            cluster_workers = self._optional_int(message, "cluster_workers") or self.cluster_recompute_workers
+            cluster_workers = (
+                self._optional_int(message, "cluster_workers")
+                or self.cluster_recompute_workers
+            )
             cluster_workers = max(1, cluster_workers)
             self._emit(
                 "cluster_batch_started",
@@ -326,7 +349,9 @@ class MLTaskHandler:
                         force_summary=force_summary,
                         result=result,
                     )
-                    self._emit_cluster_batch_progress(index, len(topic_ids), topic_id, result)
+                    self._emit_cluster_batch_progress(
+                        index, len(topic_ids), topic_id, result
+                    )
             else:
                 with ThreadPoolExecutor(max_workers=cluster_workers) as executor:
                     futures = {
@@ -349,7 +374,9 @@ class MLTaskHandler:
                             )
                         else:
                             result.updated += 1
-                        self._emit_cluster_batch_progress(index, len(topic_ids), topic_id, result)
+                        self._emit_cluster_batch_progress(
+                            index, len(topic_ids), topic_id, result
+                        )
             self._emit(
                 "cluster_batch_completed",
                 "cluster_recompute",
@@ -363,7 +390,9 @@ class MLTaskHandler:
                 ),
                 payload=result.model_dump(mode="json"),
             )
-            self._enqueue_cluster_dynamics_if_requested(message, topic_ids, result.failed)
+            self._enqueue_cluster_dynamics_if_requested(
+                message, topic_ids, result.failed
+            )
             return self._batch_result(
                 result,
                 "Topic cluster recompute completed",
@@ -509,8 +538,7 @@ class MLTaskHandler:
             current=index,
             total=total,
             message=(
-                f"topic={topic_id} updated={result.updated} "
-                f"failed={result.failed}"
+                f"topic={topic_id} updated={result.updated} failed={result.failed}"
             ),
         )
 
@@ -544,8 +572,7 @@ class MLTaskHandler:
                 result.skipped += partial.skipped
                 result.failed += partial.failed
                 result.errors.extend(
-                    {"cluster_id": cluster_id, **error}
-                    for error in partial.errors
+                    {"cluster_id": cluster_id, **error} for error in partial.errors
                 )
             return self._batch_result(
                 result,
@@ -637,7 +664,9 @@ class MLTaskHandler:
                 "force": item.get("force", force),
                 "report_language": item.get("report_language", report_language),
             }
-            requests.append(TopicQuarterReportGenerateRequestDTO.model_validate(payload))
+            requests.append(
+                TopicQuarterReportGenerateRequestDTO.model_validate(payload)
+            )
         if not requests:
             raise InvalidRequestError("Topic report task requires at least one request")
         return requests
@@ -775,11 +804,7 @@ class MLTaskHandler:
             return None
         value = message.get(field)
         if isinstance(value, str):
-            return [
-                item.strip()
-                for item in value.split(",")
-                if item.strip()
-            ]
+            return [item.strip() for item in value.split(",") if item.strip()]
         return self._str_list_field(message, field)
 
     def _required_date(self, message: dict[str, Any], field: str) -> date:

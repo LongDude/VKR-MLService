@@ -49,7 +49,9 @@ class LMStudioEmbeddingAdapter:
             payload = response.json()
             data = payload.get("data")
             if not isinstance(data, list) or len(data) != len(texts):
-                raise ValueError("Embedding response data length does not match input length")
+                raise ValueError(
+                    "Embedding response data length does not match input length"
+                )
 
             response_model = str(payload.get("model") or model)
             total_tokens = self._extract_total_tokens(payload)
@@ -83,7 +85,9 @@ class LMStudioEmbeddingAdapter:
     def _validate_vector(self, value: Any) -> list[float]:
         if not isinstance(value, list) or not value:
             raise ValueError("Embedding vector is missing or empty")
-        if not all(isinstance(item, Real) and not isinstance(item, bool) for item in value):
+        if not all(
+            isinstance(item, Real) and not isinstance(item, bool) for item in value
+        ):
             raise ValueError("Embedding vector contains non-numeric values")
         return [float(item) for item in value]
 

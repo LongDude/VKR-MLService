@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 from core.exceptions import RedisOperationError
 
@@ -17,10 +17,10 @@ class RedisAdapter:
                 return None
             if isinstance(value, bytes):
                 value = value.decode("utf-8")
-            parsed = json.loads(value)
+            parsed: Any = json.loads(value)
             if not isinstance(parsed, dict):
                 raise ValueError("Redis value is not a JSON object")
-            return parsed
+            return cast(dict[str, Any], parsed)
         except Exception as exc:
             raise RedisOperationError(
                 f"Failed to read JSON value from Redis key {key!r}",
@@ -43,7 +43,7 @@ class RedisAdapter:
             parsed = json.loads(value)
             if not isinstance(parsed, dict):
                 raise ValueError("Redis value is not a JSON object")
-            return parsed
+            return cast(dict[str, Any], parsed)
         except Exception as exc:
             raise RedisOperationError(
                 f"Failed to consume JSON value from Redis key {key!r}",
@@ -204,7 +204,7 @@ class RedisAdapter:
         parsed = json.loads(value)
         if not isinstance(parsed, dict):
             raise ValueError("Redis queue message is not a JSON object")
-        return parsed
+        return cast(dict[str, Any], parsed)
 
 
 __all__ = ["RedisAdapter"]

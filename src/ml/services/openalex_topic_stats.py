@@ -4,13 +4,12 @@ import calendar
 import logging
 import threading
 import time
-from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from email.utils import parsedate_to_datetime
-from typing import Callable, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal, cast
 
 import httpx
 from tqdm.auto import tqdm
@@ -21,8 +20,8 @@ from core.exceptions import (
     ExternalServiceRateLimitError,
     ExternalServiceUnavailableError,
 )
-from ml.services.openalex_rate_limiter import SyncRateLimiter
 from dto.external import OpenAlexSearchFiltersDTO
+from ml.services.openalex_rate_limiter import SyncRateLimiter
 from models import Topic
 from repositories.openalex_topic_stats import (
     OpenAlexTopicMonthlyCount,
@@ -33,7 +32,6 @@ from repositories.openalex_yearly_topic_stats import (
     OpenAlexYearlyTopicStatsRepository,
 )
 from repositories.taxonomy import TaxonomyRepository
-
 
 logger = logging.getLogger(__name__)
 TaxonomyStatsScope = Literal["topic", "field", "subfield"]
@@ -67,9 +65,11 @@ class OpenAlexTopicStatsCollectionResult:
     failed: int = 0
     deferred: bool = False
     retry_after_seconds: float | None = None
-    pending_tasks: list[dict[str, object]] = field(default_factory=list)
+    pending_tasks: list[dict[str, object]] = field(
+        default_factory=list[dict[str, object]]
+    )
     dry_run: bool = False
-    errors: list[dict[str, object]] = field(default_factory=list)
+    errors: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
 
 
 @dataclass(frozen=True)
@@ -99,6 +99,7 @@ class _GroupedFetchResult:
 class _JanuaryNormalizationResult:
     expected_real_count: int
     estimated_artificial_count: int
+
 
 class OpenAlexTopicStatsCollector:
     """Collect topic/month OpenAlex work counts and upsert them into PostgreSQL."""
@@ -162,7 +163,9 @@ class OpenAlexTopicStatsCollector:
         if taxonomy_scope not in {"topic", "field", "subfield"}:
             raise ValueError("taxonomy_scope must be one of: topic, field, subfield")
         if normalize_january_first and self.yearly_stats_repository is None:
-            raise ValueError("Yearly stats repository is required for January normalization")
+            raise ValueError(
+                "Yearly stats repository is required for January normalization"
+            )
 
         periods = list(iter_month_periods(date_from, date_to))
         group_filter_parts, scope_errors = self._group_filter_parts(
@@ -466,7 +469,7 @@ class OpenAlexTopicStatsCollector:
         if value is None:
             return None
         try:
-            return float(value)
+            return float(cast(str, value))
         except (TypeError, ValueError):
             return None
 
@@ -487,8 +490,12 @@ class OpenAlexTopicStatsCollector:
         created, updated = self.stats_repository.upsert_many(pending_items)
         if pending_yearly_items:
             if self.yearly_stats_repository is None:
-                raise ValueError("Yearly stats repository is required for yearly estimates")
-            self.yearly_stats_repository.upsert_artificial_estimates(pending_yearly_items)
+                raise ValueError(
+                    "Yearly stats repository is required for yearly estimates"
+                )
+            self.yearly_stats_repository.upsert_artificial_estimates(
+                pending_yearly_items
+            )
         if self.commit_each_batch:
             self.stats_repository.session.commit()
         result.created += created
@@ -570,7 +577,9 @@ class OpenAlexTopicStatsCollector:
             )
             requests += jan1_requests
             if jan1_error is not None:
-                return _FetchResult(item=None, openalex_requests=requests, errors=[jan1_error])
+                return _FetchResult(
+                    item=None, openalex_requests=requests, errors=[jan1_error]
+                )
             normalized = normalize_january_publication_count(count, jan1_count)
             count = normalized.expected_real_count
             yearly_item = OpenAlexTopicYearlyArtificialEstimate(
@@ -730,7 +739,9 @@ class OpenAlexTopicStatsCollector:
                         per_page=group_by_page_size,
                     )
                     for group in groups:
-                        key = _normalize_external_id(group.get("key") or group.get("id"))
+                        key = _normalize_external_id(
+                            group.get("key") or group.get("id")
+                        )
                         if not key:
                             continue
                         counts[key] = int(group.get("count") or 0)
@@ -760,12 +771,16 @@ class OpenAlexTopicStatsCollector:
                     error["retry_after_seconds"] = retry_after
                     return {}, requests, error
                 if attempt >= self.max_retries:
-                    return {}, requests, self._group_error_payload(
-                        period,
-                        language,
-                        publication_type,
-                        group_by,
-                        exc,
+                    return (
+                        {},
+                        requests,
+                        self._group_error_payload(
+                            period,
+                            language,
+                            publication_type,
+                            group_by,
+                            exc,
+                        ),
                     )
                 logger.warning(
                     "OpenAlex group retry: period=%s language=%s type=%s group_by=%s attempt=%s/%s delay=%.2fs reason=%s",
@@ -784,12 +799,16 @@ class OpenAlexTopicStatsCollector:
                 httpx.HTTPError,
             ) as exc:
                 if attempt >= self.max_retries:
-                    return {}, requests, self._group_error_payload(
-                        period,
-                        language,
-                        publication_type,
-                        group_by,
-                        exc,
+                    return (
+                        {},
+                        requests,
+                        self._group_error_payload(
+                            period,
+                            language,
+                            publication_type,
+                            group_by,
+                            exc,
+                        ),
                     )
                 delay = self._retry_delay(exc, attempt)
                 logger.warning(
@@ -805,12 +824,16 @@ class OpenAlexTopicStatsCollector:
                 )
                 time.sleep(delay)
             except AppError as exc:
-                return {}, requests, self._group_error_payload(
-                    period,
-                    language,
-                    publication_type,
-                    group_by,
-                    exc,
+                return (
+                    {},
+                    requests,
+                    self._group_error_payload(
+                        period,
+                        language,
+                        publication_type,
+                        group_by,
+                        exc,
+                    ),
                 )
         return {}, requests, None
 
@@ -855,12 +878,16 @@ class OpenAlexTopicStatsCollector:
                     error["retry_after_seconds"] = retry_after
                     return 0, requests, error
                 if attempt >= self.max_retries:
-                    return 0, requests, self._error_payload(
-                        topic,
-                        period,
-                        language,
-                        publication_type,
-                        exc,
+                    return (
+                        0,
+                        requests,
+                        self._error_payload(
+                            topic,
+                            period,
+                            language,
+                            publication_type,
+                            exc,
+                        ),
                     )
                 logger.warning(
                     "OpenAlex count retry: topic_id=%s period=%s language=%s type=%s attempt=%s/%s delay=%.2fs reason=%s",
@@ -879,12 +906,16 @@ class OpenAlexTopicStatsCollector:
                 httpx.HTTPError,
             ) as exc:
                 if attempt >= self.max_retries:
-                    return 0, requests, self._error_payload(
-                        topic,
-                        period,
-                        language,
-                        publication_type,
-                        exc,
+                    return (
+                        0,
+                        requests,
+                        self._error_payload(
+                            topic,
+                            period,
+                            language,
+                            publication_type,
+                            exc,
+                        ),
                     )
                 delay = self._retry_delay(exc, attempt)
                 logger.warning(
@@ -900,12 +931,16 @@ class OpenAlexTopicStatsCollector:
                 )
                 time.sleep(delay)
             except AppError as exc:
-                return 0, requests, self._error_payload(
-                    topic,
-                    period,
-                    language,
-                    publication_type,
-                    exc,
+                return (
+                    0,
+                    requests,
+                    self._error_payload(
+                        topic,
+                        period,
+                        language,
+                        publication_type,
+                        exc,
+                    ),
                 )
         return 0, requests, None
 
@@ -989,9 +1024,7 @@ class OpenAlexTopicStatsCollector:
             subfields = self.taxonomy_repository.list_subfields_by_ids(subfield_ids)
             found = {int(subfield.id) for subfield in subfields}
             missing = [
-                subfield_id
-                for subfield_id in subfield_ids
-                if subfield_id not in found
+                subfield_id for subfield_id in subfield_ids if subfield_id not in found
             ]
             openalex_ids = [
                 _normalize_external_id(subfield.openalex_id)
@@ -1068,11 +1101,9 @@ class OpenAlexTopicStatsCollector:
         return min(30.0, 0.5 * (2**attempt))
 
     def _retry_after_seconds(self, exc: Exception) -> float | None:
-        details = getattr(exc, "details", None)
-        retry_after = (
-            details.get("retry_after")
-            if isinstance(details, dict)
-            else None
+        details = cast(dict[str, Any] | None, getattr(exc, "details", None))
+        retry_after: Any = (
+            details.get("retry_after") if isinstance(details, dict) else None
         )
         if isinstance(retry_after, str):
             return self._parse_retry_after(retry_after)

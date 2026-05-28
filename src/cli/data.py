@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 
-
 BASE_DIR = Path(__file__).resolve().parent
 SRC_DIR = BASE_DIR.parent
 PROJECT_DIR = SRC_DIR.parent
@@ -24,6 +23,12 @@ if str(SRC_DIR) not in sys.path:
 
 from adapters.redis_adapter import RedisAdapter
 from core.config import Settings
+from ml.services.cluster_dynamics_tasks import (
+    acquire_cluster_dynamics_cluster_ids,
+    build_cluster_dynamics_message,
+    release_cluster_dynamics_dedupe_keys,
+)
+from ml.services.quarter_periods import QuarterPeriodService
 from models import (
     Domain,
     Field,
@@ -39,14 +44,7 @@ from models import (
     TopicQuarterReport,
 )
 from models.session import create_db_engine, create_session_factory
-from ml.services.cluster_dynamics_tasks import (
-    acquire_cluster_dynamics_cluster_ids,
-    build_cluster_dynamics_message,
-    release_cluster_dynamics_dedupe_keys,
-)
-from ml.services.quarter_periods import QuarterPeriodService
 from repositories.openalex_yearly_topic_stats import OpenAlexYearlyTopicStatsRepository
-
 
 SAMPLE_LIMIT = 20
 OPENALEX_TOPIC_STATS_QUEUE = "queue:openalex_topic_stats"
@@ -308,7 +306,9 @@ class LocalDataValidator:
         self,
         fixes: dict[str, list[dict[str, Any]]],
     ) -> None:
-        result = self.session.execute(delete(Keyword).where(self._is_blank(Keyword.value)))
+        result = self.session.execute(
+            delete(Keyword).where(self._is_blank(Keyword.value))
+        )
         self._append_applied(
             fixes,
             "delete_empty_keywords",
@@ -322,7 +322,9 @@ class LocalDataValidator:
     ) -> None:
         rows = list(
             self.session.execute(
-                select(Keyword.id, Keyword.value).where(self._is_not_blank(Keyword.value))
+                select(Keyword.id, Keyword.value).where(
+                    self._is_not_blank(Keyword.value)
+                )
             )
         )
         normalized_groups: dict[str, list[int]] = defaultdict(list)
@@ -340,9 +342,7 @@ class LocalDataValidator:
                 skipped += 1
                 continue
             self.session.execute(
-                update(Keyword)
-                .where(Keyword.id == keyword_id)
-                .values(value=normalized)
+                update(Keyword).where(Keyword.id == keyword_id).values(value=normalized)
             )
             updated += 1
 
@@ -412,7 +412,9 @@ class LocalDataValidator:
                 skipped += 1
                 continue
             self.session.execute(
-                update(model).where(id_column == row_id).values({value_column.key: normalized})
+                update(model)
+                .where(id_column == row_id)
+                .values({value_column.key: normalized})
             )
             updated += 1
 
@@ -664,7 +666,10 @@ class DataCoverageAnalyzer:
                 "sample_count": 0,
             }
             for period in months
-            if sum(counts.get((int(topic["topic_id"]), period["key"]), 0) for topic in topics)
+            if sum(
+                counts.get((int(topic["topic_id"]), period["key"]), 0)
+                for topic in topics
+            )
             == 0
         ]
         return coverage
@@ -696,7 +701,9 @@ class DataCoverageAnalyzer:
                     ResearchClusterPeriodStat.period_start.in_(month_starts),
                 )
             )
-            for cluster_key, source_topic_id, period_start in self.session.execute(stmt):
+            for cluster_key, source_topic_id, period_start in self.session.execute(
+                stmt
+            ):
                 topic_id = (
                     int(source_topic_id)
                     if source_topic_id is not None
@@ -780,8 +787,7 @@ class DataCoverageAnalyzer:
                 }
                 if include_missing_topic_ids:
                     item["topic_ids"] = [
-                        int(topic["topic_id"])
-                        for topic in missing_topics
+                        int(topic["topic_id"]) for topic in missing_topics
                     ]
                 missing_by_period.append(item)
 
@@ -1077,9 +1083,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     coverage_parser = subparsers.add_parser(
         "analyze-coverage",
         aliases=["analyze-data-coverage"],
-        help=(
-            "Analyze monthly and quarterly database coverage for fields or topics."
-        ),
+        help=("Analyze monthly and quarterly database coverage for fields or topics."),
     )
     coverage_parser.add_argument(
         "--date-from",
@@ -1678,7 +1682,9 @@ def run_analyze_sample_month_coverage(args: argparse.Namespace) -> dict[str, Any
                     per_page=args.per_page,
                     max_retries=args.max_retries,
                     skip_existing=bool(args.skip_existing),
-                    enqueue_indexing=bool(args.enqueue_indexing or args.enqueue_missing_samples),
+                    enqueue_indexing=bool(
+                        args.enqueue_indexing or args.enqueue_missing_samples
+                    ),
                     enqueue_cluster_dynamics=True,
                     primary_topic_only=bool(args.primary_topic_only),
                     openalex_url=args.openalex_url,
@@ -1729,7 +1735,9 @@ def enqueue_missing_sample_tasks(
                 "Coverage report does not include full missing topic ids. "
                 "Run analyzer with include_missing_topic_ids enabled."
             )
-        for chunk in chunked_ints([int(topic_id) for topic_id in topic_ids], task_batch_size):
+        for chunk in chunked_ints(
+            [int(topic_id) for topic_id in topic_ids], task_batch_size
+        ):
             messages.append(
                 {
                     "task_type": "bootstrap_papers",
@@ -1759,7 +1767,11 @@ def enqueue_missing_sample_tasks(
                     "workflow_granularity": "month",
                     "show_progress": False,
                     **({"openalex_url": openalex_url} if openalex_url else {}),
-                    **({"openalex_api_key": openalex_api_key} if openalex_api_key else {}),
+                    **(
+                        {"openalex_api_key": openalex_api_key}
+                        if openalex_api_key
+                        else {}
+                    ),
                     **({"openalex_mailto": openalex_mailto} if openalex_mailto else {}),
                 }
             )
@@ -1790,7 +1802,9 @@ def enqueue_missing_cluster_dynamics_tasks(
     messages: list[dict[str, Any]] = []
     missing_periods = cluster_dynamics.get("missing_by_period", [])
     if not isinstance(missing_periods, list):
-        raise ValueError("Coverage report cluster_dynamics.missing_by_period is invalid.")
+        raise ValueError(
+            "Coverage report cluster_dynamics.missing_by_period is invalid."
+        )
 
     for period in missing_periods:
         topic_ids = period.get("topic_ids") if isinstance(period, dict) else None
@@ -1868,7 +1882,9 @@ def enqueue_missing_topic_stats_tasks(
     messages: list[dict[str, Any]] = []
     missing_periods = publication_stats.get("missing_by_period", [])
     if not isinstance(missing_periods, list):
-        raise ValueError("Coverage report publication_stats.missing_by_period is invalid.")
+        raise ValueError(
+            "Coverage report publication_stats.missing_by_period is invalid."
+        )
 
     for period in missing_periods:
         topic_ids = period.get("topic_ids") if isinstance(period, dict) else None
@@ -1877,7 +1893,9 @@ def enqueue_missing_topic_stats_tasks(
                 "Coverage report does not include full missing topic ids. "
                 "Run analyzer with include_missing_topic_ids enabled."
             )
-        for chunk in chunked_ints([int(topic_id) for topic_id in topic_ids], task_batch_size):
+        for chunk in chunked_ints(
+            [int(topic_id) for topic_id in topic_ids], task_batch_size
+        ):
             messages.append(
                 {
                     "task_type": "collect_topic_stats",
@@ -1896,7 +1914,11 @@ def enqueue_missing_topic_stats_tasks(
                     "primary_topic_only": bool(primary_topic_only),
                     "show_progress": False,
                     **({"openalex_url": openalex_url} if openalex_url else {}),
-                    **({"openalex_api_key": openalex_api_key} if openalex_api_key else {}),
+                    **(
+                        {"openalex_api_key": openalex_api_key}
+                        if openalex_api_key
+                        else {}
+                    ),
                     **({"openalex_mailto": openalex_mailto} if openalex_mailto else {}),
                 }
             )
@@ -1908,7 +1930,9 @@ def enqueue_missing_topic_stats_tasks(
         "queue": queue_name,
         "priority": "max",
         "source_check": "publication_stats",
-        "missing_topic_periods": int(publication_stats.get("missing_topic_periods") or 0),
+        "missing_topic_periods": int(
+            publication_stats.get("missing_topic_periods") or 0
+        ),
         "messages": len(messages),
         "task_batch_size": task_batch_size,
         "sample": messages[:3],
@@ -2013,8 +2037,7 @@ def _january_anomaly_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "rows": len(rows),
         "affected_topics": len(affected_topics),
         "artifical_pubdates_estimation": sum(
-            int(row["artifical_pubdates_estimation"] or 0)
-            for row in rows
+            int(row["artifical_pubdates_estimation"] or 0) for row in rows
         ),
         "by_year": _finalize_anomaly_groups(by_year.values()),
         "by_field": _finalize_anomaly_groups(by_field.values()),
@@ -2063,7 +2086,9 @@ def build_report(
     if initial_checks is not None:
         report["initial_summary"] = {
             "total_issues": sum(int(check["count"]) for check in initial_checks),
-            "checks_failed": sum(1 for check in initial_checks if int(check["count"]) > 0),
+            "checks_failed": sum(
+                1 for check in initial_checks if int(check["count"]) > 0
+            ),
         }
         report["initial_checks"] = initial_checks
     return report
@@ -2109,7 +2134,9 @@ def parse_int_csv_arg(value: str) -> list[int]:
         try:
             result.append(int(item))
         except ValueError as exc:
-            raise ValueError(f"Expected comma-separated integer ids, got {item!r}.") from exc
+            raise ValueError(
+                f"Expected comma-separated integer ids, got {item!r}."
+            ) from exc
     return result
 
 
@@ -2213,7 +2240,9 @@ def build_redis_client(args: argparse.Namespace) -> Any:
     return Redis(
         host=args.redis_host or os.getenv("REDIS_HOST") or "localhost",
         port=args.redis_port or _optional_int_env("REDIS_PORT") or 6379,
-        db=args.redis_db if args.redis_db is not None else _optional_int_env("REDIS_DB") or 0,
+        db=args.redis_db
+        if args.redis_db is not None
+        else _optional_int_env("REDIS_DB") or 0,
         password=os.getenv("REDIS_PASSWORD") or None,
     )
 

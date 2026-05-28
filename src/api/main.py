@@ -18,8 +18,15 @@ from core.exceptions import (
     InsufficientUserProfileDataError,
     InvalidRequestError,
 )
-from dto.recommendations import RecommendationRequestDTO, RecommendationResponseDTO, UserProfileDTO
-from dto.topic_analytics import TopicAnalyticsInsightRequestDTO, TopicAnalyticsInsightResponseDTO
+from dto.recommendations import (
+    RecommendationRequestDTO,
+    RecommendationResponseDTO,
+    UserProfileDTO,
+)
+from dto.topic_analytics import (
+    TopicAnalyticsInsightRequestDTO,
+    TopicAnalyticsInsightResponseDTO,
+)
 from ml.facades.recommendations import RecommendationFacade
 from ml.facades.topic_analytics import TopicAnalyticsFacade
 from ml.facades.user_profile import UserProfileFacade
@@ -48,7 +55,9 @@ def get_qdrant_adapter() -> QdrantAdapter | None:
     settings = get_settings()
     try:
         if settings.qdrant_url:
-            return QdrantAdapter(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+            return QdrantAdapter(
+                url=settings.qdrant_url, api_key=settings.qdrant_api_key
+            )
         if settings.qdrant_host:
             return QdrantAdapter(
                 host=settings.qdrant_host,
@@ -98,7 +107,9 @@ def health() -> dict[str, bool]:
     return {"ok": True}
 
 
-@app.post("/v1/topic-analytics/insights", response_model=TopicAnalyticsInsightResponseDTO)
+@app.post(
+    "/v1/topic-analytics/insights", response_model=TopicAnalyticsInsightResponseDTO
+)
 def topic_analytics_insights(
     request: TopicAnalyticsInsightRequestDTO,
     session: Session = Depends(get_session),

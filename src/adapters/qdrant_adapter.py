@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
+from typing import Any, Protocol, TypeAlias, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from core.exceptions import QdrantIndexError
 from dto.qdrant import QdrantPayloadIndexDTO, QdrantPointDTO, QdrantSearchHitDTO
 
 try:
-    from qdrant_client import QdrantClient, models as qdrant_models
+    from qdrant_client import QdrantClient
+    from qdrant_client import models as qdrant_models
+    from qdrant_client.conversions.common_types import QueryResponse
 except ImportError:
     QdrantClient = None
     qdrant_models = None
@@ -16,6 +18,22 @@ except ImportError:
 
 ORIGINAL_POINT_ID_PAYLOAD_KEY = "_ml_original_point_id"
 POINT_ID_NAMESPACE_PREFIX = "vkr-mlservice:qdrant-point:"
+
+
+class QdrantPointLike(Protocol):
+    id: int | str
+    vector: list[float] | None
+    payload: dict[str, Any] | None
+
+
+class QdrantSearchPointLike(Protocol):
+    id: int | str
+    score: float | int
+    vector: list[float] | None
+    payload: dict[str, Any] | None
+
+
+ScrollResult: TypeAlias = tuple[list[QdrantPointLike], Any]
 
 
 class QdrantAdapter:
@@ -135,7 +153,7 @@ class QdrantAdapter:
     ) -> list[QdrantSearchHitDTO]:
         try:
             if hasattr(self._client, "query_points"):
-                result = self._client.query_points(
+                result: QueryResponse = self._client.query_points(
                     collection_name=collection_name,
                     query=vector,
                     limit=top_k,
@@ -145,14 +163,16 @@ class QdrantAdapter:
                 )
                 result = getattr(result, "points", result)
             elif hasattr(self._client, "search"):
-                result = self._client.search(
+                result: QueryResponse = self._client.search(
                     collection_name=collection_name,
                     query_vector=vector,
                     limit=top_k,
                     query_filter=filters,
                 )
             else:
-                raise RuntimeError("Qdrant client has neither query_points nor search method")
+                raise RuntimeError(
+                    "Qdrant client has neither query_points nor search method"
+                )
             return [self._to_search_hit(point) for point in result]
         except Exception as exc:
             raise self._error(
@@ -276,9 +296,11 @@ class QdrantAdapter:
         try:
             return schema_map[normalized]
         except KeyError as exc:
-            raise ValueError(f"Unsupported Qdrant payload schema: {field_schema!r}") from exc
+            raise ValueError(
+                f"Unsupported Qdrant payload schema: {field_schema!r}"
+            ) from exc
 
-    def _to_search_hit(self, point: Any) -> QdrantSearchHitDTO:
+    def _to_search_hit(self, point: QdrantSearchPointLike) -> QdrantSearchHitDTO:
         raw_payload = self._get_attr(point, "payload", {}) or {}
         return QdrantSearchHitDTO(
             id=self._public_point_id(self._get_attr(point, "id"), raw_payload),
@@ -287,15 +309,15 @@ class QdrantAdapter:
             vector=self._get_attr(point, "vector", None),
         )
 
-    def _to_point(self, point: Any) -> QdrantPointDTO:
+    def _to_point(self, point: QdrantPointLike) -> QdrantPointDTO:
         raw_payload = self._get_attr(point, "payload", {}) or {}
         return QdrantPointDTO(
             id=self._public_point_id(self._get_attr(point, "id"), raw_payload),
-            vector=self._get_attr(point, "vector", None) or [],
+            vector=self._get_attr(point, "vector", []) or [],
             payload=self._public_payload(raw_payload),
         )
 
-    def _scroll_result(self, result: Any) -> tuple[list[Any], Any]:
+    def _scroll_result(self, result: Any) -> ScrollResult:
         if isinstance(result, tuple) and len(result) == 2:
             return list(result[0]), result[1]
         points = getattr(result, "points", None)
@@ -361,7 +383,7 @@ class QdrantAdapter:
 
     def _get_attr(self, value: Any, key: str, default: Any = None) -> Any:
         if isinstance(value, dict):
-            return value.get(key, default)
+            return cast(Any, value.get(key, default))
         return getattr(value, key, default)
 
     def _error(self, message: str, exc: Exception, **details: Any) -> QdrantIndexError:
