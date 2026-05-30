@@ -8,10 +8,10 @@ from calendar import monthrange
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from dotenv import load_dotenv
-from sqlalchemy import delete, exists, func, or_, select, update
+from sqlalchemy import CursorResult, delete, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -253,11 +253,13 @@ class LocalDataValidator:
                 .where(column.is_not(None), column != func.trim(column))
                 .values({column.key: func.trim(column)})
             )
+            cursor_result = cast(CursorResult[Any], result)
+
             self._append_applied(
                 fixes,
                 "trim_strings",
                 label,
-                int(result.rowcount or 0),
+                int(cursor_result.rowcount or 0),
             )
 
     def _normalize_doi_values(
@@ -309,11 +311,13 @@ class LocalDataValidator:
         result = self.session.execute(
             delete(Keyword).where(self._is_blank(Keyword.value))
         )
+        cursor_result = cast(CursorResult[Any], result)
+
         self._append_applied(
             fixes,
             "delete_empty_keywords",
             "keywords",
-            int(result.rowcount or 0),
+            int(cursor_result.rowcount or 0),
         )
 
     def _normalize_keyword_values(

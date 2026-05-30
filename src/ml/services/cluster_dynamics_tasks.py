@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
-
 CLUSTER_DYNAMICS_DEDUPE_KEY_PREFIX = "ml:dedupe:cd"
 DEFAULT_CLUSTER_DYNAMICS_DEDUPE_TTL_SECONDS = 24 * 60 * 60
 
@@ -80,7 +79,9 @@ def build_cluster_dynamics_message(
 ) -> dict[str, Any]:
     return {
         "task_type": "cluster_dynamics_recompute",
-        "cluster_ids": list(dict.fromkeys(str(cluster_id) for cluster_id in cluster_ids)),
+        "cluster_ids": list(
+            dict.fromkeys(str(cluster_id) for cluster_id in cluster_ids)
+        ),
         "date_from": _date_key(date_from),
         "date_to": _date_key(date_to),
         "granularity": granularity,

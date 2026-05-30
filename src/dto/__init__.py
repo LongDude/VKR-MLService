@@ -17,7 +17,18 @@ from .common import (
     PaginationDTO,
     SortDTO,
 )
-from .embeddings import EmbeddingBatchRequestDTO, EmbeddingRequestDTO, EmbeddingResultDTO
+from .embeddings import (
+    EmbeddingBatchRequestDTO,
+    EmbeddingRequestDTO,
+    EmbeddingResultDTO,
+)
+from .enums import (
+    CachePolicy,
+    IndexingStatus,
+    PaperSource,
+    TrackedEntityType,
+    WorkflowGranularity,
+)
 from .errors import ErrorDetailDTO, ErrorResponseDTO
 from .external import (
     ExternalAuthorDTO,
@@ -49,8 +60,6 @@ from .openalex import (
     OpenAlexUnitSummaryDTO,
 )
 from .papers import (
-    CachePolicy,
-    IndexingStatus,
     PaperBatchIndexingRequestDTO,
     PaperCreateDTO,
     PaperDTO,
@@ -89,13 +98,6 @@ from .taxonomy import (
     TopicDTO,
     TopicWithHierarchyDTO,
 )
-from .tracked import (
-    AddTrackedEntityRequestDTO,
-    RemoveTrackedEntityRequestDTO,
-    TrackedEntityType,
-    TrackedEntityDTO,
-    UserTrackedEntitiesDTO,
-)
 from .topic_reports import (
     TopicQuarterReportBatchRequestDTO,
     TopicQuarterReportDTO,
@@ -107,6 +109,12 @@ from .topic_reports import (
     TopicQuarterReportPaperDTO,
     TopicQuarterReportPaperInputDTO,
     TopicQuarterReportPaperRole,
+)
+from .tracked import (
+    AddTrackedEntityRequestDTO,
+    RemoveTrackedEntityRequestDTO,
+    TrackedEntityDTO,
+    UserTrackedEntitiesDTO,
 )
 from .trends import (
     ClusterChartsRequestDTO,
@@ -122,6 +130,8 @@ from .trends import (
 
 __all__: list[str] = [
     "AddTrackedEntityRequestDTO",
+    "PaperSource",
+    "WorkflowGranularity",
     "AuthorCreateDTO",
     "AuthorDTO",
     "BaseDTO",

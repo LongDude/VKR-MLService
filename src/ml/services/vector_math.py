@@ -110,7 +110,9 @@ class VectorMathService:
                     "Vector weight must be numeric",
                     details={"index": index, "weight": weight},
                 )
-            vectors.append(self._validate_vector(vector, f"weighted_vectors[{index}][0]"))
+            vectors.append(
+                self._validate_vector(vector, f"weighted_vectors[{index}][0]")
+            )
             weights.append(float(weight))
 
         self._validate_same_dimension(vectors)
@@ -156,7 +158,9 @@ class VectorMathService:
                 "Vector must not be empty",
                 details={"name": name},
             )
-        if not all(isinstance(value, Real) and not isinstance(value, bool) for value in vector):
+        if not all(
+            isinstance(value, Real) and not isinstance(value, bool) for value in vector
+        ):
             raise InvalidRequestError(
                 "Vector must contain only numeric values",
                 details={"name": name},

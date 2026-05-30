@@ -12,7 +12,6 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-
 BASE_DIR = Path(__file__).resolve().parent
 SRC_DIR = BASE_DIR.parent
 PROJECT_DIR = SRC_DIR.parent
@@ -28,6 +27,7 @@ from adapters import (
 )
 from core.config import Settings
 from core.exceptions import AppError
+from dto.topic_reports import TopicQuarterReportGenerateRequestDTO
 from ml.constants import DEFAULT_EMBEDDING_MODEL
 from ml.facades import (
     ClusterAnalyticsFacade,
@@ -38,7 +38,7 @@ from ml.facades import (
     TopicQuarterReportFacade,
     UserProfileFacade,
 )
-from dto.topic_reports import TopicQuarterReportGenerateRequestDTO
+from ml.pipelines.topic_quarter_report_pipeline import TopicQuarterReportPipeline
 from ml.services.events import (
     CompositeEventSink,
     EventSink,
@@ -49,12 +49,10 @@ from ml.services.events import (
     TqdmEventSink,
 )
 from ml.services.quarter_periods import QuarterPeriodService
-from ml.pipelines.topic_quarter_report_pipeline import TopicQuarterReportPipeline
 from ml.workers.redis_worker import (
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
     ENTITY_INDEXING_QUEUE,
-    TOPIC_QUARTER_REPORT_QUEUE,
     USER_PROFILE_RECOMPUTE_QUEUE,
 )
 from models.session import create_db_engine, create_session_factory
@@ -582,7 +580,9 @@ def run_generate_topic_report(args: argparse.Namespace) -> dict[str, Any]:
                     paper_repository=PaperRepository(session),
                     research_cluster_repository=ResearchClusterRepository(session),
                     topic_report_repository=TopicQuarterReportRepository(session),
-                    openalex_topic_stats_repository=OpenAlexTopicStatsRepository(session),
+                    openalex_topic_stats_repository=OpenAlexTopicStatsRepository(
+                        session
+                    ),
                     chat_adapter=chat_adapter,
                     event_sink=event_sink,
                 )
@@ -1232,7 +1232,9 @@ def build_redis_client(args: argparse.Namespace) -> Any:
     return Redis(
         host=args.redis_host or os.getenv("REDIS_HOST") or "localhost",
         port=args.redis_port or _optional_int_env("REDIS_PORT") or 6379,
-        db=args.redis_db if args.redis_db is not None else _optional_int_env("REDIS_DB") or 0,
+        db=args.redis_db
+        if args.redis_db is not None
+        else _optional_int_env("REDIS_DB") or 0,
         password=os.getenv("REDIS_PASSWORD") or None,
     )
 

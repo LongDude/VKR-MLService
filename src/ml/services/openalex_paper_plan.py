@@ -11,7 +11,6 @@ from dto.openalex import (
 )
 from ml.services.openalex_periods import OpenAlexPeriod, OpenAlexPeriodService
 
-
 OPENALEX_MAX_SAMPLE = 10_000
 
 
@@ -93,22 +92,30 @@ class OpenAlexPaperPlanService:
             target_scope=request.target_count_scope,
         )
         if request.target_count_scope in {"total", "period"}:
-            periods = [
-                OpenAlexPeriod(
-                    key="period",
-                    date_from=min(period.date_from for period in periods),
-                    date_to=max(period.date_to for period in periods),
-                )
-            ] if periods else []
+            periods = (
+                [
+                    OpenAlexPeriod(
+                        key="period",
+                        date_from=min(period.date_from for period in periods),
+                        date_to=max(period.date_to for period in periods),
+                    )
+                ]
+                if periods
+                else []
+            )
 
         if request.target_count_unit == "topic":
             if not request.topic_targets:
-                raise InvalidRequestError("topic targets are required for topic quota units")
+                raise InvalidRequestError(
+                    "topic targets are required for topic quota units"
+                )
             units: list[OpenAlexPlanUnitDTO] = []
             for period in periods:
                 for target in request.topic_targets:
                     filter_parts = list(
-                        dict.fromkeys([*request.openalex_filter_parts, target.filter_part])
+                        dict.fromkeys(
+                            [*request.openalex_filter_parts, target.filter_part]
+                        )
                     )
                     units.append(
                         OpenAlexPlanUnitDTO(
@@ -164,7 +171,9 @@ class OpenAlexPaperPlanService:
         )
 
     def _or_filter_value(self, values: list[str], field_name: str) -> str:
-        cleaned = list(dict.fromkeys(value.strip() for value in values if value.strip()))
+        cleaned = list(
+            dict.fromkeys(value.strip() for value in values if value.strip())
+        )
         if not cleaned:
             raise InvalidRequestError(
                 f"At least one OpenAlex {field_name} value is required",

@@ -20,7 +20,6 @@ from repositories.landings import LandingRepository
 from repositories.papers import PaperRepository
 from repositories.taxonomy import TaxonomyRepository
 
-
 T = TypeVar("T")
 R = TypeVar("R")
 
@@ -200,7 +199,6 @@ class PaperUploaderFacade:
         }
 
         for paper in papers:
-            
             # Patch to catch empty titles
             if paper.title is None or paper.title == "":
                 continue
@@ -368,7 +366,9 @@ class PaperUploaderFacade:
         title = self._normalize_text(paper.title)
         if not title:
             raise InvalidRequestError("External paper title is required")
-        return paper.doi or paper.external_id or f"{title}:{paper.publication_year or ''}"
+        return (
+            paper.doi or paper.external_id or f"{title}:{paper.publication_year or ''}"
+        )
 
     def _author_key(self, author: ExternalAuthorDTO) -> str:
         value = self._normalize_text(author.display_name)

@@ -1,20 +1,15 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import Field
 
 from .authors import PaperAuthorDTO
 from .common import BaseDTO
+from .enums import CachePolicy, IndexingStatus, PaperSource, WorkflowGranularity
 from .taxonomy import PaperKeywordDTO, PaperTopicDTO
 
-CachePolicy = Literal[
-    "local_only",
-    "local_first_fetch_missing",
-    "force_external_refresh",
-]
-IndexingStatus = Literal["not_indexed", "pending", "indexed", "failed"]
 ExtractedKeywordsPayload = list[str] | list[dict[str, Any]]
 
 
@@ -86,12 +81,12 @@ class PaperResolveRequestDTO(BaseDTO):
     publication_year: int | None = None
     fetch_missing: bool = True
     persist_missing: bool = True
-    cache_policy: CachePolicy = "local_first_fetch_missing"
+    cache_policy: CachePolicy = CachePolicy.LOCAL_FIRST_FETCH_MISSING
 
 
 class PaperResolveResponseDTO(BaseDTO):
     paper: PaperShortDTO | None
-    source: Literal["local_cache", "external_openalex", "not_found"]
+    source: PaperSource
     was_created_locally: bool
     indexing_status: IndexingStatus | None
 
@@ -102,7 +97,7 @@ class PaperIndexingRequestDTO(BaseDTO):
     source_topic_ids: list[int] = Field(default_factory=list)
     workflow_date_from: date | None = None
     workflow_date_to: date | None = None
-    workflow_granularity: Literal["week", "month"] = "month"
+    workflow_granularity: WorkflowGranularity = WorkflowGranularity.MONTH
     enqueue_cluster_dynamics: bool = False
 
 
@@ -123,7 +118,7 @@ class PaperBatchIndexingRequestDTO(BaseDTO):
     source_topic_ids: list[int] = Field(default_factory=list)
     workflow_date_from: date | None = None
     workflow_date_to: date | None = None
-    workflow_granularity: Literal["week", "month"] = "month"
+    workflow_granularity: WorkflowGranularity = WorkflowGranularity.MONTH
     enqueue_cluster_dynamics: bool = False
 
 

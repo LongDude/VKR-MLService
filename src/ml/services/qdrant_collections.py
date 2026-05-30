@@ -133,7 +133,10 @@ class QdrantCollectionInitializer:
         )
         self.qdrant_adapter.ensure_payload_indexes(
             collection_name,
-            [self._payload_index(field_name, field_schema) for field_name, field_schema in indexes],
+            [
+                self._payload_index(field_name, field_schema)
+                for field_name, field_schema in indexes
+            ],
         )
 
     def _payload_index(

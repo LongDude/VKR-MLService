@@ -9,7 +9,6 @@ from typing import Any, Callable
 
 from dotenv import load_dotenv
 
-
 BASE_DIR = Path(__file__).resolve().parent
 SRC_DIR = BASE_DIR.parent
 PROJECT_DIR = SRC_DIR.parent
@@ -20,7 +19,6 @@ if str(SRC_DIR) not in sys.path:
 from adapters import QdrantAdapter
 from core.exceptions import AppError
 from ml.services.qdrant_collections import QdrantCollectionInitializer
-
 
 CollectionName = str
 

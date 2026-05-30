@@ -201,7 +201,9 @@ class InstitutionRepository(BaseRepository):
         for item in items:
             display_name = item.display_name.strip()
             if not display_name:
-                raise InvalidRequestError("External institution display_name is required")
+                raise InvalidRequestError(
+                    "External institution display_name is required"
+                )
             if item.ror:
                 ordered_keys.append(f"ror:{item.ror}")
                 with_ror.append(
@@ -268,7 +270,9 @@ class InstitutionRepository(BaseRepository):
             institutions_by_key[f"name:{name}"] = institution
         return [institutions_by_key[key] for key in ordered_keys]
 
-    def _institutions_by_display_names(self, names: list[str]) -> dict[str, Institution]:
+    def _institutions_by_display_names(
+        self, names: list[str]
+    ) -> dict[str, Institution]:
         if not names:
             return {}
         stmt = select(Institution).where(Institution.display_name.in_(set(names)))

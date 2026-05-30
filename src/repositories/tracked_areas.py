@@ -4,7 +4,7 @@ from typing import Any
 
 from sqlalchemy import delete, select
 
-from dto.tracked import TrackedEntityDTO, UserTrackedEntitiesDTO
+from dto.tracked import TrackedEntityDTO, TrackedEntityType, UserTrackedEntitiesDTO
 from models import (
     Domain,
     Field,
@@ -94,7 +94,9 @@ class TrackedAreaRepository(BaseRepository):
 
     def list_keyword_ids(self, user_id: int) -> list[int]:
         """List tracked keyword ids for a user."""
-        return self._list_ids(UserTrackedKeyword, user_id, UserTrackedKeyword.keyword_id)
+        return self._list_ids(
+            UserTrackedKeyword, user_id, UserTrackedKeyword.keyword_id
+        )
 
     def get_user_profile_source(self, user_id: int) -> UserTrackedEntitiesDTO:
         """Return tracked entities grouped for downstream profile construction."""
@@ -201,7 +203,7 @@ class TrackedAreaRepository(BaseRepository):
         )
         return [
             TrackedEntityDTO(
-                entity_type=entity_type,
+                entity_type=TrackedEntityType(entity_type),
                 id=entity_id,
                 name=name,
                 created_at=created_at,

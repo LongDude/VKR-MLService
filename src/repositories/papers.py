@@ -14,7 +14,6 @@ from models import Field, Paper, PaperTopic, Subfield, Topic
 
 from .base import BaseRepository
 
-
 TopicMatchMode = Literal["soft", "strict"]
 
 
@@ -251,7 +250,9 @@ class PaperRepository(BaseRepository):
     ) -> list[Paper]:
         """List papers whose publication_date falls within the optional period."""
         self._validate_topic_match(topic_match)
-        stmt = select(Paper).order_by(Paper.publication_date.desc().nullslast(), Paper.id.desc())
+        stmt = select(Paper).order_by(
+            Paper.publication_date.desc().nullslast(), Paper.id.desc()
+        )
         if date_from is not None:
             stmt = stmt.where(Paper.publication_date >= date_from)
         if date_to is not None:
@@ -515,9 +516,7 @@ class PaperRepository(BaseRepository):
         now = self._now()
         for paper_id, keywords in keywords_by_paper_id.items():
             clean_keywords = [
-                str(keyword).strip()
-                for keyword in keywords
-                if str(keyword).strip()
+                str(keyword).strip() for keyword in keywords if str(keyword).strip()
             ]
             self.session.execute(
                 update(Paper)
@@ -663,7 +662,9 @@ class PaperRepository(BaseRepository):
         return item.external_id.strip()
 
     def _update_papers(self, paper_ids: list[int], **values: Any) -> None:
-        self.session.execute(update(Paper).where(Paper.id.in_(paper_ids)).values(**values))
+        self.session.execute(
+            update(Paper).where(Paper.id.in_(paper_ids)).values(**values)
+        )
 
     def _apply_keyword_extraction_filters(
         self,

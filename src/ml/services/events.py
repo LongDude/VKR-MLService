@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-import logging
 from typing import Any, Protocol
 
 from adapters.redis_adapter import RedisAdapter
@@ -205,7 +205,10 @@ class TqdmEventSink:
                 continue
             if entity in {"batch", "worker_batch"} and key[1] != entity:
                 continue
-            if entity not in {"run", "all", "batch", "worker_batch"} and key[1] not in {entity, "run"}:
+            if entity not in {"run", "all", "batch", "worker_batch"} and key[1] not in {
+                entity,
+                "run",
+            }:
                 continue
             self._bars.pop(key).close()
             self._last_current.pop(key, None)

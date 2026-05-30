@@ -8,7 +8,9 @@ from typing import Any
 
 
 class QdrantPayloadBuilder:
-    def build_paper_payload(self, paper: Any = None, **overrides: Any) -> dict[str, Any]:
+    def build_paper_payload(
+        self, paper: Any = None, **overrides: Any
+    ) -> dict[str, Any]:
         data = self._merge_source(paper, overrides)
         topics = data.get("topics")
         keywords = data.get("keywords")
@@ -111,13 +113,19 @@ class QdrantPayloadBuilder:
             "acceleration": data.get("acceleration"),
             "trend_score": self._first(data, "trend_score", source=metrics),
             "semantic_drift": self._first(data, "semantic_drift", source=metrics),
-            "citation_count_sum": self._first(data, "citation_count_sum", source=metrics),
-            "avg_cited_by_count": self._first(data, "avg_cited_by_count", source=metrics),
+            "citation_count_sum": self._first(
+                data, "citation_count_sum", source=metrics
+            ),
+            "avg_cited_by_count": self._first(
+                data, "avg_cited_by_count", source=metrics
+            ),
             "top_keywords": data.get("top_keywords"),
             "representative_paper_ids": data.get("representative_paper_ids"),
             "indexed_paper_count": data.get("indexed_paper_count"),
             "vector_retrieve_batch_size": data.get("vector_retrieve_batch_size"),
-            "representative_candidate_count": data.get("representative_candidate_count"),
+            "representative_candidate_count": data.get(
+                "representative_candidate_count"
+            ),
             "summary_degraded": data.get("summary_degraded"),
             "indexed_at": data.get("indexed_at"),
         }
@@ -178,7 +186,9 @@ class QdrantPayloadBuilder:
         }
         return self._compact_json_dict(payload)
 
-    def _merge_source(self, source: Any, overrides: Mapping[str, Any]) -> dict[str, Any]:
+    def _merge_source(
+        self, source: Any, overrides: Mapping[str, Any]
+    ) -> dict[str, Any]:
         data = self._as_mapping(source)
         data.update(dict(overrides))
         return data
@@ -291,9 +301,7 @@ class QdrantPayloadBuilder:
         if isinstance(value, set):
             return [
                 item
-                for item in (
-                    self._to_jsonable(item) for item in sorted(value, key=str)
-                )
+                for item in (self._to_jsonable(item) for item in sorted(value, key=str))
                 if not self._is_empty(item)
             ]
         if hasattr(value, "model_dump"):

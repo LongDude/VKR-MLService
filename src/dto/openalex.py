@@ -7,7 +7,7 @@ from pydantic import Field
 
 from dto.common import BaseDTO
 
-
+# TODO: перевести в StrEnum
 NormalizeMode = Literal["none", "year", "month"]
 MissingStatsPolicy = Literal["error", "fetch"]
 MonthlyStatsSource = Literal["redis", "csv"]

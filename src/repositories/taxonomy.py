@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -22,8 +22,15 @@ from models import (
 
 from .base import BaseRepository
 
-
 TopicMatchMode = Literal["soft", "strict"]
+
+TaxonomyModelT = TypeVar(
+    "TaxonomyModelT",
+    Domain,
+    Field,
+    Subfield,
+    Topic,
+)
 
 
 class TaxonomyRepository(BaseRepository):
@@ -147,7 +154,9 @@ class TaxonomyRepository(BaseRepository):
     def get_or_create_keyword(self, value: str) -> Keyword:
         """Return an existing lowercase keyword or create one."""
         clean_value = value.strip().lower()
-        keyword = self.session.scalar(select(Keyword).where(Keyword.value == clean_value))
+        keyword = self.session.scalar(
+            select(Keyword).where(Keyword.value == clean_value)
+        )
         if keyword is not None:
             return keyword
         keyword = Keyword(value=clean_value)
@@ -375,10 +384,7 @@ class TaxonomyRepository(BaseRepository):
         by_fields = self._topic_ids_by_fields(field_ids or [])
         by_domains = self._topic_ids_by_domains(domain_ids or [])
         all_ids = sorted(
-            set(explicit_topics)
-            | set(by_subfields)
-            | set(by_fields)
-            | set(by_domains)
+            set(explicit_topics) | set(by_subfields) | set(by_fields) | set(by_domains)
         )
 
         return {
@@ -396,7 +402,9 @@ class TaxonomyRepository(BaseRepository):
         unique_ids = list(dict.fromkeys(int(field_id) for field_id in field_ids))
         fields = {
             field.id: field
-            for field in self.session.scalars(select(Field).where(Field.id.in_(unique_ids)))
+            for field in self.session.scalars(
+                select(Field).where(Field.id.in_(unique_ids))
+            )
         }
         return [fields[field_id] for field_id in unique_ids if field_id in fields]
 
@@ -404,7 +412,9 @@ class TaxonomyRepository(BaseRepository):
         """List subfields by ids preserving caller order where possible."""
         if not subfield_ids:
             return []
-        unique_ids = list(dict.fromkeys(int(subfield_id) for subfield_id in subfield_ids))
+        unique_ids = list(
+            dict.fromkeys(int(subfield_id) for subfield_id in subfield_ids)
+        )
         subfields = {
             subfield.id: subfield
             for subfield in self.session.scalars(
@@ -529,10 +539,10 @@ class TaxonomyRepository(BaseRepository):
 
     def _get_by_openalex_or_name(
         self,
-        model: type[Domain] | type[Field] | type[Subfield] | type[Topic],
+        model: type[TaxonomyModelT],
         openalex_id: str | None,
         name: str,
-    ):
+    ) -> TaxonomyModelT | None:
         if openalex_id:
             entity = self.session.scalar(
                 select(model).where(model.openalex_id == openalex_id)
@@ -666,7 +676,9 @@ class TaxonomyRepository(BaseRepository):
         self,
         items: list[ExternalKeywordDTO],
     ) -> dict[str, Keyword]:
-        values = sorted({item.value.strip().lower() for item in items if item.value.strip()})
+        values = sorted(
+            {item.value.strip().lower() for item in items if item.value.strip()}
+        )
         if not values:
             return {}
         stmt = pg_insert(Keyword).values([{"value": value} for value in values])
@@ -784,7 +796,9 @@ class TaxonomyRepository(BaseRepository):
             key = self._external_taxonomy_key(item)
             topic = existing_by_name.get(item.name.strip())
             if topic is None:
-                topic = self.session.scalar(select(Topic).where(Topic.name == item.name.strip()))
+                topic = self.session.scalar(
+                    select(Topic).where(Topic.name == item.name.strip())
+                )
             if topic is not None:
                 result[key] = topic
         return result
@@ -793,16 +807,18 @@ class TaxonomyRepository(BaseRepository):
         if not names:
             return {}
         stmt = pg_insert(Domain).values([{"name": name} for name in names])
-        self.session.execute(
-            stmt.on_conflict_do_nothing(index_elements=[Domain.name])
-        )
+        self.session.execute(stmt.on_conflict_do_nothing(index_elements=[Domain.name]))
         self.session.flush()
         return {
             domain.name: domain
-            for domain in self.session.scalars(select(Domain).where(Domain.name.in_(names)))
+            for domain in self.session.scalars(
+                select(Domain).where(Domain.name.in_(names))
+            )
         }
 
-    def _ensure_fields_by_name(self, names_to_domain_id: dict[str, int | None]) -> dict[str, Field]:
+    def _ensure_fields_by_name(
+        self, names_to_domain_id: dict[str, int | None]
+    ) -> dict[str, Field]:
         if not names_to_domain_id:
             return {}
         existing = {
@@ -851,7 +867,9 @@ class TaxonomyRepository(BaseRepository):
             return {}
         return {
             topic.name: topic
-            for topic in self.session.scalars(select(Topic).where(Topic.name.in_(clean_names)))
+            for topic in self.session.scalars(
+                select(Topic).where(Topic.name.in_(clean_names))
+            )
         }
 
     def _external_taxonomy_key(

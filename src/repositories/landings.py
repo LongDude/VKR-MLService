@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from sqlalchemy import update, select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.exceptions import EntityNotFoundError
@@ -82,8 +82,7 @@ class LandingRepository(BaseRepository):
             return self._upsert_bulk_postgresql(deduplicated)
 
         landings = [
-            self.upsert(paper_id, data)
-            for (paper_id, _), data in deduplicated.items()
+            self.upsert(paper_id, data) for (paper_id, _), data in deduplicated.items()
         ]
         self.session.flush()
         return landings

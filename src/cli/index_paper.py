@@ -10,7 +10,6 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-
 BASE_DIR = Path(__file__).resolve().parent
 SRC_DIR = BASE_DIR.parent
 PROJECT_DIR = SRC_DIR.parent
@@ -21,6 +20,7 @@ if str(SRC_DIR) not in sys.path:
 from adapters import LMStudioEmbeddingAdapter, QdrantAdapter, RedisAdapter
 from core.config import Settings
 from core.exceptions import AppError, InvalidRequestError
+from dto.papers import PaperBatchIndexingRequestDTO
 from ml.constants import DEFAULT_EMBEDDING_MODEL
 from ml.facades import PaperIndexingFacade
 from models.session import create_db_engine, create_session_factory
@@ -30,7 +30,6 @@ from repositories import (
     PaperRepository,
     TaxonomyRepository,
 )
-from dto.papers import PaperBatchIndexingRequestDTO
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -294,7 +293,9 @@ def build_redis_client(args: argparse.Namespace) -> Any:
     return Redis(
         host=args.redis_host or os.getenv("REDIS_HOST") or "localhost",
         port=args.redis_port or _optional_int_env("REDIS_PORT") or 6379,
-        db=args.redis_db if args.redis_db is not None else _optional_int_env("REDIS_DB") or 0,
+        db=args.redis_db
+        if args.redis_db is not None
+        else _optional_int_env("REDIS_DB") or 0,
         password=os.getenv("REDIS_PASSWORD") or None,
     )
 

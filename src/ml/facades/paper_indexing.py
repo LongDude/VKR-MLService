@@ -20,12 +20,6 @@ from dto.papers import (
     PaperIndexingResponseDTO,
 )
 from dto.qdrant import QdrantPointDTO
-from repositories.authors import AuthorRepository
-from repositories.institutions import InstitutionRepository
-from repositories.papers import PaperRepository
-from repositories.taxonomy import TaxonomyRepository
-from utils.hashing import calculate_text_hash
-
 from ml.constants import DEFAULT_EMBEDDING_MODEL, PAPERS_COLLECTION
 from ml.services.cluster_recompute_tasks import (
     acquire_cluster_recompute_topic_ids,
@@ -35,7 +29,12 @@ from ml.services.cluster_recompute_tasks import (
 from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.text_preparation import TextPreparationService
-
+from repositories.authors import AuthorRepository
+from repositories.institutions import InstitutionRepository
+from repositories.papers import PaperRepository
+from repositories.taxonomy import TaxonomyRepository
+from src.dto.enums import IndexingStatus
+from utils.hashing import calculate_text_hash
 
 CLUSTER_RECOMPUTE_QUEUE = "queue:cluster_recompute"
 
@@ -110,7 +109,9 @@ class PaperIndexingFacade:
             topics = self.taxonomy_repository.list_topics_by_paper(request.paper_id)
             keywords = self.taxonomy_repository.list_keywords_by_paper(request.paper_id)
 
-            topic_names = [topic.name for topic in topics if getattr(topic, "name", None)]
+            topic_names = [
+                topic.name for topic in topics if getattr(topic, "name", None)
+            ]
             keyword_values = [
                 keyword.value for keyword in keywords if getattr(keyword, "value", None)
             ]
@@ -142,7 +143,7 @@ class PaperIndexingFacade:
                 )
                 return PaperIndexingResponseDTO(
                     paper_id=request.paper_id,
-                    status="indexed",
+                    status=IndexingStatus.INDEXED,
                     message="Paper is already indexed; skipped",
                 )
 
@@ -242,7 +243,7 @@ class PaperIndexingFacade:
         )
         return PaperIndexingResponseDTO(
             paper_id=request.paper_id,
-            status="indexed",
+            status=IndexingStatus.INDEXED,
             message="Paper indexed successfully",
         )
 
@@ -433,9 +434,7 @@ class PaperIndexingFacade:
                 topic.name for topic in topics if getattr(topic, "name", None)
             ]
             keyword_values = [
-                keyword.value
-                for keyword in keywords
-                if getattr(keyword, "value", None)
+                keyword.value for keyword in keywords if getattr(keyword, "value", None)
             ]
             keyword_values = self._merge_keyword_values(
                 keyword_values,
@@ -667,9 +666,7 @@ class PaperIndexingFacade:
     ) -> bool:
         if force_reindex:
             return False
-        indexed_hashes = self.paper_repository.get_indexed_text_hashes(
-            [paper_id]
-        )
+        indexed_hashes = self.paper_repository.get_indexed_text_hashes([paper_id])
         if indexed_hashes.get(paper_id) == text_hash:
             return True
 
@@ -753,8 +750,7 @@ class PaperIndexingFacade:
         if date_from is None or date_to is None:
             return {}
         source_topic_ids = [
-            int(topic_id)
-            for topic_id in getattr(request, "source_topic_ids", []) or []
+            int(topic_id) for topic_id in getattr(request, "source_topic_ids", []) or []
         ]
         return {
             "source_topic_ids": source_topic_ids,
@@ -820,7 +816,10 @@ class PaperIndexingFacade:
     ) -> list[str]:
         result: list[str] = []
         seen: set[str] = set()
-        for value in [*taxonomy_keywords, *self._extracted_keyword_values(extracted_keywords)]:
+        for value in [
+            *taxonomy_keywords,
+            *self._extracted_keyword_values(extracted_keywords),
+        ]:
             clean_value = str(value).strip()
             if not clean_value:
                 continue

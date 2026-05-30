@@ -26,7 +26,10 @@ from ml.services.openalex_cooldown import (
     OPENALEX_TOPIC_STATS_PENDING_QUEUE,
     set_openalex_cooldown,
 )
-from src.ml.services.openalex_topic_stats import OpenAlexTopicStatsCollector
+from src.ml.services.openalex_topic_stats import (
+    OpenAlexTopicStatsCollector,
+    TaxonomyStatsScope,
+)
 
 Granularity = Literal["week", "month"]
 
@@ -198,7 +201,9 @@ class MLTaskHandler:
             topic_ids=self._optional_int_list_field(message, "topic_ids"),
             field_ids=self._optional_int_list_field(message, "field_ids"),
             subfield_ids=self._optional_int_list_field(message, "subfield_ids"),
-            taxonomy_scope=self._taxonomy_scope(message.get("taxonomy_scope", "topic")),
+            taxonomy_scope=TaxonomyStatsScope(
+                self._taxonomy_scope(message.get("taxonomy_scope", "topic"))
+            ),
             limit=self._optional_int(message, "limit"),
             offset=self._optional_int(message, "offset") or 0,
             languages=self._optional_str_list_field(message, "languages"),
@@ -703,6 +708,11 @@ class MLTaskHandler:
 
     def _required_int(self, message: dict[str, Any], field: str) -> int:
         value = message.get(field)
+        if value is None:
+            raise InvalidRequestError(
+                "Required task field couldn't be read",
+                details={"field": field, "value": value},
+            )
         try:
             return int(value)
         except (TypeError, ValueError) as exc:
@@ -850,7 +860,7 @@ class MLTaskHandler:
             return value.model_dump(mode="json")
         if hasattr(value, "dict"):
             return value.dict()
-        if is_dataclass(value):
+        if is_dataclass(value) and not isinstance(value, type):
             return asdict(value)
         if isinstance(value, dict):
             return value

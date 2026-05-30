@@ -30,7 +30,9 @@ class Settings:
             database_url=database_url,
             qdrant_url=os.getenv("QDRANT_URL") or None,
             qdrant_host=os.getenv("QDRANT_HOST") or None,
-            qdrant_port=int(qdrant_port) if qdrant_port and qdrant_port.isdigit() else None,
+            qdrant_port=int(qdrant_port)
+            if qdrant_port and qdrant_port.isdigit()
+            else None,
             qdrant_api_key=os.getenv("QDRANT_API_KEY") or None,
         )
 

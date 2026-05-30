@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from datetime import date
+
 from dto.common import BatchOperationResultDTO
 from dto.papers import (
     PaperBatchIndexingRequestDTO,
     PaperIndexingRequestDTO,
     PaperIndexingResponseDTO,
+    WorkflowGranularity,
 )
 from ml.facades.paper_indexing import PaperIndexingFacade
 
@@ -18,8 +21,8 @@ class PaperIndexingPipeline:
         paper_id: int,
         force_reindex: bool = False,
         source_topic_ids: list[int] | None = None,
-        workflow_date_from: object | None = None,
-        workflow_date_to: object | None = None,
+        workflow_date_from: date | None = None,
+        workflow_date_to: date | None = None,
         workflow_granularity: str = "month",
         enqueue_cluster_dynamics: bool = False,
     ) -> PaperIndexingResponseDTO:
@@ -30,7 +33,7 @@ class PaperIndexingPipeline:
                 source_topic_ids=source_topic_ids or [],
                 workflow_date_from=workflow_date_from,
                 workflow_date_to=workflow_date_to,
-                workflow_granularity=workflow_granularity,
+                workflow_granularity=WorkflowGranularity(workflow_granularity),
                 enqueue_cluster_dynamics=enqueue_cluster_dynamics,
             )
         )
@@ -40,8 +43,8 @@ class PaperIndexingPipeline:
         paper_ids: list[int],
         force_reindex: bool = False,
         source_topic_ids: list[int] | None = None,
-        workflow_date_from: object | None = None,
-        workflow_date_to: object | None = None,
+        workflow_date_from: date | None = None,
+        workflow_date_to: date | None = None,
         workflow_granularity: str = "month",
         enqueue_cluster_dynamics: bool = False,
     ) -> BatchOperationResultDTO:
@@ -52,7 +55,7 @@ class PaperIndexingPipeline:
                 source_topic_ids=source_topic_ids or [],
                 workflow_date_from=workflow_date_from,
                 workflow_date_to=workflow_date_to,
-                workflow_granularity=workflow_granularity,
+                workflow_granularity=WorkflowGranularity(workflow_granularity),
                 enqueue_cluster_dynamics=enqueue_cluster_dynamics,
             )
         )

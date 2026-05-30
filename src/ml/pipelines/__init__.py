@@ -9,6 +9,8 @@ from .research_entities_pipeline import ResearchEntitiesPipeline
 from .trend_recompute_pipeline import TrendRecomputePipeline
 from .user_profile_pipeline import UserProfilePipeline
 
+# TODO: а Pipeline в рамках проекта вообще нужны?
+
 __all__ = [
     "ClusterDynamicsPipeline",
     "KeywordExtractionPipeline",

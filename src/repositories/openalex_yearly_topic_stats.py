@@ -156,7 +156,9 @@ class OpenAlexYearlyTopicStatsRepository(BaseRepository):
                 OpenAlexMonthlyTopicStat.period_start >= date_from,
                 OpenAlexMonthlyTopicStat.period_start <= date_to,
             )
-            .order_by(OpenAlexMonthlyTopicStat.topic_id, OpenAlexMonthlyTopicStat.period_start)
+            .order_by(
+                OpenAlexMonthlyTopicStat.topic_id, OpenAlexMonthlyTopicStat.period_start
+            )
         )
         if topic_ids:
             monthly_stmt = monthly_stmt.where(
@@ -170,7 +172,9 @@ class OpenAlexYearlyTopicStatsRepository(BaseRepository):
             stat_year = date(period_start.year, 1, 1)
             yearly_counts[(int(topic_id), stat_year)] += int(works_count or 0)
 
-        artificial_by_key = self._artificial_estimates(set(yearly_counts)) if yearly_counts else {}
+        artificial_by_key = (
+            self._artificial_estimates(set(yearly_counts)) if yearly_counts else {}
+        )
         items = [
             OpenAlexTopicYearlyCount(
                 topic_id=topic_id,
@@ -216,7 +220,9 @@ class OpenAlexYearlyTopicStatsRepository(BaseRepository):
             .limit(limit)
         )
         if topic_ids:
-            stmt = stmt.where(OpenAlexYearlyTopicStat.topic_id.in_(sorted(set(topic_ids))))
+            stmt = stmt.where(
+                OpenAlexYearlyTopicStat.topic_id.in_(sorted(set(topic_ids)))
+            )
         return [
             {
                 "topic_id": stat.topic_id,

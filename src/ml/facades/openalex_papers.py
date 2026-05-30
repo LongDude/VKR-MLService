@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
 from typing import Any
 
 from adapters.redis_adapter import RedisAdapter
@@ -12,15 +13,14 @@ from dto.openalex import (
     OpenAlexPendingPageDTO,
     OpenAlexUnitSummaryDTO,
 )
+from ml.services.openalex_cooldown import set_openalex_cooldown
 from ml.services.openalex_paper_downloader import (
     OpenAlexDownloadResult,
     OpenAlexPaperDownloader,
 )
 from ml.services.openalex_paper_importer import OpenAlexPaperImporter
 from ml.services.openalex_paper_plan import OpenAlexPaperPlanService
-from ml.services.openalex_cooldown import set_openalex_cooldown
 from repositories.papers import PaperRepository
-
 
 PAPER_INDEXING_QUEUE = "queue:paper_indexing"
 
@@ -155,7 +155,9 @@ class OpenAlexPapersFacade:
         )
         enqueued = self._enqueue_indexing(imported.paper_ids) if enqueue_indexing else 0
         deferred_pages = (
-            self._enqueue_pending_pages(download.pending_pages) if download.deferred else 0
+            self._enqueue_pending_pages(download.pending_pages)
+            if download.deferred
+            else 0
         )
         if download.deferred:
             self._set_cooldown(
@@ -306,7 +308,7 @@ class OpenAlexPapersFacade:
     def _primary_topic_from_units(
         self,
         unit_keys: list[str],
-        topic_by_unit: dict[str, int | None],
+        topic_by_unit: Mapping[str, int | None],
     ) -> int | None:
         for unit_key in unit_keys:
             topic_id = topic_by_unit.get(unit_key)

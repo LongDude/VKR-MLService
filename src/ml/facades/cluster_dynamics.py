@@ -4,7 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any
 
 from adapters.qdrant_adapter import QdrantAdapter
 from core.exceptions import EntityNotFoundError, InvalidRequestError
@@ -12,19 +12,17 @@ from dto.charts import ChartAxisDTO, ChartDTO, ChartPointDTO, ChartSeriesDTO
 from dto.common import BatchOperationResultDTO
 from dto.qdrant import QdrantPointDTO
 from dto.trends import ClusterChartsResponseDTO, TrendClusterDTO, TrendMetricsDTO
-from repositories.graph import PaperGraphRepository
-from repositories.research_clusters import ResearchClusterRepository
-from repositories.taxonomy import TaxonomyRepository
-
 from ml.constants import PAPERS_COLLECTION, TREND_CLUSTER_PERIODS_COLLECTION
 from ml.services.chart_builder import ChartBuilderService
 from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.scoring import ScoringService
 from ml.services.vector_math import VectorMathService
+from repositories.graph import PaperGraphRepository
+from repositories.research_clusters import ResearchClusterRepository
+from repositories.taxonomy import TaxonomyRepository
+from src.dto.enums import WorkflowGranularity
 
-
-Granularity = Literal["week", "month"]
 REPRESENTATIVE_PAPER_LIMIT = 5
 TOP_KEYWORD_LIMIT = 10
 
@@ -70,7 +68,7 @@ class ClusterDynamicsFacade:
         cluster_id: str,
         date_from: date,
         date_to: date,
-        granularity: Granularity = "month",
+        granularity: WorkflowGranularity = WorkflowGranularity.MONTH,
     ) -> BatchOperationResultDTO:
         self._validate_period_request(date_from, date_to, granularity)
         topic_id = self._parse_topic_cluster_id(cluster_id)
@@ -134,7 +132,9 @@ class ClusterDynamicsFacade:
                 window.period_start,
                 self._count_points_for_window(all_points, window),
             )
-            previous_start = self._previous_period_start(window.period_start, granularity)
+            previous_start = self._previous_period_start(
+                window.period_start, granularity
+            )
             previous_paper_count = previous_count_map.get(
                 previous_start,
                 self._count_points_between(
@@ -178,8 +178,7 @@ class ClusterDynamicsFacade:
             )
             keyword_counts = self._keyword_counts(period_points)
             top_keywords = [
-                keyword
-                for keyword, _ in keyword_counts.most_common(TOP_KEYWORD_LIMIT)
+                keyword for keyword, _ in keyword_counts.most_common(TOP_KEYWORD_LIMIT)
             ]
 
             period_id = self._period_point_id(
@@ -278,7 +277,7 @@ class ClusterDynamicsFacade:
         cluster_id: str,
         date_from: date,
         date_to: date,
-        granularity: Granularity = "month",
+        granularity: WorkflowGranularity = WorkflowGranularity.MONTH,
     ) -> list[dict]:
         self._validate_period_request(date_from, date_to, granularity)
         self._parse_topic_cluster_id(cluster_id)
@@ -300,7 +299,7 @@ class ClusterDynamicsFacade:
         cluster_id: str,
         date_from: date,
         date_to: date,
-        granularity: Granularity = "month",
+        granularity: WorkflowGranularity = WorkflowGranularity.MONTH,
     ) -> ClusterChartsResponseDTO:
         topic = self._get_topic(cluster_id)
         periods = self.get_cluster_periods(cluster_id, date_from, date_to, granularity)
@@ -330,7 +329,7 @@ class ClusterDynamicsFacade:
         cluster_ids: list[str],
         date_from: date,
         date_to: date,
-        granularity: Granularity = "month",
+        granularity: WorkflowGranularity = WorkflowGranularity.MONTH,
     ) -> list[ChartDTO]:
         self._validate_period_request(date_from, date_to, granularity)
         clusters: list[TrendClusterDTO] = []
@@ -366,7 +365,7 @@ class ClusterDynamicsFacade:
         topic_id: int,
         date_from: date,
         date_to: date,
-        granularity: Granularity,
+        granularity: WorkflowGranularity = WorkflowGranularity.MONTH,
     ) -> dict[date, int]:
         if date_from > date_to:
             return {}
@@ -382,7 +381,7 @@ class ClusterDynamicsFacade:
         self,
         date_from: date,
         date_to: date,
-        granularity: Granularity,
+        granularity: WorkflowGranularity = WorkflowGranularity.MONTH,
     ) -> list[PeriodWindow]:
         windows: list[PeriodWindow] = []
         current = self._period_floor(date_from, granularity)
@@ -407,7 +406,9 @@ class ClusterDynamicsFacade:
         return [
             point
             for point in points
-            if self._point_date_in_window(point, window.effective_start, window.effective_end)
+            if self._point_date_in_window(
+                point, window.effective_start, window.effective_end
+            )
         ]
 
     def _count_points_for_window(
@@ -423,7 +424,9 @@ class ClusterDynamicsFacade:
         start: date,
         end: date,
     ) -> int:
-        return sum(1 for point in points if self._point_date_in_window(point, start, end))
+        return sum(
+            1 for point in points if self._point_date_in_window(point, start, end)
+        )
 
     def _point_date_in_window(
         self,
@@ -473,7 +476,9 @@ class ClusterDynamicsFacade:
             paper_id = self._paper_id_from_point(point)
             if paper_id is not None:
                 try:
-                    for keyword in self.taxonomy_repository.list_keywords_by_paper(paper_id):
+                    for keyword in self.taxonomy_repository.list_keywords_by_paper(
+                        paper_id
+                    ):
                         value = getattr(keyword, "value", None)
                         if value:
                             counter[str(value)] += 1
@@ -489,17 +494,20 @@ class ClusterDynamicsFacade:
         self,
         cluster_id: str,
         cluster_name: str,
-        periods: list[dict],
+        periods: list[dict[str, Any]],
     ) -> ChartDTO | None:
-        drift_points = [
-            ChartPointDTO(
-                x=period.get("period_start"),
-                y=float(period["semantic_drift"]),
-                meta={"cluster_id": cluster_id},
-            )
-            for period in periods
-            if period.get("semantic_drift") is not None
-        ]
+        drift_points = []
+        for period in periods:
+            sem_drift = period.get("semantic_drift")
+            start = period.get("period_start")
+            if sem_drift is not None and start is not None:
+                drift_points.append(
+                    ChartPointDTO(
+                        x=start,
+                        y=sem_drift,
+                        meta={"cluster_id": cluster_id},
+                    )
+                )
         if not drift_points:
             return None
         return ChartDTO(
@@ -559,28 +567,30 @@ class ClusterDynamicsFacade:
     def _period_point_id(
         self,
         cluster_id: str,
-        granularity: Granularity,
+        granularity: WorkflowGranularity,
         period_start: date,
     ) -> str:
         return f"{cluster_id}:{granularity}:{period_start.isoformat()}"
 
-    def _period_floor(self, value: date, granularity: Granularity) -> date:
+    def _period_floor(self, value: date, granularity: WorkflowGranularity) -> date:
         if granularity == "week":
             return value - timedelta(days=value.weekday())
         return value.replace(day=1)
 
-    def _period_end(self, value: date, granularity: Granularity) -> date:
+    def _period_end(self, value: date, granularity: WorkflowGranularity) -> date:
         if granularity == "week":
             return value + timedelta(days=6)
         next_month = self._next_month_start(value)
         return next_month - timedelta(days=1)
 
-    def _next_period_start(self, value: date, granularity: Granularity) -> date:
+    def _next_period_start(self, value: date, granularity: WorkflowGranularity) -> date:
         if granularity == "week":
             return value + timedelta(days=7)
         return self._next_month_start(value)
 
-    def _previous_period_start(self, value: date, granularity: Granularity) -> date:
+    def _previous_period_start(
+        self, value: date, granularity: WorkflowGranularity
+    ) -> date:
         if granularity == "week":
             return value - timedelta(days=7)
         previous_month_end = value.replace(day=1) - timedelta(days=1)
@@ -592,7 +602,7 @@ class ClusterDynamicsFacade:
     def _previous_start(
         self,
         first_window: PeriodWindow,
-        granularity: Granularity,
+        granularity: WorkflowGranularity,
     ) -> date:
         return self._previous_period_start(first_window.period_start, granularity)
 
@@ -629,7 +639,7 @@ class ClusterDynamicsFacade:
         self,
         date_from: date,
         date_to: date,
-        granularity: Granularity,
+        granularity: WorkflowGranularity = WorkflowGranularity.MONTH,
     ) -> None:
         if granularity not in {"week", "month"}:
             raise InvalidRequestError(

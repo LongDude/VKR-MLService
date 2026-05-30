@@ -64,12 +64,6 @@ class OpenAlexDownloadResult:
     errors: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
 
 
-#! Error client
-class _UnusedClient:
-    def get(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise RuntimeError("Synchronous OpenAlex client is not used by paper loader")
-
-
 class OpenAlexPaperDownloader:
     """Download OpenAlex works concurrently and detect exhausted quota units."""
 
@@ -95,8 +89,6 @@ class OpenAlexPaperDownloader:
         self.mailto = mailto.strip() if mailto and mailto.strip() else None
         self.rate_limit_defer_after_seconds = max(0.0, rate_limit_defer_after_seconds)
         self.transport = transport
-        #! Why?
-        self._normalizer = OpenAlexAdapter(base_url=base_url, client=_UnusedClient())
 
     async def fetch_plan(
         self,
@@ -421,7 +413,7 @@ class OpenAlexPaperDownloader:
             for raw_item in page_result["items"]:
                 result.fetched += 1
                 try:
-                    paper = self._normalizer.normalize_work(raw_item)
+                    paper = OpenAlexAdapter.normalize_work(raw_item)
                 except Exception as exc:
                     result.failed += 1
                     result.errors.append(

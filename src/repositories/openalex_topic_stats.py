@@ -129,7 +129,7 @@ class OpenAlexTopicStatsRepository(BaseRepository):
         Returns ``(created, updated)`` estimated from rows that already existed
         before the upsert. The caller owns transaction commit/rollback.
 
-        Примечание: так как подсчитать количество перезаписанных строк (UPDATE) 
+        Примечание: так как подсчитать количество перезаписанных строк (UPDATE)
         можно только доп запросом, то обновления также входят в число created
         """
         if not items:

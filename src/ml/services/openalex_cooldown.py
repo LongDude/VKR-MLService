@@ -6,7 +6,6 @@ from typing import Any
 
 from adapters.redis_adapter import RedisAdapter
 
-
 OPENALEX_COOLDOWN_KEY = "ml:cooldown:openalex"
 OPENALEX_COOLDOWN_FALLBACK_SECONDS = 900
 OPENALEX_TOPIC_STATS_PENDING_QUEUE = "queue:openalex_topic_stats_pending"

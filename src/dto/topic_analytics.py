@@ -7,6 +7,7 @@ from pydantic import Field, model_validator
 
 from .common import BaseDTO
 
+# TODO: перевести в StrEnum
 MetricLevel = Literal["low", "medium", "high"]
 RelationType = Literal["same subfield", "embedding similarity", "shared keyphrases"]
 TrendStatus = Literal["emerging", "popular", "declining", "stable"]

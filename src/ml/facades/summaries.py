@@ -6,7 +6,6 @@ from typing import Any
 from adapters.lmstudio_chat_adapter import LMStudioChatAdapter
 from core.exceptions import LLMGenerationError
 from dto.trends import ClusterSummaryDTO
-
 from ml.constants import DEFAULT_CHAT_MODEL
 from ml.services.text_preparation import TextPreparationService
 
@@ -100,9 +99,7 @@ class SummaryFacade:
         title = self._clean_text(payload.get("title"))
         summary = self._clean_text(payload.get("summary"))
         if not title or not summary:
-            raise LLMGenerationError(
-                "Cluster summary JSON is missing title or summary"
-            )
+            raise LLMGenerationError("Cluster summary JSON is missing title or summary")
 
         return ClusterSummaryDTO(
             title=title,
@@ -159,8 +156,7 @@ class SummaryFacade:
             {
                 "role": "user",
                 "content": (
-                    f"Representative titles:\n{title_lines}\n\n"
-                    f"Top keywords: {keywords}"
+                    f"Representative titles:\n{title_lines}\n\nTop keywords: {keywords}"
                 ),
             },
         ]

@@ -16,16 +16,14 @@ from dto.recommendations import (
     RecommendationResponseDTO,
     RecommendationScoreDetailsDTO,
 )
-from repositories.favourites import FavouriteRepository
-from repositories.papers import PaperRepository
-from repositories.taxonomy import TaxonomyRepository
-from utils.hashing import calculate_text_hash
-
 from ml.constants import PAPERS_COLLECTION, TREND_CLUSTERS_COLLECTION
 from ml.facades.summaries import SummaryFacade
 from ml.facades.user_profile import UserProfileFacade
 from ml.services.scoring import ScoringService
-
+from repositories.favourites import FavouriteRepository
+from repositories.papers import PaperRepository
+from repositories.taxonomy import TaxonomyRepository
+from utils.hashing import calculate_text_hash
 
 RECOMMENDATION_CACHE_TTL_SECONDS = 300
 FALLBACK_TRENDING_WINDOW_DAYS = 365 * 3
@@ -76,7 +74,9 @@ class RecommendationFacade:
         tag_topic_sets = self._topic_sets_by_selected_tags(request)
         try:
             if self.user_profile_facade is None or self.qdrant_adapter is None:
-                raise InsufficientUserProfileDataError("Qdrant profile search is unavailable")
+                raise InsufficientUserProfileDataError(
+                    "Qdrant profile search is unavailable"
+                )
             profile_vector = self.user_profile_facade.get_user_profile_vector(
                 request.user_id,
                 recompute_if_missing=True,
@@ -96,7 +96,9 @@ class RecommendationFacade:
                 self.papers_collection,
                 profile_vector,
                 top_k=self._candidate_limit(request),
-                filters=self._build_qdrant_filter(request, tag_topic_sets.get("all", [])),
+                filters=self._build_qdrant_filter(
+                    request, tag_topic_sets.get("all", [])
+                ),
             )
         except Exception as exc:
             response = self._fallback_trending_response(
@@ -176,7 +178,9 @@ class RecommendationFacade:
         tag_topic_sets: dict[str, list[int]] | None = None,
         errors: list[str] | None = None,
     ) -> RecommendationResponseDTO:
-        date_from = request.date_from or date.today() - timedelta(days=FALLBACK_TRENDING_WINDOW_DAYS)
+        date_from = request.date_from or date.today() - timedelta(
+            days=FALLBACK_TRENDING_WINDOW_DAYS
+        )
         papers = self.paper_repository.list_recent_indexed(
             date_from,
             limit=self._candidate_limit(request),
@@ -257,7 +261,9 @@ class RecommendationFacade:
                     "match": {"value": request.is_open_access},
                 }
             )
-        self._append_any_filter(must, "topic_ids", topic_filter_ids or request.topic_ids)
+        self._append_any_filter(
+            must, "topic_ids", topic_filter_ids or request.topic_ids
+        )
         self._append_any_filter(must, "keyword_ids", request.keyword_ids)
         return {"must": must} if must else None
 
@@ -323,7 +329,8 @@ class RecommendationFacade:
                 score = max(score, weight)
         return score
 
-    def _paper_topic_ids_from_model(self, paper: Any) -> list[int]:
+    @staticmethod
+    def _paper_topic_ids_from_model(paper: Any) -> list[int]:
         topic_ids: set[int] = set()
         primary_topic_id = getattr(paper, "primary_topic_id", None)
         if primary_topic_id is not None:
@@ -333,6 +340,8 @@ class RecommendationFacade:
                 pass
         for link in getattr(paper, "topic_links", []) or []:
             topic_id = getattr(link, "topic_id", None)
+            if topic_id is None:
+                continue
             try:
                 topic_ids.add(int(topic_id))
             except (TypeError, ValueError):
@@ -418,7 +427,11 @@ class RecommendationFacade:
         payload = payload or {}
         return PaperShortDTO(
             id=int(getattr(paper, "id")),
-            title=str(getattr(paper, "title", None) or payload.get("title") or "Untitled paper"),
+            title=str(
+                getattr(paper, "title", None)
+                or payload.get("title")
+                or "Untitled paper"
+            ),
             doi=getattr(paper, "doi", None) or payload.get("doi"),
             publication_year=getattr(paper, "publication_year", None)
             or self._payload_int(payload.get("publication_year")),
@@ -431,7 +444,8 @@ class RecommendationFacade:
             cited_by_count=getattr(paper, "cited_by_count", None)
             if getattr(paper, "cited_by_count", None) is not None
             else self._payload_int(payload.get("cited_by_count")) or 0,
-            openalex_id=getattr(paper, "openalex_id", None) or payload.get("openalex_id"),
+            openalex_id=getattr(paper, "openalex_id", None)
+            or payload.get("openalex_id"),
             references_count=getattr(paper, "references_count", None)
             if getattr(paper, "references_count", None) is not None
             else self._payload_int(payload.get("references_count")) or 0,
@@ -446,7 +460,10 @@ class RecommendationFacade:
         paper: Any,
         request: RecommendationRequestDTO,
     ) -> bool:
-        if request.language is not None and getattr(paper, "language", None) != request.language:
+        if (
+            request.language is not None
+            and getattr(paper, "language", None) != request.language
+        ):
             return False
         if (
             request.is_open_access is not None
@@ -480,7 +497,9 @@ class RecommendationFacade:
         interests: list[str] = []
         interests.extend(f"domain:{domain_id}" for domain_id in request.domain_ids)
         interests.extend(f"field:{field_id}" for field_id in request.field_ids)
-        interests.extend(f"subfield:{subfield_id}" for subfield_id in request.subfield_ids)
+        interests.extend(
+            f"subfield:{subfield_id}" for subfield_id in request.subfield_ids
+        )
         interests.extend(f"topic:{topic_id}" for topic_id in request.topic_ids)
         interests.extend(f"keyword:{keyword_id}" for keyword_id in request.keyword_ids)
         return interests

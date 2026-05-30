@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import delete, select
+from sqlalchemy import CursorResult, delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.exceptions import InvalidRequestError
@@ -30,7 +30,10 @@ class ResearchClusterRepository(BaseRepository):
         """List persisted period stats for one cluster and date range."""
         stmt = (
             select(ResearchClusterPeriodStat)
-            .join(ResearchCluster, ResearchCluster.id == ResearchClusterPeriodStat.cluster_id)
+            .join(
+                ResearchCluster,
+                ResearchCluster.id == ResearchClusterPeriodStat.cluster_id,
+            )
             .where(
                 ResearchCluster.cluster_key == cluster_key,
                 ResearchClusterPeriodStat.period_start >= date_from,
@@ -66,6 +69,11 @@ class ResearchClusterRepository(BaseRepository):
                     set_=update_values,
                 ).returning(ResearchCluster.id)
             )
+            if cluster_id is None:
+                raise InvalidRequestError(
+                    "Error when upserting cluster to DB",
+                    details={"cluster_key": values["cluster_key"]},
+                )
             cluster = self.session.get(ResearchCluster, int(cluster_id))
             if cluster is None:
                 raise InvalidRequestError(
@@ -124,6 +132,17 @@ class ResearchClusterRepository(BaseRepository):
                     set_=update_values,
                 ).returning(ResearchClusterPeriodStat.id)
             )
+
+            if stat_id is None:
+                raise InvalidRequestError(
+                    "Research cluster period stat upsert did not return a row",
+                    details={
+                        "cluster_key": cluster.cluster_key,
+                        "period_start": values["period_start"],
+                        "period_end": values["period_end"],
+                    },
+                )
+
             stat = self.session.get(ResearchClusterPeriodStat, int(stat_id))
             if stat is None:
                 raise InvalidRequestError(
@@ -154,7 +173,8 @@ class ResearchClusterRepository(BaseRepository):
         if cluster_keys:
             stmt = stmt.where(ResearchCluster.cluster_key.notin_(cluster_keys))
         result = self.session.execute(stmt)
-        return int(result.rowcount or 0)
+        cursor_result = cast(CursorResult[Any], result)
+        return cursor_result.rowcount or 0
 
     def delete_clusters_by_keys(self, cluster_keys: set[str]) -> int:
         """Delete clusters whose keys are explicitly listed."""
@@ -163,7 +183,8 @@ class ResearchClusterRepository(BaseRepository):
         result = self.session.execute(
             delete(ResearchCluster).where(ResearchCluster.cluster_key.in_(cluster_keys))
         )
-        return int(result.rowcount or 0)
+        cursor_result = cast(CursorResult[Any], result)
+        return cursor_result.rowcount or 0
 
     def delete_period_stats_not_in_keys(
         self,
@@ -172,17 +193,18 @@ class ResearchClusterRepository(BaseRepository):
         cluster_key: str | None = None,
     ) -> int:
         """Delete period stats whose identity was not seen in Qdrant."""
-        existing_stmt = (
-            select(
-                ResearchClusterPeriodStat.id,
-                ResearchCluster.cluster_key,
-                ResearchClusterPeriodStat.period_start,
-                ResearchClusterPeriodStat.period_end,
-            )
-            .join(ResearchCluster, ResearchCluster.id == ResearchClusterPeriodStat.cluster_id)
+        existing_stmt = select(
+            ResearchClusterPeriodStat.id,
+            ResearchCluster.cluster_key,
+            ResearchClusterPeriodStat.period_start,
+            ResearchClusterPeriodStat.period_end,
+        ).join(
+            ResearchCluster, ResearchCluster.id == ResearchClusterPeriodStat.cluster_id
         )
         if cluster_key is not None:
-            existing_stmt = existing_stmt.where(ResearchCluster.cluster_key == cluster_key)
+            existing_stmt = existing_stmt.where(
+                ResearchCluster.cluster_key == cluster_key
+            )
 
         ids_to_delete = [
             int(stat_id)
@@ -198,7 +220,8 @@ class ResearchClusterRepository(BaseRepository):
                 ResearchClusterPeriodStat.id.in_(ids_to_delete)
             )
         )
-        return int(result.rowcount or 0)
+        cursor_result = cast(CursorResult[Any], result)
+        return cursor_result.rowcount or 0
 
     def _cluster_for_period_payload(
         self,
@@ -262,12 +285,16 @@ class ResearchClusterRepository(BaseRepository):
             "period_start": period_start,
             "period_end": period_end,
             "paper_count": self._int_value(payload.get("paper_count")),
-            "previous_paper_count": self._int_value(payload.get("previous_paper_count")),
+            "previous_paper_count": self._int_value(
+                payload.get("previous_paper_count")
+            ),
             "growth_rate": self._decimal_or_none(payload.get("growth_rate")),
             "trend_score": self._decimal_or_none(payload.get("trend_score")),
             "semantic_drift": self._decimal_or_none(payload.get("semantic_drift")),
             "citation_count_sum": self._optional_int(payload.get("citation_count_sum")),
-            "avg_cited_by_count": self._decimal_or_none(payload.get("avg_cited_by_count")),
+            "avg_cited_by_count": self._decimal_or_none(
+                payload.get("avg_cited_by_count")
+            ),
             "top_keywords": payload.get("top_keywords"),
             "representative_paper_ids": payload.get("representative_paper_ids"),
             "summary": payload.get("summary"),

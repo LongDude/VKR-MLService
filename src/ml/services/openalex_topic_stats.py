@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from email.utils import parsedate_to_datetime
-from typing import Any, Callable, Iterator, Literal, cast
+from enum import StrEnum
+from typing import Any, Callable, Iterator, cast
 
 import httpx
 from tqdm.auto import tqdm
@@ -34,7 +35,12 @@ from repositories.openalex_yearly_topic_stats import (
 from repositories.taxonomy import TaxonomyRepository
 
 logger = logging.getLogger(__name__)
-TaxonomyStatsScope = Literal["topic", "field", "subfield"]
+
+
+class TaxonomyStatsScope(StrEnum):
+    TOPIC = "topic"
+    FIELD = "field"
+    SUBFIELD = "subfield"
 
 
 @dataclass(frozen=True)
@@ -140,7 +146,7 @@ class OpenAlexTopicStatsCollector:
         topic_ids: list[int] | None = None,
         field_ids: list[int] | None = None,
         subfield_ids: list[int] | None = None,
-        taxonomy_scope: TaxonomyStatsScope = "topic",
+        taxonomy_scope: TaxonomyStatsScope = TaxonomyStatsScope.TOPIC,
         limit: int | None = None,
         offset: int = 0,
         languages: list[str] | None = None,
@@ -365,7 +371,7 @@ class OpenAlexTopicStatsCollector:
         return [
             self._pending_task_payload(
                 period=period,
-                taxonomy_scope="topic",
+                taxonomy_scope=TaxonomyStatsScope.TOPIC,
                 topic_ids=[topic.id],
                 field_ids=None,
                 subfield_ids=None,

@@ -9,6 +9,7 @@ from pydantic import Field
 from .charts import ChartDTO
 from .common import BaseDTO, DateRangeDTO, PaginationDTO
 
+# Todo: StrEnum
 TrendStatus = Literal["new", "emerging", "growing", "stable", "declining"]
 
 

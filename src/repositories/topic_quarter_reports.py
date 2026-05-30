@@ -12,8 +12,11 @@ from dto.topic_reports import (
     TopicQuarterReportDTO,
     TopicQuarterReportItemDTO,
     TopicQuarterReportItemInputDTO,
+    TopicQuarterReportItemType,
+    TopicQuarterReportMaturity,
     TopicQuarterReportPaperDTO,
     TopicQuarterReportPaperInputDTO,
+    TopicQuarterReportPaperRole,
 )
 from models import (
     TopicQuarterReport,
@@ -91,6 +94,11 @@ class TopicQuarterReportRepository(BaseRepository):
                     },
                 ).returning(TopicQuarterReport.id)
             )
+            if report_id is None:
+                raise InvalidRequestError(
+                    "Topic quarter report upsert did not return an id",
+                    details={"topic_id": topic_id, "period_key": period_key},
+                )
             report = self.session.get(TopicQuarterReport, int(report_id))
             if report is None:
                 raise InvalidRequestError(
@@ -175,7 +183,9 @@ class TopicQuarterReportRepository(BaseRepository):
             TopicQuarterReport.topic_id,
             TopicQuarterReport.period_key,
         ).where(
-            TopicQuarterReport.topic_id.in_(sorted(set(int(item) for item in topic_ids))),
+            TopicQuarterReport.topic_id.in_(
+                sorted(set(int(item) for item in topic_ids))
+            ),
             TopicQuarterReport.period_key.in_(sorted(set(period_keys))),
         )
         return {
@@ -203,10 +213,10 @@ class TopicQuarterReportRepository(BaseRepository):
                 TopicQuarterReportItemDTO(
                     id=int(item.id),
                     report_id=int(item.report_id),
-                    item_type=item.item_type,
+                    item_type=TopicQuarterReportItemType(item.item_type),
                     title=item.title,
                     description=item.description,
-                    maturity=item.maturity,
+                    maturity=TopicQuarterReportMaturity(item.maturity),
                     evidence=dict(item.evidence or {}),
                     sort_order=int(item.sort_order or 0),
                     created_at=item.created_at,
@@ -217,7 +227,7 @@ class TopicQuarterReportRepository(BaseRepository):
                 TopicQuarterReportPaperDTO(
                     report_id=int(link.report_id),
                     paper_id=int(link.paper_id),
-                    role=link.role,
+                    role=TopicQuarterReportPaperRole(link.role),
                     score=link.score,
                     note=link.note,
                 )

@@ -59,7 +59,9 @@ class OpenAlexPaperImporter:
             ]
             if show_progress:
                 partial_results = []
-                with tqdm(total=len(tasks), desc="PostgreSQL import", unit="batch") as progress:
+                with tqdm(
+                    total=len(tasks), desc="PostgreSQL import", unit="batch"
+                ) as progress:
                     for task in asyncio.as_completed(tasks):
                         partial_results.append(await task)
                         progress.update(1)
@@ -121,9 +123,7 @@ class OpenAlexPaperImporter:
                     if institution.display_name and institution.display_name.strip()
                 ],
                 "topics": [
-                    topic
-                    for topic in paper.topics
-                    if topic.name and topic.name.strip()
+                    topic for topic in paper.topics if topic.name and topic.name.strip()
                 ],
                 "keywords": [
                     keyword
@@ -167,7 +167,9 @@ class OpenAlexPaperImporter:
 
         if skip_existing:
             papers_to_import = [
-                paper for paper in papers if not (self.paper_keys(paper) & existing_keys)
+                paper
+                for paper in papers
+                if not (self.paper_keys(paper) & existing_keys)
             ]
             result.existing += len(existing_papers)
         else:
@@ -202,10 +204,14 @@ class OpenAlexPaperImporter:
             return result
         except IntegrityError as exc:
             session.rollback()
-            return self._fallback_after_error(session, papers_to_import, skip_existing, exc)
+            return self._fallback_after_error(
+                session, papers_to_import, skip_existing, exc
+            )
         except Exception as exc:
             session.rollback()
-            return self._fallback_after_error(session, papers_to_import, skip_existing, exc)
+            return self._fallback_after_error(
+                session, papers_to_import, skip_existing, exc
+            )
 
     def _fallback_after_error(
         self,
@@ -270,7 +276,9 @@ class OpenAlexPaperImporter:
         target.skipped_duplicates += source.skipped_duplicates
         target.failed += source.failed
         target.paper_ids.extend(
-            paper_id for paper_id in source.paper_ids if paper_id not in target.paper_ids
+            paper_id
+            for paper_id in source.paper_ids
+            if paper_id not in target.paper_ids
         )
         target.errors.extend(source.errors)
 

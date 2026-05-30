@@ -52,8 +52,10 @@ class FavouriteRepository(BaseRepository):
 
     def count(self, user_id: int) -> int:
         """Count favourite papers for a user."""
-        stmt = select(func.count()).select_from(UserFavouritePaper).where(
-            UserFavouritePaper.user_id == user_id
+        stmt = (
+            select(func.count())
+            .select_from(UserFavouritePaper)
+            .where(UserFavouritePaper.user_id == user_id)
         )
         return int(self.session.scalar(stmt) or 0)
 

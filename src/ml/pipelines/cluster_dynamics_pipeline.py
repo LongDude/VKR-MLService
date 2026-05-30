@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Literal
 
 from dto.common import BatchOperationResultDTO
 from ml.facades.cluster_dynamics import ClusterDynamicsFacade
+from src.dto.enums import WorkflowGranularity
 
 
 class ClusterDynamicsPipeline:
@@ -16,7 +16,7 @@ class ClusterDynamicsPipeline:
         cluster_id: str,
         date_from: date,
         date_to: date,
-        granularity: Literal["week", "month"] = "month",
+        granularity: WorkflowGranularity = WorkflowGranularity.MONTH,
     ) -> BatchOperationResultDTO:
         return self.facade.recompute_cluster_periods(
             cluster_id=cluster_id,

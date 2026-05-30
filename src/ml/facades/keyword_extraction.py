@@ -39,6 +39,14 @@ except Exception:
     _PorterStemmer = None
     _nltk_wordpunct_tokenize = None
 
+try:
+    import pke as _pke
+    import pke.lang as _pke_lang
+    import pke.unsupervised as _pke_uns
+except Exception:
+    _pke = None
+    _pke_uns = None
+    _pke_lang = None
 
 logger = logging.getLogger(__name__)
 
@@ -113,11 +121,17 @@ class KeywordExtractionFacade:
         self.default_model_name = str(model_name)
         self.default_top_k = int(top_k)
         default_artifact_root = Path(__file__).resolve().parents[1] / "model_weights"
-        self.artifact_root = Path(artifact_dir).resolve() if artifact_dir is not None else default_artifact_root
+        self.artifact_root = (
+            Path(artifact_dir).resolve()
+            if artifact_dir is not None
+            else default_artifact_root
+        )
         self.models_dir = self._resolve_models_dir(self.artifact_root)
         self.manifest_path = self._find_manifest(self.models_dir)
         self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-        self.feature_columns = list(self.manifest.get("feature_columns") or FEATURE_COLUMNS)
+        self.feature_columns = list(
+            self.manifest.get("feature_columns") or FEATURE_COLUMNS
+        )
         self.filter_similar_candidates: bool = filter_similar_candidates
         self.filter_score_tolerance: float = filter_score_tolerance
         self.paper_repository = paper_repository
@@ -129,9 +143,13 @@ class KeywordExtractionFacade:
         self._model_cache: dict[str, Any] = {}
         self._english_stopwords: set[str] | None = None
 
-        self._model_index = {item["name"]: item for item in self.manifest.get("models", [])}
+        self._model_index = {
+            item["name"]: item for item in self.manifest.get("models", [])
+        }
         if self.default_model_name not in self._model_index:
-            raise ValueError(f"Unknown model_name={self.default_model_name!r}. Available models: {sorted(self._model_index)}")
+            raise ValueError(
+                f"Unknown model_name={self.default_model_name!r}. Available models: {sorted(self._model_index)}"
+            )
 
     def extract(
         self,
@@ -141,7 +159,9 @@ class KeywordExtractionFacade:
         top_k: int | None = None,
     ) -> list[list[tuple[str, float]]]:
         if isinstance(paragraphs, str):
-            raise TypeError("paragraphs must be a sequence of paragraph strings, not a single string")
+            raise TypeError(
+                "paragraphs must be a sequence of paragraph strings, not a single string"
+            )
 
         paragraph_list = [str(text) if text is not None else "" for text in paragraphs]
         if not paragraph_list:
@@ -150,12 +170,16 @@ class KeywordExtractionFacade:
         active_model_name = model_name or self.default_model_name
         limit = self.default_top_k if top_k is None else int(top_k)
         if active_model_name not in self._model_index:
-            raise ValueError(f"Unknown model_name={active_model_name!r}. Available models: {sorted(self._model_index)}")
+            raise ValueError(
+                f"Unknown model_name={active_model_name!r}. Available models: {sorted(self._model_index)}"
+            )
 
-        documents = pd.DataFrame({
-            "id": [f"paragraph_{idx}" for idx in range(len(paragraph_list))],
-            "text": paragraph_list,
-        })
+        documents = pd.DataFrame(
+            {
+                "id": [f"paragraph_{idx}" for idx in range(len(paragraph_list))],
+                "text": paragraph_list,
+            }
+        )
         pke_scores = self._collect_pke_scores(documents)
         features = self._build_candidate_features(documents, pke_scores)
         if features.empty:
@@ -180,7 +204,9 @@ class KeywordExtractionFacade:
                 for _, row in group.iterrows()
             ]
             if self.filter_similar_candidates:
-                ranked_terms = self.filter_similar_ranked_terms(ranked_terms, min_score_gap=self.filter_score_tolerance)
+                ranked_terms = self.filter_similar_ranked_terms(
+                    ranked_terms, min_score_gap=self.filter_score_tolerance
+                )
             if limit >= 0:
                 ranked_terms = ranked_terms[:limit]
             outputs.append(ranked_terms)
@@ -248,7 +274,9 @@ class KeywordExtractionFacade:
         request: PaperKeywordExtractionBatchRequestDTO,
     ) -> BatchOperationResultDTO:
         if self.paper_repository is None:
-            raise InvalidRequestError("PaperRepository is required for paper keyword extraction")
+            raise InvalidRequestError(
+                "PaperRepository is required for paper keyword extraction"
+            )
         if request.paper_ids:
             return self._extract_requested_papers(request)
         if (
@@ -276,7 +304,9 @@ class KeywordExtractionFacade:
         request: PaperKeywordExtractionBatchRequestDTO,
     ) -> BatchOperationResultDTO:
         assert self.paper_repository is not None
-        requested_ids = list(dict.fromkeys(int(paper_id) for paper_id in request.paper_ids))
+        requested_ids = list(
+            dict.fromkeys(int(paper_id) for paper_id in request.paper_ids)
+        )
         result = BatchOperationResultDTO(total=len(requested_ids))
         papers = self.paper_repository.get_by_ids(requested_ids)
         papers_by_id = {int(paper.id): paper for paper in papers}
@@ -295,7 +325,10 @@ class KeywordExtractionFacade:
                     }
                 )
                 continue
-            if request.skip_processed and getattr(paper, "extracted_keywords", None) is not None:
+            if (
+                request.skip_processed
+                and getattr(paper, "extracted_keywords", None) is not None
+            ):
                 result.skipped += 1
                 continue
             pending_papers.append(paper)
@@ -354,7 +387,9 @@ class KeywordExtractionFacade:
         for chunk in self._chunked_ids(candidate_ids, request.batch_size):
             papers = self.paper_repository.get_by_ids(chunk)
             papers_by_id = {int(paper.id): paper for paper in papers}
-            ordered_papers = [papers_by_id[paper_id] for paper_id in chunk if paper_id in papers_by_id]
+            ordered_papers = [
+                papers_by_id[paper_id] for paper_id in chunk if paper_id in papers_by_id
+            ]
             self._merge_batch_result(
                 result,
                 self._extract_loaded_papers(
@@ -435,7 +470,13 @@ class KeywordExtractionFacade:
         pending_pairs = list(zip(pending_papers, pending_metadata))
         chunk_size = max(
             1,
-            int(getattr(self, "paper_extraction_chunk_size", DEFAULT_PAPER_EXTRACTION_CHUNK_SIZE)),
+            int(
+                getattr(
+                    self,
+                    "paper_extraction_chunk_size",
+                    DEFAULT_PAPER_EXTRACTION_CHUNK_SIZE,
+                )
+            ),
         )
         for chunk in self._chunked_values(pending_pairs, chunk_size):
             chunk_papers = [paper for paper, _ in chunk]
@@ -671,17 +712,23 @@ class KeywordExtractionFacade:
     def _find_manifest(models_dir: Path) -> Path:
         manifests = sorted(models_dir.glob("booster_weights_manifest_*.json"))
         if not manifests:
-            raise FileNotFoundError(f"No booster_weights_manifest_*.json found in {models_dir}")
+            raise FileNotFoundError(
+                f"No booster_weights_manifest_*.json found in {models_dir}"
+            )
         return manifests[-1]
 
     @staticmethod
     def _load_english_stopwords() -> set[str]:
         if _nltk_stopwords is None:
-            raise RuntimeError("nltk is required for candidate generation; install nltk and its stopwords corpus.")
+            raise RuntimeError(
+                "nltk is required for candidate generation; install nltk and its stopwords corpus."
+            )
         try:
             return set(_nltk_stopwords.words("english"))
         except LookupError as exc:
-            raise RuntimeError("NLTK stopwords corpus is required; run nltk.download('stopwords').") from exc
+            raise RuntimeError(
+                "NLTK stopwords corpus is required; run nltk.download('stopwords')."
+            ) from exc
 
     def _get_english_stopwords(self) -> set[str]:
         if self._english_stopwords is None:
@@ -802,24 +849,33 @@ class KeywordExtractionFacade:
                     if span is None:
                         first_pos = 0.0
 
-                    rows.append({
-                        "doc_id": doc_id,
-                        "candidate": candidate,
-                        "candidate_s": candidate_s,
-                        "start_token": start,
-                        "end_token": end,
-                        "first_pos": first_pos,
-                        "candidate_len": len(candidate_terms),
-                        "contains_hyphen": int(any("-" in tok for tok in candidate_terms)),
-                        "ends_with_noun": int(bool(candidate_pos) and candidate_pos[-1] == "NOUN"),
-                    })
+                    rows.append(
+                        {
+                            "doc_id": doc_id,
+                            "candidate": candidate,
+                            "candidate_s": candidate_s,
+                            "start_token": start,
+                            "end_token": end,
+                            "first_pos": first_pos,
+                            "candidate_len": len(candidate_terms),
+                            "contains_hyphen": int(
+                                any("-" in tok for tok in candidate_terms)
+                            ),
+                            "ends_with_noun": int(
+                                bool(candidate_pos) and candidate_pos[-1] == "NOUN"
+                            ),
+                        }
+                    )
 
         if not rows:
             return pd.DataFrame(columns=["doc_id", "candidate", "candidate_s"])
 
         return (
             pd.DataFrame(rows)
-            .sort_values(["doc_id", "candidate_s", "first_pos", "candidate"], ascending=[True, True, True, True])
+            .sort_values(
+                ["doc_id", "candidate_s", "first_pos", "candidate"],
+                ascending=[True, True, True, True],
+            )
             .drop_duplicates(["doc_id", "candidate_s"], keep="first")
             .reset_index(drop=True)
         )
@@ -839,7 +895,11 @@ class KeywordExtractionFacade:
                 name="pke_singlerank_w4",
                 extractor_name="SingleRank",
                 candidate_selection_kwargs={"pos": pos},
-                candidate_weighting_kwargs={"window": 4, "pos": pos, "normalized": False},
+                candidate_weighting_kwargs={
+                    "window": 4,
+                    "pos": pos,
+                    "normalized": False,
+                },
                 get_n_best_kwargs={"n": 100},
             ),
         ]
@@ -880,15 +940,16 @@ class KeywordExtractionFacade:
                 try:
                     keyphrases = self._score_single_pke_document(text, spec)
                 except Exception as exc:
-                    logger.debug("PKE failed doc=%s model=%s error=%s", doc_id, spec.name, exc)
+                    logger.debug(
+                        "PKE failed doc=%s model=%s error=%s", doc_id, spec.name, exc
+                    )
                     if len(errors) < 3:
                         errors.append(f"{spec.name}: {exc}")
                     keyphrases = []
                 else:
                     successes += 1
                 scores[doc_id][spec.name] = [
-                    (str(candidate), float(score))
-                    for candidate, score in keyphrases
+                    (str(candidate), float(score)) for candidate, score in keyphrases
                 ]
         if attempts > 0 and successes == 0 and errors:
             raise RuntimeError(
@@ -909,37 +970,51 @@ class KeywordExtractionFacade:
                 cleaned_candidate = self._clean_candidate(candidate)
                 if cleaned_candidate is None:
                     continue
-                rows.append({
-                    "doc_id": doc_id,
-                    "candidate_s": self._normalize_candidate(cleaned_candidate),
-                    f"{spec.name}_score": float(score),
-                    f"{spec.name}_rank": rank,
-                    f"{spec.name}_rrank": 1.0 / rank,
-                })
+                rows.append(
+                    {
+                        "doc_id": doc_id,
+                        "candidate_s": self._normalize_candidate(cleaned_candidate),
+                        f"{spec.name}_score": float(score),
+                        f"{spec.name}_rank": rank,
+                        f"{spec.name}_rrank": 1.0 / rank,
+                    }
+                )
 
-        columns = ["doc_id", "candidate_s", f"{spec.name}_score", f"{spec.name}_rank", f"{spec.name}_rrank"]
+        columns = [
+            "doc_id",
+            "candidate_s",
+            f"{spec.name}_score",
+            f"{spec.name}_rank",
+            f"{spec.name}_rrank",
+        ]
         if not rows:
             return pd.DataFrame(columns=columns)
         return (
             pd.DataFrame(rows)
-            .sort_values(["doc_id", "candidate_s", f"{spec.name}_rank"], ascending=[True, True, True])
+            .sort_values(
+                ["doc_id", "candidate_s", f"{spec.name}_rank"],
+                ascending=[True, True, True],
+            )
             .drop_duplicates(["doc_id", "candidate_s"], keep="first")
             .reset_index(drop=True)
         )
 
     @staticmethod
-    def _score_single_pke_document(text: str, spec: _PkeSpec) -> list[tuple[str, float]]:
-        try:
-            import pke
-        except Exception as exc:
-            raise RuntimeError("pke is required for YAKE/SingleRank feature extraction.") from exc
+    def _score_single_pke_document(
+        text: str, spec: _PkeSpec
+    ) -> list[tuple[str, float]]:
+        # PyLance typization shenanigans
+        if _pke is None or _pke_uns is None or _pke_lang is None:
+            raise RuntimeError(
+                "pke is required for YAKE/SingleRank feature extraction."
+            )
 
-        extractor_factory = getattr(pke.unsupervised, spec.extractor_name)
+        extractor_factory = getattr(_pke_uns, spec.extractor_name)
         extractor = extractor_factory()
         extractor.load_document(
             input=text,
             language="en",
-            stoplist=list(string.punctuation) + list(pke.lang.stopwords.get("en")),
+            stoplist=list(string.punctuation) + list(_pke_lang.stopwords.get("en", [])),
             normalization=None,
         )
         extractor.candidate_selection(**spec.candidate_selection_kwargs)
@@ -965,18 +1040,30 @@ class KeywordExtractionFacade:
                 continue
 
             selected = pd.Index([])
-            selected = selected.union(self._top_rank_indices(group, config.yake_rank_col, config.yake_top_n))
-            selected = selected.union(self._top_rank_indices(group, config.singlerank_rank_col, config.singlerank_top_n))
+            selected = selected.union(
+                self._top_rank_indices(group, config.yake_rank_col, config.yake_top_n)
+            )
+            selected = selected.union(
+                self._top_rank_indices(
+                    group, config.singlerank_rank_col, config.singlerank_top_n
+                )
+            )
             selected = selected.union(self._agreement_indices(group, config))
 
             min_count = min(config.min_candidates_per_doc, len(group))
             if len(selected) < min_count:
-                selected = selected.union(self._supplement_indices(group, min_count - len(selected), config, selected))
+                selected = selected.union(
+                    self._supplement_indices(
+                        group, min_count - len(selected), config, selected
+                    )
+                )
             if len(selected) == 0:
                 selected = group.index
 
             selected_set = set(selected)
-            selected_indices.extend(int(idx) for idx in group.index if idx in selected_set)
+            selected_indices.extend(
+                int(idx) for idx in group.index if idx in selected_set
+            )
 
         return result.loc[selected_indices].reset_index(drop=True)
 
@@ -984,15 +1071,24 @@ class KeywordExtractionFacade:
     def _numeric_column(group: pd.DataFrame, column: str, default: float) -> pd.Series:
         if column not in group.columns:
             return pd.Series(default, index=group.index, dtype=float)
-        return pd.to_numeric(group[column], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default).astype(float)
+        return (
+            pd.to_numeric(group[column], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(default)
+            .astype(float)
+        )
 
-    def _top_rank_indices(self, group: pd.DataFrame, rank_col: str, top_n: int) -> pd.Index:
+    def _top_rank_indices(
+        self, group: pd.DataFrame, rank_col: str, top_n: int
+    ) -> pd.Index:
         if top_n <= 0 or rank_col not in group.columns:
             return pd.Index([])
         ranks = self._numeric_column(group, rank_col, np.inf)
         return group.index[ranks <= int(top_n)]
 
-    def _agreement_indices(self, group: pd.DataFrame, config: _BaselineFilterConfig) -> pd.Index:
+    def _agreement_indices(
+        self, group: pd.DataFrame, config: _BaselineFilterConfig
+    ) -> pd.Index:
         if config.agreement_top_n <= 0:
             return pd.Index([])
         score_parts = []
@@ -1001,7 +1097,7 @@ class KeywordExtractionFacade:
                 score_parts.append(self._numeric_column(group, col, 0.0))
         if not score_parts:
             return pd.Index([])
-        score = sum(score_parts) / len(score_parts)
+        score = pd.concat(score_parts, axis=1).mean(axis=1)
         return score.sort_values(ascending=False).head(config.agreement_top_n).index
 
     def _supplement_indices(
@@ -1013,7 +1109,11 @@ class KeywordExtractionFacade:
     ) -> pd.Index:
         if n_needed <= 0:
             return pd.Index([])
-        pool = group.drop(index=excluded, errors="ignore") if excluded is not None and len(excluded) else group
+        pool = (
+            group.drop(index=excluded, errors="ignore")
+            if excluded is not None and len(excluded)
+            else group
+        )
         if pool.empty:
             return pd.Index([])
         score_parts = []
@@ -1023,7 +1123,11 @@ class KeywordExtractionFacade:
         if score_parts:
             score = pd.concat(score_parts, axis=1).max(axis=1)
             return score.sort_values(ascending=False).head(n_needed).index
-        return pool.sort_values(["first_pos", "candidate_s"], ascending=[True, True]).head(n_needed).index
+        return (
+            pool.sort_values(["first_pos", "candidate_s"], ascending=[True, True])
+            .head(n_needed)
+            .index
+        )
 
     def _add_semantic_feature(
         self,
@@ -1051,7 +1155,9 @@ class KeywordExtractionFacade:
             if cand_emb.size == 0 or sent_emb.size == 0:
                 continue
             sim = cand_emb @ sent_emb.T
-            result.loc[group.index, "embedrank_best_sentence_cosine"] = sim.max(axis=1).astype(float)
+            result.loc[group.index, "embedrank_best_sentence_cosine"] = sim.max(
+                axis=1
+            ).astype(float)
         return result
 
     def _embed_texts(
@@ -1071,7 +1177,9 @@ class KeywordExtractionFacade:
             missing_texts.append(text)
             seen_missing.add(text)
 
-        batch_size = max(1, int(getattr(self, "embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE)))
+        batch_size = max(
+            1, int(getattr(self, "embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE))
+        )
         for chunk in self._chunked_values(missing_texts, batch_size):
             embeddings = self.embedding_adapter.embed_batch(
                 chunk,
@@ -1117,7 +1225,11 @@ class KeywordExtractionFacade:
         text = re.sub(r"\s+", " ", str(text)).strip()
         if not text:
             return []
-        sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", text) if sentence.strip()]
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", text)
+            if sentence.strip()
+        ]
         return (sentences or [text])[:SEMANTIC_MAX_SENTENCES]
 
     def _postprocess_features(self, features: pd.DataFrame) -> pd.DataFrame:
@@ -1136,7 +1248,12 @@ class KeywordExtractionFacade:
             result[out_col] = 0.0
             if base_col not in result.columns:
                 continue
-            values = result[base_col].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+            values = (
+                result[base_col]
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+                .astype(float)
+            )
             for _, group in result.groupby("doc_id", sort=False):
                 idx = group.index
                 x = values.loc[idx]
@@ -1149,15 +1266,21 @@ class KeywordExtractionFacade:
     @staticmethod
     def _raw_pke_rrank_columns(result: pd.DataFrame) -> list[str]:
         return [
-            col for col in result.columns
-            if col.startswith("pke_") and col.endswith("_rrank") and not col.endswith("_doc_z")
+            col
+            for col in result.columns
+            if col.startswith("pke_")
+            and col.endswith("_rrank")
+            and not col.endswith("_doc_z")
         ]
 
     @staticmethod
     def _raw_pke_rank_columns(result: pd.DataFrame) -> list[str]:
         return [
-            col for col in result.columns
-            if col.startswith("pke_") and col.endswith("_rank") and not col.endswith("_rrank")
+            col
+            for col in result.columns
+            if col.startswith("pke_")
+            and col.endswith("_rank")
+            and not col.endswith("_rrank")
         ]
 
     def _add_pke_agreement_features(self, result: pd.DataFrame) -> pd.DataFrame:
@@ -1175,27 +1298,53 @@ class KeywordExtractionFacade:
 
         rrank_cols = self._raw_pke_rrank_columns(result)
         if rrank_cols:
-            rrank_frame = result[rrank_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+            rrank_frame = (
+                result[rrank_cols]
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+                .astype(float)
+            )
             result["pke_rrank_max"] = rrank_frame.max(axis=1)
             result["pke_rrank_mean"] = rrank_frame.mean(axis=1)
-            result["pke_rrank_range"] = rrank_frame.max(axis=1) - rrank_frame.min(axis=1)
+            result["pke_rrank_range"] = rrank_frame.max(axis=1) - rrank_frame.min(
+                axis=1
+            )
 
         rank_cols = self._raw_pke_rank_columns(result)
         if rank_cols:
-            rank_frame = result[rank_cols].replace([np.inf, -np.inf], np.nan).fillna(999).astype(float)
+            rank_frame = (
+                result[rank_cols]
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(999)
+                .astype(float)
+            )
             result["pke_top5_count"] = (rank_frame <= 5).sum(axis=1)
             result["pke_top10_count"] = (rank_frame <= 10).sum(axis=1)
 
         if {"pke_yake_w8_rrank", "pke_singlerank_w4_rrank"}.issubset(result.columns):
-            yake = result["pke_yake_w8_rrank"].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
-            singlerank = result["pke_singlerank_w4_rrank"].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+            yake = (
+                result["pke_yake_w8_rrank"]
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+                .astype(float)
+            )
+            singlerank = (
+                result["pke_singlerank_w4_rrank"]
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+                .astype(float)
+            )
             result["pke_rrank_delta_yake_singlerank"] = yake - singlerank
             result["pke_yake_beats_singlerank"] = (yake > singlerank).astype(int)
             result["pke_singlerank_beats_yake"] = (singlerank > yake).astype(int)
         return result
 
     def _add_candidate_competition_features(self, result: pd.DataFrame) -> pd.DataFrame:
-        for col in ("candidate_substring_of_other", "candidate_contains_other", "candidate_token_overlap_max"):
+        for col in (
+            "candidate_substring_of_other",
+            "candidate_contains_other",
+            "candidate_token_overlap_max",
+        ):
             result[col] = 0.0
 
         for _, group in result.groupby("doc_id", sort=False):
@@ -1204,7 +1353,9 @@ class KeywordExtractionFacade:
             idx = group.index
             candidates = group["candidate"].astype(str).str.lower().tolist()
             lengths = group["candidate_len"].astype(int).tolist()
-            token_sets = [set(self._wordpunct_tokenize(candidate)) for candidate in candidates]
+            token_sets = [
+                set(self._wordpunct_tokenize(candidate)) for candidate in candidates
+            ]
             substring_of_other = np.zeros(len(group), dtype=int)
             contains_other = np.zeros(len(group), dtype=int)
             overlap_max = np.zeros(len(group), dtype=float)
@@ -1214,13 +1365,23 @@ class KeywordExtractionFacade:
                 for j, candidate_j in enumerate(candidates):
                     if i == j:
                         continue
-                    if lengths[j] > lengths[i] and candidate_i and candidate_i in candidate_j:
+                    if (
+                        lengths[j] > lengths[i]
+                        and candidate_i
+                        and candidate_i in candidate_j
+                    ):
                         substring_of_other[i] = 1
-                    if lengths[j] < lengths[i] and candidate_j and candidate_j in candidate_i:
+                    if (
+                        lengths[j] < lengths[i]
+                        and candidate_j
+                        and candidate_j in candidate_i
+                    ):
                         contains_other[i] = 1
                     union = len(set_i | token_sets[j])
                     if union:
-                        overlap_max[i] = max(overlap_max[i], len(set_i & token_sets[j]) / union)
+                        overlap_max[i] = max(
+                            overlap_max[i], len(set_i & token_sets[j]) / union
+                        )
 
             result.loc[idx, "candidate_substring_of_other"] = substring_of_other
             result.loc[idx, "candidate_contains_other"] = contains_other
@@ -1236,7 +1397,9 @@ class KeywordExtractionFacade:
 
     def _feature_matrix(self, features: pd.DataFrame) -> pd.DataFrame:
         features = self._ensure_feature_columns(features)
-        return features[self.feature_columns].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        return (
+            features[self.feature_columns].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        )
 
     def _predict(self, model_name: str, features: pd.DataFrame) -> np.ndarray:
         model = self._load_ranker(model_name)
@@ -1250,23 +1413,31 @@ class KeywordExtractionFacade:
         item = self._model_index[model_name]
         model_path = self.models_dir / item["filename"]
         if not model_path.exists():
-            raise FileNotFoundError(f"Model weights not found for {model_name}: {model_path}")
+            raise FileNotFoundError(
+                f"Model weights not found for {model_name}: {model_path}"
+            )
 
         backend = item["backend"]
         if backend == "catboost":
             try:
                 from catboost import CatBoostRanker
             except Exception as exc:
-                raise RuntimeError("catboost is required to load catboost_lambdamart weights.") from exc
+                raise RuntimeError(
+                    "catboost is required to load catboost_lambdamart weights."
+                ) from exc
             model = CatBoostRanker()
         elif backend == "xgboost":
             try:
                 from xgboost import XGBRanker
             except Exception as exc:
-                raise RuntimeError("xgboost is required to load xgb_lambdarank weights.") from exc
+                raise RuntimeError(
+                    "xgboost is required to load xgb_lambdarank weights."
+                ) from exc
             model = XGBRanker()
         else:
-            raise ValueError(f"Unsupported backend={backend!r} for model={model_name!r}")
+            raise ValueError(
+                f"Unsupported backend={backend!r} for model={model_name!r}"
+            )
 
         model.load_model(str(model_path))
         self._model_cache[model_name] = model

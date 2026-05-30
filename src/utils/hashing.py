@@ -12,4 +12,3 @@ stable_text_hash = calculate_text_hash
 
 
 __all__ = ["calculate_text_hash", "hash_text", "stable_text_hash"]
-

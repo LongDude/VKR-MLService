@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections import deque
-import threading
+
 
 class AsyncRateLimiter:
     """Simple async sliding-window rate limiter."""
@@ -27,6 +28,7 @@ class AsyncRateLimiter:
                     return
                 sleep_for = max(0.0, 1.0 - (now - self._timestamps[0]))
                 await asyncio.sleep(sleep_for)
+
 
 class SyncRateLimiter:
     """Thread-safe sliding-window request limiter for synchronous OpenAlex calls."""

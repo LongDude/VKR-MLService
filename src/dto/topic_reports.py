@@ -2,33 +2,35 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from enum import StrEnum
+from typing import Any
 
 from pydantic import Field, model_validator
 
 from .common import BaseDTO
 
 
-TopicQuarterReportItemType = Literal[
-    "research_problem",
-    "method",
-    "approach",
-    "future_direction",
-]
-TopicQuarterReportMaturity = Literal[
-    "emerging",
-    "growing",
-    "stable",
-    "declining",
-    "mature",
-]
-TopicQuarterReportPaperRole = Literal[
-    "representative",
-    "highly_cited",
-    "emerging",
-    "method_evidence",
-    "problem_evidence",
-]
+class TopicQuarterReportItemType(StrEnum):
+    RESEARCH_PROBLEM = "research_problem"
+    METHOD = "method"
+    APPROACH = "approach"
+    FUTURE_DIRECTION = "future_direction"
+
+
+class TopicQuarterReportMaturity(StrEnum):
+    EMERGING = "emerging"
+    GROWING = "growing"
+    STABLE = "stable"
+    DECLINING = "declining"
+    MATURE = "mature"
+
+
+class TopicQuarterReportPaperRole(StrEnum):
+    REPRESENTATIVE = "representative"
+    HIGHLY_CITED = "highly_cited"
+    EMERGING = "emerging"
+    METHOD_EVIDENCE = "method_evidence"
+    PROBLEM_EVIDENCE = "problem_evidence"
 
 
 class TopicQuarterReportGenerateRequestDTO(BaseDTO):

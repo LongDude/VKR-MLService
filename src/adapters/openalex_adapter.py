@@ -141,7 +141,7 @@ class OpenAlexAdapter:
         *,
         params: dict[str, Any] | None = None,
         allow_not_found: bool,
-    ) -> dict[str, Any] | list[Any] | None:
+    ) -> dict[str, Any] | None:
         response = self._client.get(
             f"{self._base_url}{path}",
             params=self._with_auth_params(params),
@@ -200,32 +200,33 @@ class OpenAlexAdapter:
             result.setdefault("mailto", self._mailto)
         return result
 
-    def normalize_work(self, data: dict[str, Any]) -> ExternalPaperDTO:
+    @classmethod
+    def normalize_work(cls, data: dict[str, Any]) -> ExternalPaperDTO:
 
-        authors, institutions_from_authors = self._normalize_authors(data)
-        institutions = self._dedupe_institutions(
+        authors, institutions_from_authors = cls._normalize_authors(data)
+        institutions = cls._dedupe_institutions(
             [
                 *institutions_from_authors,
-                *self._normalize_top_level_institutions(data.get("institutions")),
+                *cls._normalize_top_level_institutions(data.get("institutions")),
             ]
         )
         return ExternalPaperDTO(
-            external_id=self._string_or_none(
+            external_id=cls._string_or_none(
                 data.get("external_id") or data.get("openalex_id") or data.get("id")
             ),
-            doi=self._string_or_none(data.get("doi")),
+            doi=cls._string_or_none(data.get("doi")),
             title=str(
                 data.get("title") or data.get("display_name") or data.get("name") or ""
             ),
-            abstract=self._normalize_abstract(data),
-            publication_year=self._int_or_none(data.get("publication_year")),
+            abstract=cls._normalize_abstract(data),
+            publication_year=cls._int_or_none(data.get("publication_year")),
             publication_date=data.get("publication_date"),
-            type=self._string_or_none(data.get("type")),
-            language=self._string_or_none(data.get("language")),
-            is_open_access=self._normalize_open_access(data),
-            cited_by_count=self._int_or_none(data.get("cited_by_count")),
-            references_count=self._int_or_none(
-                self._first_present(
+            type=cls._string_or_none(data.get("type")),
+            language=cls._string_or_none(data.get("language")),
+            is_open_access=cls._normalize_open_access(data),
+            cited_by_count=cls._int_or_none(data.get("cited_by_count")),
+            references_count=cls._int_or_none(
+                cls._first_present(
                     data,
                     "referenced_works_count",
                     "references_count",
@@ -234,22 +235,21 @@ class OpenAlexAdapter:
             ),
             authors=authors,
             institutions=institutions,
-            topics=self._normalize_topics(data.get("topics")),
-            keywords=self._normalize_keywords(data),
-            landings=self._normalize_landings(data),
+            topics=cls._normalize_topics(data.get("topics")),
+            keywords=cls._normalize_keywords(data),
+            landings=cls._normalize_landings(data),
             raw=data,
         )
 
-    def _normalize_abstract(self, data: dict[str, Any]) -> str | None:
+    @staticmethod
+    def _normalize_abstract(data: dict[str, Any]) -> str | None:
         abstract = data.get("abstract")
         if isinstance(abstract, str):
             return abstract
         inverted = data.get("abstract_inverted_index")
-        if isinstance(inverted, dict):
-            return self._restore_inverted_abstract(inverted)
-        return None
+        if not isinstance(inverted, dict):
+            return None
 
-    def _restore_inverted_abstract(self, inverted: dict[str, Any]) -> str:
         positions: dict[int, str] = {}
         for token, token_positions in inverted.items():
             if not isinstance(token_positions, list):
@@ -259,8 +259,9 @@ class OpenAlexAdapter:
                     positions[position] = str(token)
         return " ".join(positions[index] for index in sorted(positions))
 
+    @classmethod
     def _normalize_authors(
-        self,
+        cls,
         data: dict[str, Any],
     ) -> tuple[list[ExternalAuthorDTO], list[ExternalInstitutionDTO]]:
         raw_authors = data.get("authorships") or data.get("authors") or []
@@ -272,33 +273,32 @@ class OpenAlexAdapter:
         for index, item in enumerate(raw_authors):
             if not isinstance(item, dict):
                 continue
-            author_data = (
-                item.get("author") if isinstance(item.get("author"), dict) else item
-            )
-            author_institutions = self._normalize_top_level_institutions(
+            author_data = cls._dict_or_default(item.get("author"), item)
+            author_institutions = cls._normalize_top_level_institutions(
                 item.get("institutions")
             )
             institutions.extend(author_institutions)
             authors.append(
                 ExternalAuthorDTO(
-                    external_id=self._string_or_none(
+                    external_id=cls._string_or_none(
                         author_data.get("id") or author_data.get("external_id")
                     ),
                     display_name=str(
                         author_data.get("display_name") or author_data.get("name") or ""
                     ),
-                    orcid=self._string_or_none(author_data.get("orcid")),
-                    author_order=self._int_or_none(item.get("author_order"))
+                    orcid=cls._string_or_none(author_data.get("orcid")),
+                    author_order=cls._int_or_none(item.get("author_order"))
                     or index + 1,
-                    is_corresponding=self._bool_or_none(item.get("is_corresponding")),
+                    is_corresponding=cls._bool_or_none(item.get("is_corresponding")),
                     institutions=author_institutions,
                     raw=item,
                 )
             )
         return authors, institutions
 
+    @classmethod
     def _normalize_top_level_institutions(
-        self,
+        cls,
         raw_institutions: Any,
     ) -> list[ExternalInstitutionDTO]:
         if not isinstance(raw_institutions, list):
@@ -309,22 +309,22 @@ class OpenAlexAdapter:
                 continue
             institutions.append(
                 ExternalInstitutionDTO(
-                    external_id=self._string_or_none(
+                    external_id=cls._string_or_none(
                         item.get("id") or item.get("external_id")
                     ),
                     display_name=str(
                         item.get("display_name") or item.get("name") or ""
                     ),
-                    ror=self._string_or_none(item.get("ror")),
-                    country_code=self._string_or_none(item.get("country_code")),
-                    type=self._string_or_none(item.get("type")),
+                    ror=cls._string_or_none(item.get("ror")),
+                    country_code=cls._string_or_none(item.get("country_code")),
+                    type=cls._string_or_none(item.get("type")),
                     raw=item,
                 )
             )
         return institutions
 
+    @staticmethod
     def _dedupe_institutions(
-        self,
         institutions: list[ExternalInstitutionDTO],
     ) -> list[ExternalInstitutionDTO]:
         seen: set[str] = set()
@@ -337,30 +337,31 @@ class OpenAlexAdapter:
             result.append(institution)
         return result
 
-    def _normalize_topics(self, raw_topics: Any) -> list[ExternalTopicDTO]:
+    @classmethod
+    def _normalize_topics(cls, raw_topics: Any) -> list[ExternalTopicDTO]:
         if not isinstance(raw_topics, list):
             return []
         topics: list[ExternalTopicDTO] = []
         for item in raw_topics:
             if not isinstance(item, dict):
                 continue
-            domain = item.get("domain") if isinstance(item.get("domain"), dict) else {}
-            field = item.get("field") if isinstance(item.get("field"), dict) else {}
-            subfield = (
-                item.get("subfield") if isinstance(item.get("subfield"), dict) else {}
-            )
+
+            domain = cls._dict_or_default(item.get("domain"))
+            field = cls._dict_or_default(item.get("field"))
+            subfield = cls._dict_or_default(item.get("subfield"))
+
             topics.append(
                 ExternalTopicDTO(
-                    external_id=self._string_or_none(item.get("id")),
+                    external_id=cls._string_or_none(item.get("id")),
                     name=str(item.get("display_name") or item.get("name") or ""),
-                    score=self._decimal_or_none(item.get("score")),
-                    domain_name=self._string_or_none(
+                    score=cls._decimal_or_none(item.get("score")),
+                    domain_name=cls._string_or_none(
                         domain.get("display_name") or domain.get("name")
                     ),
-                    field_name=self._string_or_none(
+                    field_name=cls._string_or_none(
                         field.get("display_name") or field.get("name")
                     ),
-                    subfield_name=self._string_or_none(
+                    subfield_name=cls._string_or_none(
                         subfield.get("display_name") or subfield.get("name")
                     ),
                     raw=item,
@@ -368,7 +369,8 @@ class OpenAlexAdapter:
             )
         return topics
 
-    def _normalize_keywords(self, data: dict[str, Any]) -> list[ExternalKeywordDTO]:
+    @classmethod
+    def _normalize_keywords(cls, data: dict[str, Any]) -> list[ExternalKeywordDTO]:
         raw_keywords = data.get("keywords")
         if raw_keywords is None:
             raw_keywords = data.get("concepts")
@@ -389,13 +391,14 @@ class OpenAlexAdapter:
                             or item.get("value")
                             or ""
                         ),
-                        score=self._decimal_or_none(item.get("score")),
+                        score=cls._decimal_or_none(item.get("score")),
                         raw=item,
                     )
                 )
         return keywords
 
-    def _normalize_landings(self, data: dict[str, Any]) -> list[ExternalLandingDTO]:
+    @classmethod
+    def _normalize_landings(cls, data: dict[str, Any]) -> list[ExternalLandingDTO]:
         candidates: list[tuple[dict[str, Any], bool | None]] = []
         for key, is_best in (
             ("primary_location", True),
@@ -423,13 +426,13 @@ class OpenAlexAdapter:
             if landing_url in seen:
                 continue
             seen.add(landing_url)
-            explicit_is_best = self._bool_or_none(item.get("is_best"))
+            explicit_is_best = cls._bool_or_none(item.get("is_best"))
             landings.append(
                 ExternalLandingDTO(
                     landing_url=landing_url,
-                    pdf_url=self._string_or_none(pdf_url),
-                    license=self._string_or_none(item.get("license")),
-                    version=self._string_or_none(item.get("version")),
+                    pdf_url=cls._string_or_none(pdf_url),
+                    license=cls._string_or_none(item.get("license")),
+                    version=cls._string_or_none(item.get("version")),
                     is_best=explicit_is_best
                     if explicit_is_best is not None
                     else default_is_best,
@@ -438,16 +441,18 @@ class OpenAlexAdapter:
             )
         return landings
 
-    def _normalize_open_access(self, data: dict[str, Any]) -> bool | None:
+    @classmethod
+    def _normalize_open_access(cls, data: dict[str, Any]) -> bool | None:
         value = data.get("is_open_access")
         if isinstance(value, bool):
             return value
         open_access = data.get("open_access")
         if isinstance(open_access, dict):
-            return self._bool_or_none(open_access.get("is_oa"))
+            return cls._bool_or_none(open_access.get("is_oa"))
         return None
 
-    def _build_filter_param(self, filters: OpenAlexSearchFiltersDTO) -> str | None:
+    @staticmethod
+    def _build_filter_param(filters: OpenAlexSearchFiltersDTO) -> str | None:
         values: list[str] = []
         if filters.date_from is not None:
             values.append(f"from_publication_date:{filters.date_from.isoformat()}")
@@ -467,24 +472,32 @@ class OpenAlexAdapter:
             values.append(f"is_oa:{str(filters.is_open_access).lower()}")
         return ",".join(values) if values else None
 
-    def _normalize_work_identifier(self, external_id: str) -> str:
+    @staticmethod
+    def _normalize_work_identifier(external_id: str) -> str:
         value = external_id.rstrip("/")
         if "/" in value:
             return value.rsplit("/", 1)[-1]
         return value
 
-    def _string_or_none(self, value: Any) -> str | None:
+    @staticmethod
+    def _dict_or_default(value: Any, default: Any = {}) -> dict[str, Any]:
+        return value if isinstance(value, dict) else default
+
+    @staticmethod
+    def _string_or_none(value: Any) -> str | None:
         if value is None:
             return None
         return str(value)
 
-    def _first_present(self, data: dict[str, Any], *keys: str) -> Any:
+    @staticmethod
+    def _first_present(data: dict[str, Any], *keys: str) -> Any:
         for key in keys:
             if key in data:
                 return data.get(key)
         return None
 
-    def _int_or_none(self, value: Any) -> int | None:
+    @staticmethod
+    def _int_or_none(value: Any) -> int | None:
         if isinstance(value, bool) or value is None:
             return None
         try:
@@ -492,10 +505,12 @@ class OpenAlexAdapter:
         except (TypeError, ValueError):
             return None
 
-    def _bool_or_none(self, value: Any) -> bool | None:
+    @staticmethod
+    def _bool_or_none(value: Any) -> bool | None:
         return value if isinstance(value, bool) else None
 
-    def _decimal_or_none(self, value: Any) -> Decimal | None:
+    @staticmethod
+    def _decimal_or_none(value: Any) -> Decimal | None:
         if value is None or isinstance(value, bool):
             return None
         try:

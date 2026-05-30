@@ -7,10 +7,6 @@ from adapters.qdrant_adapter import QdrantAdapter
 from core.exceptions import InsufficientUserProfileDataError
 from dto.qdrant import QdrantPointDTO
 from dto.recommendations import UserProfileDTO
-from repositories.favourites import FavouriteRepository
-from repositories.taxonomy import TaxonomyRepository
-from repositories.tracked_areas import TrackedAreaRepository
-
 from ml.constants import (
     PAPERS_COLLECTION,
     RESEARCH_ENTITIES_COLLECTION,
@@ -19,7 +15,9 @@ from ml.constants import (
 from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.vector_math import VectorMathService
-
+from repositories.favourites import FavouriteRepository
+from repositories.taxonomy import TaxonomyRepository
+from repositories.tracked_areas import TrackedAreaRepository
 
 FAVOURITE_PAPER_WEIGHT = 0.45
 TRACKED_TOPIC_WEIGHT = 0.25
@@ -80,7 +78,10 @@ class UserProfileFacade:
             )
             raise InsufficientUserProfileDataError(
                 "User profile has no source data",
-                details={"user_id": user_id, "source_counts": self._source_counts(sources)},
+                details={
+                    "user_id": user_id,
+                    "source_counts": self._source_counts(sources),
+                },
             )
 
         self._emit(
@@ -205,9 +206,13 @@ class UserProfileFacade:
             "favourite_paper_ids": self.favourite_repository.list_paper_ids(user_id),
             "tracked_domain_ids": self.tracked_area_repository.list_domain_ids(user_id),
             "tracked_field_ids": self.tracked_area_repository.list_field_ids(user_id),
-            "tracked_subfield_ids": self.tracked_area_repository.list_subfield_ids(user_id),
+            "tracked_subfield_ids": self.tracked_area_repository.list_subfield_ids(
+                user_id
+            ),
             "tracked_topic_ids": self.tracked_area_repository.list_topic_ids(user_id),
-            "tracked_keyword_ids": self.tracked_area_repository.list_keyword_ids(user_id),
+            "tracked_keyword_ids": self.tracked_area_repository.list_keyword_ids(
+                user_id
+            ),
         }
 
     def _load_category_vectors(

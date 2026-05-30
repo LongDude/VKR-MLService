@@ -1,25 +1,27 @@
 from __future__ import annotations
 
-from collections import defaultdict
 import logging
 import time
-from typing import Any, Sequence
+from collections import defaultdict
+from typing import Any, Iterable, Sequence
 
 from adapters.redis_adapter import RedisAdapter
 from core.exceptions import AppError
+from ml.services.cluster_dynamics_tasks import release_cluster_dynamics_dedupe_keys
+from ml.services.cluster_recompute_tasks import (
+    build_cluster_recompute_message,
+    release_cluster_recompute_dedupe_keys,
+)
+from ml.services.events import EventSink, MLEvent, NoopEventSink, TqdmEventSink
 from ml.services.openalex_cooldown import (
     OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE,
     OPENALEX_COOLDOWN_KEY,
     OPENALEX_TOPIC_STATS_PENDING_QUEUE,
 )
-from ml.services.cluster_recompute_tasks import (
-    build_cluster_recompute_message,
-    release_cluster_recompute_dedupe_keys,
-)
-from ml.services.cluster_dynamics_tasks import release_cluster_dynamics_dedupe_keys
-from ml.services.events import EventSink, MLEvent, NoopEventSink, TqdmEventSink
 from ml.workers.task_handlers import MLTaskHandler
 
+# TODO: вынести параметры в файл настроек
+# TODO: Разработать корректную систему типов для сообщений - вместо словарей использовать контракты
 
 KEYWORD_EXTRACTION_QUEUE = "queue:keyword_extraction"
 OPENALEX_TOPIC_STATS_QUEUE = "queue:openalex_topic_stats"
@@ -278,6 +280,17 @@ class RedisMLWorker:
             return self._coalesce_cluster_recompute_messages(messages)
         return messages
 
+    @staticmethod
+    def _unique_preserve_order(values: Iterable[int]) -> list[int]:
+        seen: set[int] = set()
+        result: list[int] = []
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        return result
+
     def _coalesce_paper_indexing_messages(
         self,
         messages: list[dict[str, Any]],
@@ -299,16 +312,15 @@ class RedisMLWorker:
                 current_seen = set()
                 continue
 
-            paper_ids = []
-            for paper_id in self._paper_ids_from_message(message):
-                if paper_id not in paper_ids:
-                    paper_ids.append(paper_id)
+            paper_ids = self._unique_preserve_order(
+                self._paper_ids_from_message(message)
+            )
             key = self._paper_indexing_coalesce_key(message)
             can_extend = (
                 current_message is not None
                 and current_key == key
                 and len(current_message["paper_ids"])
-                + len([paper_id for paper_id in paper_ids if paper_id not in current_seen])
+                + sum(1 for paper_id in paper_ids if paper_id not in current_seen)
                 <= max_task_size
             )
             if not can_extend:
@@ -320,10 +332,18 @@ class RedisMLWorker:
                 current_key = key
                 current_seen = set()
 
+            # Typecheck guard
+            if current_message is None:
+                raise RuntimeError("Paper indexing coalescing invatiant violated")
+
+            paper_ids_target = current_message["paper_ids"]
+            if not isinstance(paper_ids_target, list):
+                raise TypeError("paper_ids must be a list")
+
             for paper_id in paper_ids:
                 if paper_id in current_seen:
                     continue
-                current_message["paper_ids"].append(paper_id)
+                paper_ids_target.append(paper_id)
                 current_seen.add(paper_id)
             self._merge_paper_indexing_workflow_fields(current_message, message)
 
@@ -333,8 +353,12 @@ class RedisMLWorker:
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        grouped_ids: dict[tuple[int | None, float | None, bool, bool], list[int]] = defaultdict(list)
-        seen_by_options: dict[tuple[int | None, float | None, bool, bool], set[int]] = defaultdict(set)
+        grouped_ids: dict[tuple[int | None, float | None, bool, bool], list[int]] = (
+            defaultdict(list)
+        )
+        seen_by_options: dict[tuple[int | None, float | None, bool, bool], set[int]] = (
+            defaultdict(set)
+        )
         result: list[dict[str, Any]] = []
 
         for message in messages:
@@ -541,7 +565,9 @@ class RedisMLWorker:
         if len(paper_ids) <= max_task_size:
             return [message]
 
-        top_k, min_score, skip_processed, skip_non_english = self._keyword_extraction_options(message)
+        top_k, min_score, skip_processed, skip_non_english = (
+            self._keyword_extraction_options(message)
+        )
         return [
             {
                 "task_type": "keyword_extraction",
@@ -559,7 +585,10 @@ class RedisMLWorker:
         queue_name: str,
         message: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        if message.get("task_type") not in {"cluster_recompute", "recompute_topic_clusters"}:
+        if message.get("task_type") not in {
+            "cluster_recompute",
+            "recompute_topic_clusters",
+        }:
             return [message]
 
         max_task_size = self.max_task_sizes.get(queue_name)
@@ -716,7 +745,10 @@ class RedisMLWorker:
         )
 
     def _is_simple_cluster_recompute_message(self, message: dict[str, Any]) -> bool:
-        if message.get("task_type") not in {"cluster_recompute", "recompute_topic_clusters"}:
+        if message.get("task_type") not in {
+            "cluster_recompute",
+            "recompute_topic_clusters",
+        }:
             return False
         if message.get("cluster_id"):
             return False
@@ -880,10 +912,7 @@ class RedisMLWorker:
         if isinstance(value, list):
             return {
                 "count": len(value),
-                "sample": [
-                    self._safe_payload_summary(item)
-                    for item in value[:5]
-                ],
+                "sample": [self._safe_payload_summary(item) for item in value[:5]],
             }
         if isinstance(value, str) and len(value) > 500:
             return f"{value[:500]}..."

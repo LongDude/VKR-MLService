@@ -8,6 +8,7 @@ from sqlalchemy import func, literal, select
 from core.exceptions import InvalidRequestError
 from dto.charts import PeriodCountDTO
 from models import Paper, PaperTopic, Topic
+from src.dto.enums import WorkflowGranularity
 
 from .base import BaseRepository
 
@@ -18,7 +19,7 @@ class PaperGraphRepository(BaseRepository):
         topic_id: int,
         date_from: date,
         date_to: date,
-        granularity: Literal["week", "month"],
+        granularity: WorkflowGranularity,
         *,
         topic_match: Literal["soft", "strict"] = "soft",
     ) -> list[PeriodCountDTO]:
@@ -50,7 +51,7 @@ class PaperGraphRepository(BaseRepository):
         topic_ids: list[int],
         date_from: date,
         date_to: date,
-        granularity: Literal["week", "month"],
+        granularity: WorkflowGranularity,
         *,
         topic_match: Literal["soft", "strict"] = "soft",
     ) -> dict:
@@ -118,10 +119,7 @@ class PaperGraphRepository(BaseRepository):
         )
         current_count = func.coalesce(current_counts.c.paper_count, 0)
         previous_count = func.coalesce(previous_counts.c.previous_paper_count, 0)
-        growth_rate = (
-            (current_count - previous_count)
-            / func.nullif(previous_count, 0)
-        )
+        growth_rate = (current_count - previous_count) / func.nullif(previous_count, 0)
 
         stmt = (
             select(
@@ -156,10 +154,12 @@ class PaperGraphRepository(BaseRepository):
             ) in self.session.execute(stmt)
         ]
 
-    def _period_expr(self, granularity: Literal["week", "month"]):
+    def _period_expr(self, granularity: WorkflowGranularity):
         if granularity not in {"week", "month"}:
             raise ValueError("granularity must be 'week' or 'month'")
-        return func.date_trunc(granularity, Paper.publication_date).label("period_start")
+        return func.date_trunc(granularity, Paper.publication_date).label(
+            "period_start"
+        )
 
     def _topic_counts_subquery(
         self,

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
 
 from pydantic import Field
 
-from .common import BaseDTO
+from src.dto.enums import TrackedEntityType
 
-TrackedEntityType = Literal["domain", "field", "subfield", "topic", "keyword"]
+from .common import BaseDTO
 
 
 class AddTrackedEntityRequestDTO(BaseDTO):

@@ -7,11 +7,9 @@ from adapters.qdrant_adapter import QdrantAdapter
 from core.exceptions import AppError, InvalidRequestError
 from dto.common import OperationResultDTO
 from dto.qdrant import QdrantPointDTO
-from repositories.research_clusters import ResearchClusterRepository
-
 from ml.constants import TREND_CLUSTER_PERIODS_COLLECTION, TREND_CLUSTERS_COLLECTION
 from ml.services.events import EventSink, MLEvent, NoopEventSink
-
+from repositories.research_clusters import ResearchClusterRepository
 
 SyncScope = Literal["all", "clusters", "periods"]
 
@@ -66,9 +64,12 @@ class ClusterDbSyncFacade:
                 "dry_run": dry_run,
                 "clusters": cluster_details,
                 "periods": period_details,
-                "created": int(cluster_details["created"]) + int(period_details["created"]),
-                "updated": int(cluster_details["updated"]) + int(period_details["updated"]),
-                "skipped": int(cluster_details["skipped"]) + int(period_details["skipped"]),
+                "created": int(cluster_details["created"])
+                + int(period_details["created"]),
+                "updated": int(cluster_details["updated"])
+                + int(period_details["updated"]),
+                "skipped": int(cluster_details["skipped"])
+                + int(period_details["skipped"]),
                 "failed": failed,
                 "pruned_clusters": cluster_details.get("pruned_clusters", 0),
                 "pruned_period_stats": period_details.get("pruned_period_stats", 0),
@@ -198,11 +199,9 @@ class ClusterDbSyncFacade:
 
         pruned = 0
         if prune_missing and not dry_run:
-            pruned = (
-                self.research_cluster_repository.delete_period_stats_not_in_keys(
-                    seen_period_keys,
-                    cluster_key=cluster_id,
-                )
+            pruned = self.research_cluster_repository.delete_period_stats_not_in_keys(
+                seen_period_keys,
+                cluster_key=cluster_id,
             )
         counters["pruned_period_stats"] = pruned
         return self._sync_result("periods", counters, cluster_id=cluster_id)
@@ -239,9 +238,7 @@ class ClusterDbSyncFacade:
         if cluster_id is None:
             return points
         return [
-            point
-            for point in points
-            if self._point_cluster_key(point) == cluster_id
+            point for point in points if self._point_cluster_key(point) == cluster_id
         ]
 
     def _payload_with_cluster_key(self, point: QdrantPointDTO) -> dict[str, Any]:

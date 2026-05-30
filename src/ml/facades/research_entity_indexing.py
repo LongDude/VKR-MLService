@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
+from enum import StrEnum
 from numbers import Real
-from typing import Any
+from typing import Any, TypeAlias
 
 from adapters.lmstudio_embedding_adapter import LMStudioEmbeddingAdapter
 from adapters.qdrant_adapter import QdrantAdapter
@@ -15,17 +16,38 @@ from core.exceptions import (
 )
 from dto.common import BatchOperationResultDTO, OperationResultDTO
 from dto.qdrant import QdrantPointDTO
-from repositories.graph import PaperGraphRepository
-from repositories.taxonomy import TaxonomyRepository
-
 from ml.constants import DEFAULT_EMBEDDING_MODEL, RESEARCH_ENTITIES_COLLECTION
 from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.text_preparation import TextPreparationService
-
+from repositories.graph import PaperGraphRepository
+from repositories.taxonomy import TaxonomyRepository
 
 DEFAULT_RECENT_WINDOW_DAYS = 365
 DEFAULT_EMBEDDING_VERSION = "v1"
+
+
+class ResearchEntityType(StrEnum):
+    DOMAIN = "domain"
+    FIELD = "field"
+    SUBFIELD = "subfield"
+    TOPIC = "topic"
+    KEYWORD = "keyword"
+
+
+class ResearchEntitySelection(StrEnum):
+    ALL = "all"
+    DOMAIN = "domain"
+    FIELD = "field"
+    SUBFIELD = "subfield"
+    TOPIC = "topic"
+    KEYWORD = "keyword"
+
+
+EntityListMethod: TypeAlias = Callable[[int, int], list[Any]]
+EntityCountMethod: TypeAlias = Callable[[], int]
+PaperIdsMethod: TypeAlias = Callable[[int], list[int]]
+PaperCountMethod: TypeAlias = Callable[[int], int | None]
 
 
 class ResearchEntityIndexingFacade:
@@ -65,7 +87,7 @@ class ResearchEntityIndexingFacade:
         force_reindex: bool = False,
         limit: int | None = None,
         offset: int = 0,
-        entity_type: str = "all",
+        entity_type: ResearchEntitySelection = ResearchEntitySelection.ALL,
         batch_size: int = 128,
     ) -> BatchOperationResultDTO:
         """Index reference entities into ``research_entities_v1``.
@@ -91,14 +113,6 @@ class ResearchEntityIndexingFacade:
                 "batch_size must be positive",
                 details={"batch_size": batch_size},
             )
-        if entity_type not in self._supported_entity_types():
-            raise InvalidRequestError(
-                "Unsupported research entity type",
-                details={
-                    "entity_type": entity_type,
-                    "supported": sorted(self._supported_entity_types()),
-                },
-            )
 
         result = BatchOperationResultDTO()
         self._emit(
@@ -115,7 +129,7 @@ class ResearchEntityIndexingFacade:
 
         for current_type, list_method in self._selected_entity_sources(entity_type):
             source_offset = offset_remaining
-            if entity_type == "all" and offset_remaining:
+            if entity_type == ResearchEntitySelection.ALL and offset_remaining:
                 entity_count = self._entity_count(current_type)
                 if entity_count is not None and offset_remaining >= entity_count:
                     offset_remaining -= entity_count
@@ -140,7 +154,9 @@ class ResearchEntityIndexingFacade:
                         payload=result.model_dump(mode="json"),
                     )
                     return result
-                page_size = batch_size if remaining is None else min(batch_size, remaining)
+                page_size = (
+                    batch_size if remaining is None else min(batch_size, remaining)
+                )
                 entities = list_method(page_size, source_offset)
                 if not entities:
                     break
@@ -197,7 +213,9 @@ class ResearchEntityIndexingFacade:
                 "Topic not found",
                 details={"topic_id": topic_id},
             )
-        return self._index_entity("topic", topic, force_reindex=force_reindex)
+        return self._index_entity(
+            ResearchEntityType.TOPIC, topic, force_reindex=force_reindex
+        )
 
     def index_keyword(
         self,
@@ -211,45 +229,46 @@ class ResearchEntityIndexingFacade:
                 "Keyword not found",
                 details={"keyword_id": keyword_id},
             )
-        return self._index_entity("keyword", keyword, force_reindex=force_reindex)
+        return self._index_entity(
+            ResearchEntityType.KEYWORD, keyword, force_reindex=force_reindex
+        )
 
     def _selected_entity_sources(
         self,
-        entity_type: str,
-    ) -> list[tuple[str, Callable[[int, int], list[Any]]]]:
+        entity_type: ResearchEntitySelection,
+    ) -> list[tuple[ResearchEntityType, Callable[[int, int], list[Any]]]]:
         sources = self._entity_sources()
-        if entity_type == "all":
+        if entity_type == ResearchEntitySelection.ALL:
             return sources
-        return [(name, method) for name, method in sources if name == entity_type]
-
-    def _entity_sources(self) -> list[tuple[str, Callable[[int, int], list[Any]]]]:
         return [
-            ("domain", self.taxonomy_repository.list_domains),
-            ("field", self.taxonomy_repository.list_fields),
-            ("subfield", self.taxonomy_repository.list_subfields),
-            ("topic", self.taxonomy_repository.list_topics),
-            ("keyword", self.taxonomy_repository.list_keywords),
+            (name, method)
+            for name, method in sources
+            if name.value == entity_type.value
         ]
 
-    def _supported_entity_types(self) -> set[str]:
-        return {"all", "domain", "field", "subfield", "topic", "keyword"}
+    def _entity_sources(
+        self,
+    ) -> list[tuple[ResearchEntityType, Callable[[int, int], list[Any]]]]:
+        return [
+            (ResearchEntityType.DOMAIN, self.taxonomy_repository.list_domains),
+            (ResearchEntityType.FIELD, self.taxonomy_repository.list_fields),
+            (ResearchEntityType.SUBFIELD, self.taxonomy_repository.list_subfields),
+            (ResearchEntityType.TOPIC, self.taxonomy_repository.list_topics),
+            (ResearchEntityType.KEYWORD, self.taxonomy_repository.list_keywords),
+        ]
 
-    def _entity_count(self, entity_type: str) -> int | None:
-        method_name = {
-            "domain": "count_domains",
-            "field": "count_fields",
-            "subfield": "count_subfields",
-            "topic": "count_topics",
-            "keyword": "count_keywords",
-        }[entity_type]
-        method = getattr(self.taxonomy_repository, method_name, None)
-        if not callable(method):
-            return None
-        return int(method())
+    def _entity_count(self, entity_type: ResearchEntityType) -> int:
+        return {
+            ResearchEntityType.DOMAIN: self.taxonomy_repository.count_domains,
+            ResearchEntityType.FIELD: self.taxonomy_repository.count_fields,
+            ResearchEntityType.SUBFIELD: self.taxonomy_repository.count_subfields,
+            ResearchEntityType.TOPIC: self.taxonomy_repository.count_topics,
+            ResearchEntityType.KEYWORD: self.taxonomy_repository.count_keywords,
+        }[entity_type]()
 
     def _index_entity_batch(
         self,
-        entity_type: str,
+        entity_type: ResearchEntityType,
         entities: list[Any],
         *,
         force_reindex: bool,
@@ -306,7 +325,7 @@ class ResearchEntityIndexingFacade:
 
         self._emit(
             "entity_embedding_started",
-            entity_id=entity_type,
+            entity_id=entity_type.value,
             stage="embedding",
             current=0,
             total=len(pending_records),
@@ -318,11 +337,11 @@ class ResearchEntityIndexingFacade:
         )
         self._emit(
             "entity_embedding_completed",
-            entity_id=entity_type,
+            entity_id=entity_type.value,
             stage="embedding",
             current=len(pending_records),
             total=len(pending_records),
-            message=f"{entity_type} embeddings generated",
+            message=f"{entity_type.value}s embeddings generated",
         )
         if len(embeddings) != len(pending_records):
             raise EmbeddingGenerationError(
@@ -339,12 +358,12 @@ class ResearchEntityIndexingFacade:
                 result.failed += 1
                 result.errors.append(
                     {
-                        "entity_type": entity_type,
+                        "entity_type": entity_type.value,
                         "entity_id": record["entity_id"],
                         "code": EmbeddingGenerationError.code,
                         "message": "Embedding vector was not generated",
                         "details": {
-                            "entity_type": entity_type,
+                            "entity_type": entity_type.value,
                             "entity_id": record["entity_id"],
                         },
                     }
@@ -353,7 +372,7 @@ class ResearchEntityIndexingFacade:
 
             payload = self.payload_builder.build_research_entity_payload(
                 record["entity"],
-                entity_type=entity_type,
+                entity_type=entity_type.value,
                 entity_id=record["entity_id"],
                 name=record["name"],
                 **record["hierarchy"],
@@ -375,11 +394,11 @@ class ResearchEntityIndexingFacade:
             result.updated += len(points)
             self._emit(
                 "entity_qdrant_upsert_completed",
-                entity_id=entity_type,
+                entity_id=entity_type.value,
                 stage="qdrant_upsert",
                 current=len(points),
                 total=len(pending_records),
-                message=f"Upserted {len(points)} {entity_type} points",
+                message=f"Upserted {len(points)} {entity_type.value} points",
                 payload={"collection": self.collection_name},
             )
 
@@ -402,7 +421,7 @@ class ResearchEntityIndexingFacade:
 
     def _index_entity(
         self,
-        entity_type: str,
+        entity_type: ResearchEntityType,
         entity: Any,
         *,
         force_reindex: bool,
@@ -419,7 +438,7 @@ class ResearchEntityIndexingFacade:
                 success=True,
                 message="Research entity is already indexed; skipped",
                 details={
-                    "entity_type": entity_type,
+                    "entity_type": entity_type.value,
                     "entity_id": entity_id,
                     "point_id": point_id,
                     "skipped": True,
@@ -444,12 +463,12 @@ class ResearchEntityIndexingFacade:
         if embedding is None or not embedding.vector:
             raise EmbeddingGenerationError(
                 "Embedding vector was not generated",
-                details={"entity_type": entity_type, "entity_id": entity_id},
+                details={"entity_type": entity_type.value, "entity_id": entity_id},
             )
 
         payload = self.payload_builder.build_research_entity_payload(
             entity,
-            entity_type=entity_type,
+            entity_type=entity_type.value,
             entity_id=entity_id,
             name=name,
             **hierarchy,
@@ -469,26 +488,28 @@ class ResearchEntityIndexingFacade:
             entity_id=point_id,
             stage="completed",
             message="Research entity indexed successfully",
-            payload={"entity_type": entity_type, "entity_id": entity_id},
+            payload={"entity_type": entity_type.value, "entity_id": entity_id},
         )
 
         return OperationResultDTO(
             success=True,
             message="Research entity indexed successfully",
             details={
-                "entity_type": entity_type,
+                "entity_type": entity_type.value,
                 "entity_id": entity_id,
                 "point_id": point_id,
                 "skipped": False,
             },
         )
 
-    def _build_hierarchy(self, entity_type: str, entity: Any) -> dict[str, Any]:
+    def _build_hierarchy(
+        self, entity_type: ResearchEntityType, entity: Any
+    ) -> dict[str, Any]:
         entity_id = self._entity_id(entity)
         name = self._entity_name(entity)
-        if entity_type == "domain":
+        if entity_type == ResearchEntityType.DOMAIN:
             return {"domain_id": entity_id, "domain_name": name}
-        if entity_type == "field":
+        if entity_type == ResearchEntityType.FIELD:
             domain = self._domain_for_field(entity)
             return {
                 "domain_id": getattr(entity, "domain_id", None),
@@ -496,7 +517,7 @@ class ResearchEntityIndexingFacade:
                 "field_id": entity_id,
                 "field_name": name,
             }
-        if entity_type == "subfield":
+        if entity_type == ResearchEntityType.SUBFIELD:
             field = self._field_for_subfield(entity)
             domain = self._domain_for_field(field) if field is not None else None
             return {
@@ -507,7 +528,7 @@ class ResearchEntityIndexingFacade:
                 "subfield_id": entity_id,
                 "subfield_name": name,
             }
-        if entity_type == "topic":
+        if entity_type == ResearchEntityType.TOPIC:
             subfield = self._subfield_for_topic(entity)
             field = self._field_for_subfield(subfield) if subfield is not None else None
             domain = self._domain_for_field(field) if field is not None else None
@@ -521,7 +542,9 @@ class ResearchEntityIndexingFacade:
             }
         return {}
 
-    def _build_count_payload(self, entity_type: str, entity_id: int) -> dict[str, int]:
+    def _build_count_payload(
+        self, entity_type: ResearchEntityType, entity_id: int
+    ) -> dict[str, int]:
         payload: dict[str, int] = {}
         paper_count = self._paper_count(entity_type, entity_id)
         recent_paper_count = self._recent_paper_count(entity_type, entity_id)
@@ -531,15 +554,12 @@ class ResearchEntityIndexingFacade:
             payload["recent_paper_count"] = recent_paper_count
         return payload
 
-    def _paper_count(self, entity_type: str, entity_id: int) -> int | None:
-        if entity_type == "topic":
-            list_method = getattr(
-                self.taxonomy_repository,
-                "list_paper_ids_by_topic",
-                None,
-            )
-            if callable(list_method):
-                return len(list_method(entity_id))
+    # TODO: Проверить корректность методов подсчета - сдается мне тут мертвая зона
+    def _paper_count(
+        self, entity_type: ResearchEntityType, entity_id: int
+    ) -> int | None:
+        if entity_type == ResearchEntityType.TOPIC:
+            return len(self.taxonomy_repository.list_paper_ids_by_topic(entity_id))
         list_method = getattr(
             self.taxonomy_repository,
             f"list_paper_ids_by_{entity_type}",
@@ -613,11 +633,11 @@ class ResearchEntityIndexingFacade:
     def _error_payload(
         self,
         exc: AppError,
-        entity_type: str,
+        entity_type: ResearchEntityType,
         entity_id: Any,
     ) -> dict[str, Any]:
         return {
-            "entity_type": entity_type,
+            "entity_type": entity_type.value,
             "entity_id": entity_id,
             "code": exc.code,
             "message": exc.message,
@@ -659,19 +679,19 @@ class ResearchEntityIndexingFacade:
 
     def _embedding_context(
         self,
-        entity_type: str,
+        entity_type: ResearchEntityType,
         hierarchy: dict[str, Any],
     ) -> dict[str, Any]:
-        if entity_type == "domain":
+        if entity_type == ResearchEntityType.DOMAIN:
             return {}
-        if entity_type == "field":
+        if entity_type == ResearchEntityType.FIELD:
             return {"domain_name": hierarchy.get("domain_name")}
-        if entity_type == "subfield":
+        if entity_type == ResearchEntityType.SUBFIELD:
             return {
                 "domain_name": hierarchy.get("domain_name"),
                 "field_name": hierarchy.get("field_name"),
             }
-        if entity_type == "topic":
+        if entity_type == ResearchEntityType.TOPIC:
             return {
                 "domain_name": hierarchy.get("domain_name"),
                 "field_name": hierarchy.get("field_name"),
@@ -679,8 +699,8 @@ class ResearchEntityIndexingFacade:
             }
         return {}
 
-    def _point_id(self, entity_type: str, entity_id: int) -> str:
-        return f"{entity_type}:{entity_id}"
+    def _point_id(self, entity_type: ResearchEntityType, entity_id: int) -> str:
+        return f"{entity_type.value}:{entity_id}"
 
     def _entity_id(self, entity: Any) -> int:
         entity_id = getattr(entity, "id", None)

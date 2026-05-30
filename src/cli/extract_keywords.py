@@ -10,7 +10,6 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-
 BASE_DIR = Path(__file__).resolve().parent
 SRC_DIR = BASE_DIR.parent
 PROJECT_DIR = SRC_DIR.parent
@@ -28,7 +27,6 @@ from ml.pipelines.keyword_extraction_pipeline import KeywordExtractionPipeline
 from ml.workers.redis_worker import KEYWORD_EXTRACTION_QUEUE
 from models.session import create_db_engine, create_session_factory
 from repositories import PaperRepository
-
 
 DEFAULT_ENQUEUE_PAGE_SIZE = 1000
 
@@ -361,7 +359,9 @@ def build_redis_client(args: argparse.Namespace) -> Any:
     return Redis(
         host=args.redis_host or os.getenv("REDIS_HOST") or "localhost",
         port=args.redis_port or _optional_int_env("REDIS_PORT") or 6379,
-        db=args.redis_db if args.redis_db is not None else _optional_int_env("REDIS_DB") or 0,
+        db=args.redis_db
+        if args.redis_db is not None
+        else _optional_int_env("REDIS_DB") or 0,
         password=os.getenv("REDIS_PASSWORD") or None,
     )
 

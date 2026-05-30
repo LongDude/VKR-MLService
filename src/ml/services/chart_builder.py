@@ -5,7 +5,13 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from dto.charts import ChartAxisDTO, ChartCellDTO, ChartDTO, ChartPointDTO, ChartSeriesDTO
+from dto.charts import (
+    ChartAxisDTO,
+    ChartCellDTO,
+    ChartDTO,
+    ChartPointDTO,
+    ChartSeriesDTO,
+)
 from dto.trends import TrendClusterDTO
 
 
@@ -254,4 +260,3 @@ class ChartBuilderService:
 
 
 __all__ = ["ChartBuilderService"]
-

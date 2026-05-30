@@ -4,7 +4,6 @@ from typing import TypeVar
 
 from sqlalchemy.orm import Session
 
-
 T = TypeVar("T")
 
 
@@ -29,7 +28,10 @@ class BaseRepository:
         for instance in self.session.new:
             if not isinstance(instance, model):
                 continue
-            if all(getattr(instance, field, None) == value for field, value in values.items()):
+            if all(
+                getattr(instance, field, None) == value
+                for field, value in values.items()
+            ):
                 return instance
         return None
 

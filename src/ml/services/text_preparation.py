@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from core.exceptions import InvalidRequestError
+from src.ml.facades.research_entity_indexing import ResearchEntityType
 
 
 class TextPreparationService:
@@ -22,7 +23,7 @@ class TextPreparationService:
 
     def build_research_entity_embedding_text(
         self,
-        entity_type: str,
+        entity_type: ResearchEntityType,
         name: str,
         domain_name: str | None = None,
         field_name: str | None = None,

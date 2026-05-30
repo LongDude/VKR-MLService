@@ -26,4 +26,3 @@ class TrendStatusService:
 
 
 __all__ = ["TrendStatusService"]
-

@@ -12,19 +12,17 @@ from core.exceptions import AppError, EntityNotFoundError, InvalidRequestError
 from dto.common import BatchOperationResultDTO
 from dto.qdrant import QdrantPointDTO
 from dto.trends import TrendClusterDTO, TrendMetricsDTO
-from repositories.graph import PaperGraphRepository
-from repositories.papers import PaperRepository
-from repositories.research_clusters import ResearchClusterRepository
-from repositories.taxonomy import TaxonomyRepository
-
 from ml.constants import PAPERS_COLLECTION, TREND_CLUSTERS_COLLECTION
 from ml.facades.summaries import SummaryFacade
+from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.scoring import ScoringService
 from ml.services.trend_status import TrendStatusService
 from ml.services.vector_math import VectorMathService
-from ml.services.events import EventSink, MLEvent, NoopEventSink
-
+from repositories.graph import PaperGraphRepository
+from repositories.papers import PaperRepository
+from repositories.research_clusters import ResearchClusterRepository
+from repositories.taxonomy import TaxonomyRepository
 
 ENTITY_PAGE_SIZE = 500
 QDRANT_VECTOR_RETRIEVE_BATCH_SIZE = 256
@@ -318,7 +316,9 @@ class ClusterAnalyticsFacade:
                 source_topic_name=self._topic_name(topic),
                 indexed_paper_count=vector_data.indexed_paper_count,
                 vector_retrieve_batch_size=QDRANT_VECTOR_RETRIEVE_BATCH_SIZE,
-                representative_candidate_count=len(vector_data.representative_candidates),
+                representative_candidate_count=len(
+                    vector_data.representative_candidates
+                ),
                 summary_degraded=summary_degraded,
                 indexed_at=datetime.now(timezone.utc),
             )
@@ -508,8 +508,7 @@ class ClusterAnalyticsFacade:
             indexed_paper_count=indexed_paper_count,
             representative_candidates=representative_candidates,
             top_keywords=[
-                keyword
-                for keyword, _ in keyword_counter.most_common(TOP_KEYWORD_LIMIT)
+                keyword for keyword, _ in keyword_counter.most_common(TOP_KEYWORD_LIMIT)
             ],
         )
 
@@ -547,9 +546,7 @@ class ClusterAnalyticsFacade:
             )
 
         avg_cited_by_count = (
-            self._decimal(citation_count_sum / paper_count)
-            if paper_count
-            else None
+            self._decimal(citation_count_sum / paper_count) if paper_count else None
         )
         return _PaperMetadata(
             paper_dates=paper_dates,
@@ -673,7 +670,9 @@ class ClusterAnalyticsFacade:
         cluster_id: str,
         payload: dict[str, Any],
     ) -> TrendClusterDTO:
-        topic_id = int(payload.get("source_topic_id") or self._parse_topic_cluster_id(cluster_id))
+        topic_id = int(
+            payload.get("source_topic_id") or self._parse_topic_cluster_id(cluster_id)
+        )
         return TrendClusterDTO(
             id=topic_id,
             cluster_key=str(payload.get("cluster_key") or cluster_id),
@@ -683,13 +682,23 @@ class ClusterAnalyticsFacade:
             status=payload.get("status"),
             source_topic_id=topic_id,
             metrics=TrendMetricsDTO(
-                paper_count=int(payload.get("paper_count_total") or payload.get("paper_count") or 0),
-                previous_paper_count=int(payload.get("previous_90d_count") or payload.get("previous_paper_count") or 0),
-                growth_rate=self._decimal_or_none(payload.get("growth_rate_90d") or payload.get("growth_rate")),
+                paper_count=int(
+                    payload.get("paper_count_total") or payload.get("paper_count") or 0
+                ),
+                previous_paper_count=int(
+                    payload.get("previous_90d_count")
+                    or payload.get("previous_paper_count")
+                    or 0
+                ),
+                growth_rate=self._decimal_or_none(
+                    payload.get("growth_rate_90d") or payload.get("growth_rate")
+                ),
                 trend_score=self._decimal_or_none(payload.get("trend_score")),
                 semantic_drift=self._decimal_or_none(payload.get("semantic_drift")),
                 citation_count_sum=payload.get("citation_count_sum"),
-                avg_cited_by_count=self._decimal_or_none(payload.get("avg_cited_by_count")),
+                avg_cited_by_count=self._decimal_or_none(
+                    payload.get("avg_cited_by_count")
+                ),
             ),
             top_keywords=[str(value) for value in payload.get("top_keywords", [])],
             representative_paper_ids=[
@@ -760,7 +769,8 @@ class ClusterAnalyticsFacade:
         return [
             str(getattr(paper_by_id[paper_id], "abstract"))
             for paper_id in paper_ids
-            if paper_id in paper_by_id and getattr(paper_by_id[paper_id], "abstract", None)
+            if paper_id in paper_by_id
+            and getattr(paper_by_id[paper_id], "abstract", None)
         ]
 
     def _citation_count_sum(self, papers: list[Any]) -> int:

@@ -198,7 +198,8 @@ class PublicationForecastService:
         if values.dropna().empty:
             return pd.Series(dtype=float)
 
-        values.index = values.index.to_period("M").to_timestamp()
+        # clarification for PyLance
+        values.index = pd.DatetimeIndex(values.index).to_period("M").to_timestamp()
 
         if kind == "count":
             monthly = values.groupby(level=0).sum(min_count=1).astype(float)
@@ -540,6 +541,7 @@ class PublicationForecastService:
         exog_train = self._calendar_exog(train.index) if candidate.use_exog else None
         exog_future = self._calendar_exog(future_index) if candidate.use_exog else None
 
+        fitted: SARIMAX | None = None
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
@@ -553,6 +555,9 @@ class PublicationForecastService:
                 enforce_invertibility=False,
                 concentrate_scale=True,
             ).fit(disp=False, maxiter=200)  # type: ignore
+
+        if fitted is None:
+            raise RuntimeError("Unable to initialize forecast model")
 
         if with_interval:
             prediction = fitted.get_forecast(  # type: ignore
@@ -594,7 +599,7 @@ class PublicationForecastService:
                 )
                 return ForecastValues(mean, lower, upper)
 
-        forecast_t = fitted.forecast(
+        forecast_t = fitted.forecast(  # type: ignore
             steps=steps,
             exog=exog_future,
         ).to_numpy(dtype=float)
@@ -905,9 +910,9 @@ class PublicationForecastService:
             {
                 "q2": (quarter == 2).astype(float),
                 "q4": (quarter == 4).astype(float),
-                "jan": (month == 1).astype(float),
-                "may_jun": ((month == 5) | (month == 6)).astype(float),
-                "dec": (month == 12).astype(float),
+                # "jan": (month == 1).astype(float),
+                # "may_jun": ((month == 5) | (month == 6)).astype(float),
+                # "dec": (month == 12).astype(float),
             },
             index=index,
         )

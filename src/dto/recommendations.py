@@ -30,6 +30,7 @@ class RecommendationRequestDTO(BaseDTO):
     exclude_favourites: bool = True
     include_explanations: bool = False
     limit: int = Field(default=20, ge=1, le=100)
+    # TODO: Перевести в StrEnum
     strategy: Literal["profile", "similar_papers", "hybrid"] = "hybrid"
 
 

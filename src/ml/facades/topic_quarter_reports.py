@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from datetime import date
 from decimal import Decimal
-import json
 from typing import Any
 
 from pydantic import ValidationError
@@ -26,7 +26,6 @@ from repositories.papers import PaperRepository
 from repositories.research_clusters import ResearchClusterRepository
 from repositories.taxonomy import TaxonomyRepository
 from repositories.topic_quarter_reports import TopicQuarterReportRepository
-
 
 REPRESENTATIVE_PAPER_LIMIT = 8
 TOP_CITED_PAPER_LIMIT = 5
@@ -344,20 +343,12 @@ class TopicQuarterReportFacade:
             for keyword, periods in periods_by_keyword.items()
             if len(periods) >= 2
         ]
-        emerging = [
-            keyword
-            for keyword in last_counter
-            if keyword not in first_counter
-        ]
+        emerging = [keyword for keyword in last_counter if keyword not in first_counter]
         declining = [
-            keyword
-            for keyword in first_counter
-            if keyword not in last_counter
+            keyword for keyword in first_counter if keyword not in last_counter
         ]
         return {
-            "top_keywords": [
-                keyword for keyword, _ in total_counter.most_common(20)
-            ],
+            "top_keywords": [keyword for keyword, _ in total_counter.most_common(20)],
             "stable_keywords": stable[:20],
             "emerging_keywords": emerging[:20],
             "declining_keywords": declining[:20],

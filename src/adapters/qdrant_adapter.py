@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Any, Protocol, TypeAlias, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -10,7 +11,6 @@ from dto.qdrant import QdrantPayloadIndexDTO, QdrantPointDTO, QdrantSearchHitDTO
 try:
     from qdrant_client import QdrantClient
     from qdrant_client import models as qdrant_models
-    from qdrant_client.conversions.common_types import QueryResponse
 except ImportError:
     QdrantClient = None
     qdrant_models = None
@@ -29,8 +29,8 @@ class QdrantPointLike(Protocol):
 class QdrantSearchPointLike(Protocol):
     id: int | str
     score: float | int
-    vector: list[float] | None
-    payload: dict[str, Any] | None
+    vector: Sequence[float] | None
+    payload: Mapping[str, Any] | None
 
 
 ScrollResult: TypeAlias = tuple[list[QdrantPointLike], Any]
@@ -152,8 +152,10 @@ class QdrantAdapter:
         filters: dict[str, Any] | None = None,
     ) -> list[QdrantSearchHitDTO]:
         try:
+            points: Sequence[QdrantSearchPointLike]
+
             if hasattr(self._client, "query_points"):
-                result: QueryResponse = self._client.query_points(
+                response = self._client.query_points(
                     collection_name=collection_name,
                     query=vector,
                     limit=top_k,
@@ -161,19 +163,21 @@ class QdrantAdapter:
                     with_payload=True,
                     with_vectors=False,
                 )
-                result = getattr(result, "points", result)
+                points = cast(Sequence[QdrantSearchPointLike], response.points)
+
             elif hasattr(self._client, "search"):
-                result: QueryResponse = self._client.search(
+                response = self._client.search(
                     collection_name=collection_name,
                     query_vector=vector,
                     limit=top_k,
                     query_filter=filters,
                 )
+                points = cast(Sequence[QdrantSearchPointLike], response)
             else:
                 raise RuntimeError(
                     "Qdrant client has neither query_points nor search method"
                 )
-            return [self._to_search_hit(point) for point in result]
+            return [self._to_search_hit(point) for point in points]
         except Exception as exc:
             raise self._error(
                 f"Failed to search Qdrant collection {collection_name!r}",
@@ -184,7 +188,7 @@ class QdrantAdapter:
     def retrieve(
         self,
         collection_name: str,
-        point_ids: list[int | str],
+        point_ids: Sequence[int | str],
         with_vectors: bool = False,
     ) -> list[QdrantPointDTO]:
         try:

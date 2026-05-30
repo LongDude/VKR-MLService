@@ -127,7 +127,12 @@ class AuthorRepository(BaseRepository):
                 is_corresponding,
             )
         if not self._is_postgresql():
-            for paper_id, author_id, author_order, is_corresponding in deduplicated.values():
+            for (
+                paper_id,
+                author_id,
+                author_order,
+                is_corresponding,
+            ) in deduplicated.values():
                 self.attach_to_paper(
                     paper_id,
                     author_id,
