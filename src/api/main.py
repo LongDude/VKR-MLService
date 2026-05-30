@@ -38,7 +38,7 @@ from repositories.favourites import FavouriteRepository
 from repositories.papers import PaperRepository
 from repositories.taxonomy import TaxonomyRepository
 from repositories.tracked_areas import TrackedAreaRepository
-from src.ml.services.forecast_model import PublicationForecastService
+from ml.services.forecast_model import PublicationForecastService
 
 
 @lru_cache(maxsize=1)

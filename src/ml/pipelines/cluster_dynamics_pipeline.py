@@ -4,7 +4,7 @@ from datetime import date
 
 from dto.common import BatchOperationResultDTO
 from ml.facades.cluster_dynamics import ClusterDynamicsFacade
-from src.dto.enums import WorkflowGranularity
+from dto.enums import WorkflowGranularity
 
 
 class ClusterDynamicsPipeline:

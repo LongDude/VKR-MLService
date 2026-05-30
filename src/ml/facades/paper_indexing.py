@@ -33,7 +33,7 @@ from repositories.authors import AuthorRepository
 from repositories.institutions import InstitutionRepository
 from repositories.papers import PaperRepository
 from repositories.taxonomy import TaxonomyRepository
-from src.dto.enums import IndexingStatus
+from dto.enums import IndexingStatus
 from utils.hashing import calculate_text_hash
 
 CLUSTER_RECOMPUTE_QUEUE = "queue:cluster_recompute"

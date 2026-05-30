@@ -26,7 +26,7 @@ from ml.services.openalex_cooldown import (
     OPENALEX_TOPIC_STATS_PENDING_QUEUE,
     set_openalex_cooldown,
 )
-from src.ml.services.openalex_topic_stats import (
+from ml.services.openalex_topic_stats import (
     OpenAlexTopicStatsCollector,
     TaxonomyStatsScope,
 )

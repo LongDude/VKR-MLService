@@ -21,7 +21,7 @@ from ml.services.vector_math import VectorMathService
 from repositories.graph import PaperGraphRepository
 from repositories.research_clusters import ResearchClusterRepository
 from repositories.taxonomy import TaxonomyRepository
-from src.dto.enums import WorkflowGranularity
+from dto.enums import WorkflowGranularity
 
 REPRESENTATIVE_PAPER_LIMIT = 5
 TOP_KEYWORD_LIMIT = 10

@@ -4,7 +4,7 @@ from datetime import datetime
 
 from pydantic import Field
 
-from src.dto.enums import TrackedEntityType
+from dto.enums import TrackedEntityType
 
 from .common import BaseDTO
 

@@ -8,7 +8,7 @@ from sqlalchemy import func, literal, select
 from core.exceptions import InvalidRequestError
 from dto.charts import PeriodCountDTO
 from models import Paper, PaperTopic, Topic
-from src.dto.enums import WorkflowGranularity
+from dto.enums import WorkflowGranularity
 
 from .base import BaseRepository
 

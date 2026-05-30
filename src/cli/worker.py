@@ -97,7 +97,7 @@ from repositories import (
     TopicQuarterReportRepository,
     TrackedAreaRepository,
 )
-from src.ml.services.openalex_topic_stats import (
+from ml.services.openalex_topic_stats import (
     OpenAlexTopicStatsCollector,
     SyncRateLimiter,
 )

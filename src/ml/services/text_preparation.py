@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from core.exceptions import InvalidRequestError
-from src.ml.facades.research_entity_indexing import ResearchEntityType
+
+if TYPE_CHECKING:
+    from ml.facades.research_entity_indexing import ResearchEntityType
 
 
 class TextPreparationService:
