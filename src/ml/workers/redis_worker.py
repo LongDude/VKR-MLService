@@ -34,6 +34,8 @@ TOPIC_QUARTER_REPORT_QUEUE = "queue:topic_quarter_reports"
 USER_PROFILE_RECOMPUTE_QUEUE = "queue:user_profile_recompute"
 FAILED_TASKS_QUEUE = "queue:failed_tasks"
 ML_WORKER_SHUTDOWN_KEY = "ml:worker:shutdown"
+ADMIN_COVERAGE_TASK_RESULT_KEY_PREFIX = "admin:data_coverage:result"
+ADMIN_COVERAGE_TASK_RESULT_TTL_SECONDS = 7 * 24 * 60 * 60
 
 DEFAULT_QUEUE_ORDER = (
     OPENALEX_TOPIC_STATS_PENDING_QUEUE,
@@ -478,6 +480,7 @@ class RedisMLWorker:
         else:
             elapsed_seconds = round(time.monotonic() - started_at, 3)
             result_summary = self._safe_result_summary(result)
+            self._save_admin_coverage_task_result(message, result)
             self._emit_worker_event(
                 "worker_task_completed",
                 task_summary,
@@ -509,6 +512,26 @@ class RedisMLWorker:
                 self._release_cluster_dynamics_dedupe_keys(message)
             self._current_queue_name = None
             self._current_message = None
+
+    def _save_admin_coverage_task_result(
+        self,
+        message: dict[str, Any],
+        result: Any,
+    ) -> None:
+        task_id = str(message.get("client_task_id") or "").strip()
+        if not task_id:
+            return
+        try:
+            self.redis_adapter.set_json(
+                f"{ADMIN_COVERAGE_TASK_RESULT_KEY_PREFIX}:{task_id}",
+                self._result_payload(result),
+                ADMIN_COVERAGE_TASK_RESULT_TTL_SECONDS,
+            )
+        except Exception:
+            self.logger.exception(
+                "Failed to save admin coverage task result",
+                extra={"client_task_id": task_id},
+            )
 
     def _split_oversized_message(
         self,
@@ -902,6 +925,11 @@ class RedisMLWorker:
         return self._safe_payload_summary(message)
 
     def _safe_result_summary(self, result: Any) -> dict[str, Any]:
+        value = self._result_payload(result)
+        safe_value = self._safe_payload_summary(value)
+        return safe_value if isinstance(safe_value, dict) else {"value": safe_value}
+
+    def _result_payload(self, result: Any) -> dict[str, Any]:
         if result is None:
             return {}
         if hasattr(result, "model_dump"):
@@ -912,8 +940,7 @@ class RedisMLWorker:
             value = result
         else:
             value = {"value": result}
-        safe_value = self._safe_payload_summary(value)
-        return safe_value if isinstance(safe_value, dict) else {"value": safe_value}
+        return value if isinstance(value, dict) else {"value": value}
 
     def _safe_payload_summary(self, value: Any) -> Any:
         if isinstance(value, dict):

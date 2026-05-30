@@ -11,6 +11,7 @@ from adapters.redis_adapter import RedisAdapter
 from repositories.taxonomy import TaxonomyRepository
 from ml.services.worker_heartbeat import ML_WORKER_HEARTBEAT_KEY
 from ml.workers.redis_worker import (
+    ADMIN_COVERAGE_TASK_RESULT_KEY_PREFIX,
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
     FAILED_TASKS_QUEUE,
@@ -29,6 +30,7 @@ TASK_KEY_PREFIX = "admin:data_coverage:task"
 WORKFLOW_KEY_PREFIX = "admin:data_coverage:workflow"
 TRACKING_TTL_SECONDS = 7 * 24 * 60 * 60
 RECENT_TTL_SECONDS = 24 * 60 * 60
+EXHAUSTED_UNIT_KEY_PREFIX = "admin:data_coverage:exhausted"
 STALE_AFTER = timedelta(hours=24)
 MAX_TRACKED_ITEMS = 5000
 
@@ -410,6 +412,7 @@ class AdminCoverageTaskService:
             if task_id in failed_ids:
                 self._finish_task(marker, record, "failed", "Worker reported a task failure.")
                 continue
+            self._record_exhausted_units(task_id, record)
             period = self._period_from_record(record)
             missing = self._missing_topic_ids(
                 str(record["panelKey"]),
@@ -538,7 +541,73 @@ class AdminCoverageTaskService:
         if not topic_ids:
             return []
         covered = self._covered_topic_ids(panel_key, topic_ids, period)
+        if panel_key == "sample-papers":
+            covered.update(self._exhausted_topic_ids(panel_key, topic_ids, period))
         return sorted(set(topic_ids) - covered)
+
+    def _record_exhausted_units(
+        self,
+        task_id: str,
+        record: dict[str, Any],
+    ) -> None:
+        if record.get("panelKey") != "sample-papers":
+            return
+        result = self.redis.get_json(
+            f"{ADMIN_COVERAGE_TASK_RESULT_KEY_PREFIX}:{task_id}"
+        )
+        if result is None:
+            return
+        details = result.get("details")
+        if not isinstance(details, dict):
+            return
+        summaries = details.get("unit_summaries")
+        if not isinstance(summaries, list):
+            return
+        expected_period = str(record.get("period") or "")
+        expected_topics = {int(value) for value in record.get("topicIds", [])}
+        for summary in summaries:
+            if not isinstance(summary, dict) or not summary.get("exhausted"):
+                continue
+            period = str(summary.get("period") or "")
+            try:
+                topic_id = int(summary.get("topic_id"))
+            except (TypeError, ValueError):
+                continue
+            if period != expected_period or topic_id not in expected_topics:
+                continue
+            self.redis.set_json(
+                self._exhausted_unit_key("sample-papers", period, topic_id),
+                {
+                    "panelKey": "sample-papers",
+                    "period": period,
+                    "topicId": topic_id,
+                    "reason": str(summary.get("reason") or "source_exhausted"),
+                    "missingCount": int(summary.get("missing_count") or 0),
+                    "updatedAt": self._now_iso(),
+                },
+            )
+
+    def _exhausted_topic_ids(
+        self,
+        panel_key: str,
+        topic_ids: list[int],
+        period: dict[str, Any],
+    ) -> set[int]:
+        return {
+            topic_id
+            for topic_id in topic_ids
+            if self.redis.exists(
+                self._exhausted_unit_key(panel_key, str(period["key"]), topic_id)
+            )
+        }
+
+    def _exhausted_unit_key(
+        self,
+        panel_key: str,
+        period: str,
+        topic_id: int,
+    ) -> str:
+        return f"{EXHAUSTED_UNIT_KEY_PREFIX}:{panel_key}:{period}:topic:{topic_id}"
 
     def _covered_topic_ids(
         self,
