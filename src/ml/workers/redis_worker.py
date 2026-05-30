@@ -546,6 +546,7 @@ class RedisMLWorker:
                 "paper_ids": paper_ids[index : index + max_task_size],
                 "force_reindex": force_reindex,
                 **workflow_fields,
+                **self._client_tracking_fields(message),
             }
             for index in range(0, len(paper_ids), max_task_size)
         ]
@@ -576,6 +577,7 @@ class RedisMLWorker:
                 "min_score": min_score,
                 "skip_processed": skip_processed,
                 "skip_non_english": skip_non_english,
+                **self._client_tracking_fields(message),
             }
             for index in range(0, len(paper_ids), max_task_size)
         ]
@@ -602,16 +604,26 @@ class RedisMLWorker:
         force_summary = bool(message.get("force_summary", False))
         cluster_workers = message.get("cluster_workers")
         return [
-            build_cluster_recompute_message(
-                topic_ids[index : index + max_task_size],
-                force_summary=force_summary,
-                cluster_workers=(
-                    int(cluster_workers) if cluster_workers is not None else None
+            {
+                **build_cluster_recompute_message(
+                    topic_ids[index : index + max_task_size],
+                    force_summary=force_summary,
+                    cluster_workers=(
+                        int(cluster_workers) if cluster_workers is not None else None
+                    ),
+                    workflow_options=message,
                 ),
-                workflow_options=message,
-            )
+                **self._client_tracking_fields(message),
+            }
             for index in range(0, len(topic_ids), max_task_size)
         ]
+
+    def _client_tracking_fields(self, message: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: message[key]
+            for key in ("client_task_id", "client_workflow_id")
+            if key in message
+        }
 
     def _is_simple_paper_indexing_message(self, message: dict[str, Any]) -> bool:
         if message.get("task_type") != "paper_indexing":

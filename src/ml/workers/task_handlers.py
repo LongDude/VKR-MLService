@@ -470,6 +470,9 @@ class MLTaskHandler:
             date_to=date_to,
             granularity=granularity,
         )
+        for key in ("client_task_id", "client_workflow_id"):
+            if key in message:
+                task_message[key] = message[key]
         try:
             self.redis_adapter.enqueue("queue:cluster_dynamics_recompute", task_message)
         except Exception:

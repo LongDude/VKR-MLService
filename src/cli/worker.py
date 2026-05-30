@@ -101,6 +101,7 @@ from ml.services.openalex_topic_stats import (
     OpenAlexTopicStatsCollector,
     SyncRateLimiter,
 )
+from ml.services.worker_heartbeat import WorkerHeartbeat
 
 QUEUE_ALIASES = {
     "openalex_topic_stats": OPENALEX_TOPIC_STATS_QUEUE,
@@ -342,6 +343,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
     processed = 0
+    heartbeat: WorkerHeartbeat | None = None
     try:
         redis_adapter = RedisAdapter(build_redis_client(args))
         event_sink = build_event_sink(args, redis_adapter=redis_adapter)
@@ -409,6 +411,8 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 not args.no_progress,
                 args.verbose,
             )
+            heartbeat = WorkerHeartbeat(redis_adapter, queues=queue_names)
+            heartbeat.start()
 
             if args.max_tasks is None:
                 worker.run_forever()
@@ -445,6 +449,8 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
             "cluster_recompute_workers": args.cluster_recompute_workers,
         }
     finally:
+        if heartbeat is not None:
+            heartbeat.stop()
         engine.dispose()
 
 

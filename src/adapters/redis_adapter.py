@@ -77,6 +77,16 @@ class RedisAdapter:
                 details={"key": key, "reason": str(exc)},
             ) from exc
 
+    def ping(self) -> bool:
+        """Return whether Redis responds to PING."""
+        try:
+            return bool(self._client.ping())
+        except Exception as exc:
+            raise RedisOperationError(
+                "Failed to ping Redis",
+                details={"reason": str(exc)},
+            ) from exc
+
     def enqueue(self, queue_name: str, message: dict[str, Any]) -> None:
         try:
             payload = json.dumps(message, ensure_ascii=False)
@@ -163,6 +173,17 @@ class RedisAdapter:
         except Exception as exc:
             raise RedisOperationError(
                 f"Failed to read Redis queue length for {queue_name!r}",
+                details={"queue_name": queue_name, "reason": str(exc)},
+            ) from exc
+
+    def remove_from_queue(self, queue_name: str, message: dict[str, Any]) -> int:
+        """Remove all exact JSON message occurrences from a Redis list."""
+        try:
+            payload = json.dumps(message, ensure_ascii=False)
+            return int(self._client.lrem(queue_name, 0, payload))
+        except Exception as exc:
+            raise RedisOperationError(
+                f"Failed to remove Redis message from {queue_name!r}",
                 details={"queue_name": queue_name, "reason": str(exc)},
             ) from exc
 

@@ -83,6 +83,11 @@ services:
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redis123}
+      - ML_INTERNAL_API_TOKEN=${ML_INTERNAL_API_TOKEN:-change-me}
     volumes:
       - ./:/app
     ports:
