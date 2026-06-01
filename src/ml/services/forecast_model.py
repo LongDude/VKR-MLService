@@ -170,7 +170,7 @@ class PublicationForecastService:
                 }
                 for index in range(horizon)
             ],
-            "quality": self._quality_scores(scores, kind),
+            "quality": self._quality_scores(scores, kind, selected),
         }
 
     def _forecast_series(
@@ -1031,7 +1031,8 @@ class PublicationForecastService:
         self,
         scores: list[CandidateScore],
         kind: SeriesKind,
-    ) -> list[dict[str, float | str]]:
+        selected: CandidateScore | None = None,
+    ) -> list[dict[str, float | str | bool | None]]:
         best_by_family: dict[ModelFamily, CandidateScore] = {}
         for score in scores:
             if (
@@ -1058,14 +1059,27 @@ class PublicationForecastService:
                 self._model_priority(score.candidate, kind),
             ),
         )
+        top_scores = ranked[:3]
+        selected_family = selected.candidate.family if selected is not None else None
+        if (
+            selected is not None
+            and all(score.candidate.family != selected_family for score in top_scores)
+        ):
+            selected_score = best_by_family.get(selected_family, selected)
+            if len(top_scores) >= 3:
+                top_scores[-1] = selected_score
+            else:
+                top_scores.append(selected_score)
+
         return [
             {
                 "family": self._family_name(score.candidate.family),
-                "mae": float(score.mae),
-                "mape": float(score.mape),
-                "smape": float(score.smape),
+                "mae": None if score.mae is None else float(score.mae),
+                "mape": None if score.mape is None else float(score.mape),
+                "smape": None if score.smape is None else float(score.smape),
+                "selected": score.candidate.family == selected_family,
             }
-            for score in ranked[:3]
+            for score in top_scores
         ]
 
     def _family_name(self, family: ModelFamily) -> str:

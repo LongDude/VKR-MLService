@@ -49,9 +49,10 @@ class TopicForecastPointDTO(BaseDTO):
 
 class ForecastQualityModelDTO(BaseDTO):
     family: str
-    mae: float
-    mape: float
-    smape: float
+    mae: float | None = None
+    mape: float | None = None
+    smape: float | None = None
+    selected: bool = False
 
 
 class ForecastQualityGroupDTO(BaseDTO):
