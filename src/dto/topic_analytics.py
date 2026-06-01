@@ -11,6 +11,8 @@ from .common import BaseDTO
 MetricLevel = Literal["low", "medium", "high"]
 RelationType = Literal["same subfield", "embedding similarity", "shared keyphrases"]
 TrendStatus = Literal["emerging", "popular", "declining", "stable"]
+InsightSection = Literal["activity", "trend-decomposition", "related-topics"]
+ForecastPrimaryMetric = Literal["MAE", "SMAPE"]
 
 
 class TopicAnalyticsInsightRequestDTO(BaseDTO):
@@ -20,6 +22,7 @@ class TopicAnalyticsInsightRequestDTO(BaseDTO):
     comparison_window_months: Literal[6, 12, 24] = 12
     forecast_months: Literal[6, 12] = 12
     max_related: int = Field(default=12, ge=1, le=50)
+    sections: list[InsightSection] | None = None
 
     @model_validator(mode="after")
     def validate_period(self) -> "TopicAnalyticsInsightRequestDTO":
@@ -44,6 +47,27 @@ class TopicForecastPointDTO(BaseDTO):
     backtest_error_smape: float | None = None
 
 
+class ForecastQualityModelDTO(BaseDTO):
+    family: str
+    mae: float
+    mape: float
+    smape: float
+
+
+class ForecastQualityGroupDTO(BaseDTO):
+    primary_metric: ForecastPrimaryMetric
+    models: list[ForecastQualityModelDTO] = Field(default_factory=list)
+
+
+class ForecastQualityDTO(BaseDTO):
+    activity: ForecastQualityGroupDTO = Field(
+        default_factory=lambda: ForecastQualityGroupDTO(primary_metric="SMAPE")
+    )
+    share: ForecastQualityGroupDTO = Field(
+        default_factory=lambda: ForecastQualityGroupDTO(primary_metric="MAE")
+    )
+
+
 class TopicDecompositionMetricDTO(BaseDTO):
     key: str
     label: str
@@ -66,6 +90,7 @@ class RelatedTopicDTO(BaseDTO):
 
 class TopicAnalyticsInsightResponseDTO(BaseDTO):
     forecast: list[TopicForecastPointDTO] = Field(default_factory=list)
+    forecast_quality: ForecastQualityDTO = Field(default_factory=ForecastQualityDTO)
     decomposition: list[TopicDecompositionMetricDTO] = Field(default_factory=list)
     related_topics: list[RelatedTopicDTO] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
@@ -73,6 +98,9 @@ class TopicAnalyticsInsightResponseDTO(BaseDTO):
 
 __all__ = [
     "RelatedTopicDTO",
+    "ForecastQualityDTO",
+    "ForecastQualityGroupDTO",
+    "ForecastQualityModelDTO",
     "TopicAnalyticsInsightRequestDTO",
     "TopicAnalyticsInsightResponseDTO",
     "TopicDecompositionMetricDTO",

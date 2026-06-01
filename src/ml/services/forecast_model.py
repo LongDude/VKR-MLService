@@ -109,14 +109,22 @@ class PublicationForecastService:
         horizon: int,
         kind: SeriesKind = "count",
     ) -> list[dict[str, Any]]:
+        return self.forecast_series_with_quality(series, horizon, kind=kind)["forecast"]
+
+    def forecast_series_with_quality(
+        self,
+        series: Any,
+        horizon: int,
+        kind: SeriesKind = "count",
+    ) -> dict[str, Any]:
         if horizon <= 0:
-            return []
+            return {"forecast": [], "quality": []}
 
         clean = self._prepare_series(series, kind)
         if clean.empty:
-            return []
+            return {"forecast": [], "quality": []}
 
-        selected = self._select_candidate(clean, kind, horizon)
+        selected, scores = self._select_candidate_with_scores(clean, kind, horizon)
 
         try:
             forecast = self._fit_forecast(
@@ -148,19 +156,22 @@ class PublicationForecastService:
             freq="MS",
         )
 
-        return [
-            {
-                "period_start": forecast_index[index].date(),
-                "forecast": float(values[index]),
-                "lower_bound": float(lower[index]),
-                "upper_bound": float(upper[index]),
-                "model_name": selected.candidate.name,
-                "backtest_error_mae": selected.mae,
-                "backtest_error_mape": selected.mape,
-                "backtest_error_smape": selected.smape,
-            }
-            for index in range(horizon)
-        ]
+        return {
+            "forecast": [
+                {
+                    "period_start": forecast_index[index].date(),
+                    "forecast": float(values[index]),
+                    "lower_bound": float(lower[index]),
+                    "upper_bound": float(upper[index]),
+                    "model_name": selected.candidate.name,
+                    "backtest_error_mae": selected.mae,
+                    "backtest_error_mape": selected.mape,
+                    "backtest_error_smape": selected.smape,
+                }
+                for index in range(horizon)
+            ],
+            "quality": self._quality_scores(scores, kind),
+        }
 
     def _forecast_series(
         self,
@@ -240,14 +251,23 @@ class PublicationForecastService:
         kind: SeriesKind,
         horizon: int,
     ) -> CandidateScore:
+        selected, _scores = self._select_candidate_with_scores(clean, kind, horizon)
+        return selected
+
+    def _select_candidate_with_scores(
+        self,
+        clean: Any,
+        kind: SeriesKind,
+        horizon: int,
+    ) -> tuple[CandidateScore, list[CandidateScore]]:
         fallback = self._fallback_score(clean, kind)
 
         if len(clean) < self.min_backtest_points:
-            return fallback
+            return fallback, []
 
         splits = self._backtest_splits(len(clean), horizon)
         if not splits:
-            return fallback
+            return fallback, []
 
         scores: list[CandidateScore] = []
 
@@ -259,7 +279,7 @@ class PublicationForecastService:
                     scores.append(score)
 
         if not scores:
-            return fallback
+            return fallback, []
 
         best_primary = min(self._primary_error(score, kind) for score in scores)
 
@@ -271,14 +291,17 @@ class PublicationForecastService:
             <= best_primary * (1.0 + self.near_tie_relative_tolerance)
         ]
 
-        return sorted(
-            eligible,
-            key=lambda score: (
-                self._model_priority(score.candidate, kind),
-                self._primary_error(score, kind),
-                self._candidate_complexity(score.candidate),
-            ),
-        )[0]
+        return (
+            sorted(
+                eligible,
+                key=lambda score: (
+                    self._model_priority(score.candidate, kind),
+                    self._primary_error(score, kind),
+                    self._candidate_complexity(score.candidate),
+                ),
+            )[0],
+            scores,
+        )
 
     def _candidate_grid(
         self,
@@ -1003,6 +1026,57 @@ class PublicationForecastService:
             return math.inf
 
         return float(value)
+
+    def _quality_scores(
+        self,
+        scores: list[CandidateScore],
+        kind: SeriesKind,
+    ) -> list[dict[str, float | str]]:
+        best_by_family: dict[ModelFamily, CandidateScore] = {}
+        for score in scores:
+            if (
+                score.mae is None
+                or score.mape is None
+                or score.smape is None
+                or not np.isfinite(score.mae)
+                or not np.isfinite(score.mape)
+                or not np.isfinite(score.smape)
+            ):
+                continue
+            existing = best_by_family.get(score.candidate.family)
+            if (
+                existing is None
+                or self._primary_error(score, kind)
+                < self._primary_error(existing, kind)
+            ):
+                best_by_family[score.candidate.family] = score
+
+        ranked = sorted(
+            best_by_family.values(),
+            key=lambda score: (
+                self._primary_error(score, kind),
+                self._model_priority(score.candidate, kind),
+            ),
+        )
+        return [
+            {
+                "family": self._family_name(score.candidate.family),
+                "mae": float(score.mae),
+                "mape": float(score.mape),
+                "smape": float(score.smape),
+            }
+            for score in ranked[:3]
+        ]
+
+    def _family_name(self, family: ModelFamily) -> str:
+        return {
+            "sarimax": "SARIMAX",
+            "ets": "ETS",
+            "seasonal_naive": "seasonal_naive",
+            "rolling_mean": "rolling_mean",
+            "seasonal_drift": "seasonal_drift",
+            "linear_trend": "linear_trend",
+        }[family]
 
     def _model_priority(
         self,

@@ -10,6 +10,9 @@ from sqlalchemy.orm import Session
 
 from adapters.qdrant_adapter import QdrantAdapter
 from dto.topic_analytics import (
+    ForecastQualityDTO,
+    ForecastQualityGroupDTO,
+    ForecastQualityModelDTO,
     RelatedTopicDTO,
     TopicAnalyticsInsightRequestDTO,
     TopicAnalyticsInsightResponseDTO,
@@ -38,29 +41,36 @@ class TopicAnalyticsFacade:
         self, request: TopicAnalyticsInsightRequestDTO
     ) -> TopicAnalyticsInsightResponseDTO:
         errors: list[str] = []
-        monthly = self._monthly_series(
-            request.topic_id, request.period_start, request.period_end
-        )
         forecast: list[TopicForecastPointDTO] = []
-        try:
-            forecast = self._forecast(monthly, request.forecast_months)
-        except Exception as exc:
-            errors.append(f"Forecast unavailable: {exc}")
+        forecast_quality = ForecastQualityDTO()
+        if self._includes(request, "activity"):
+            try:
+                monthly = self._monthly_series(
+                    request.topic_id, request.period_start, request.period_end
+                )
+                forecast, forecast_quality = self._forecast(
+                    monthly, request.forecast_months
+                )
+            except Exception as exc:
+                errors.append(f"Forecast unavailable: {exc}")
 
         decomposition: list[TopicDecompositionMetricDTO] = []
-        try:
-            decomposition = self._decomposition(request)
-        except Exception as exc:
-            errors.append(f"Trend decomposition ML metrics unavailable: {exc}")
+        if self._includes(request, "trend-decomposition"):
+            try:
+                decomposition = self._decomposition(request)
+            except Exception as exc:
+                errors.append(f"Trend decomposition ML metrics unavailable: {exc}")
 
         related: list[RelatedTopicDTO] = []
-        try:
-            related = self._related_topics(request, errors)
-        except Exception as exc:
-            errors.append(f"Related topics unavailable: {exc}")
+        if self._includes(request, "related-topics"):
+            try:
+                related = self._related_topics(request, errors)
+            except Exception as exc:
+                errors.append(f"Related topics unavailable: {exc}")
 
         return TopicAnalyticsInsightResponseDTO(
             forecast=forecast,
+            forecast_quality=forecast_quality,
             decomposition=decomposition,
             related_topics=related,
             errors=errors,
@@ -135,10 +145,10 @@ class TopicAnalyticsFacade:
 
     def _forecast(
         self, rows: list[dict[str, Any]], horizon: int
-    ) -> list[TopicForecastPointDTO]:
+    ) -> tuple[list[TopicForecastPointDTO], ForecastQualityDTO]:
         observed_rows = [row for row in rows if row.get("is_observed", True)]
         if not observed_rows:
-            return []
+            return [], ForecastQualityDTO()
         share_series = pd.Series(
             [float(row["share"]) for row in observed_rows],
             index=pd.to_datetime([row["period_start"] for row in observed_rows]),
@@ -147,13 +157,15 @@ class TopicAnalyticsFacade:
             [float(row["topic_count"]) for row in observed_rows],
             index=pd.to_datetime([row["period_start"] for row in observed_rows]),
         )
-        share_forecast = self._forecast_service.forecast_series(
+        share_result = self._forecast_service.forecast_series_with_quality(
             share_series, horizon, kind="share"
         )
 
-        topic_forecast = self._forecast_service.forecast_series(
+        topic_result = self._forecast_service.forecast_series_with_quality(
             topic_series, horizon, kind="count"
         )
+        share_forecast = share_result["forecast"]
+        topic_forecast = topic_result["forecast"]
 
         # share_forecast = self._forecast_series(share_series, horizon)
         # topic_forecast = self._forecast_series(subfield_series, horizon)
@@ -190,7 +202,30 @@ class TopicAnalyticsFacade:
                     ),
                 )
             )
-        return result
+        return (
+            result,
+            ForecastQualityDTO(
+                activity=ForecastQualityGroupDTO(
+                    primary_metric="SMAPE",
+                    models=[
+                        ForecastQualityModelDTO(**item)
+                        for item in topic_result["quality"]
+                    ],
+                ),
+                share=ForecastQualityGroupDTO(
+                    primary_metric="MAE",
+                    models=[
+                        ForecastQualityModelDTO(**item)
+                        for item in share_result["quality"]
+                    ],
+                ),
+            ),
+        )
+
+    def _includes(
+        self, request: TopicAnalyticsInsightRequestDTO, section: str
+    ) -> bool:
+        return request.sections is None or section in request.sections
 
     # ! Deprecated
     # def _forecast_series(
