@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
+from ml.task_contracts import RECOMPUTE_TOPIC_CLUSTERS_TASK
+
 CLUSTER_RECOMPUTE_DEDUPE_KEY_PREFIX = "ml:dedupe:cr"
 DEFAULT_CLUSTER_RECOMPUTE_DEDUPE_TTL_SECONDS = 24 * 60 * 60
 CLUSTER_RECOMPUTE_WORKFLOW_FIELDS = (
@@ -83,7 +85,7 @@ def build_cluster_recompute_message(
     workflow_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     message: dict[str, Any] = {
-        "task_type": "recompute_topic_clusters",
+        "task_type": RECOMPUTE_TOPIC_CLUSTERS_TASK,
         "topic_ids": list(dict.fromkeys(int(topic_id) for topic_id in topic_ids)),
         "force_summary": bool(force_summary),
     }

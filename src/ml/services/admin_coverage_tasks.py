@@ -8,18 +8,26 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from adapters.redis_adapter import RedisAdapter
+from core.config import Settings, get_settings
 from repositories.taxonomy import TaxonomyRepository
 from ml.services.worker_heartbeat import ML_WORKER_HEARTBEAT_KEY
-from ml.workers.redis_worker import (
+from ml.task_contracts import (
     ADMIN_COVERAGE_TASK_RESULT_KEY_PREFIX,
+    BOOTSTRAP_PAPERS_TASK,
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
+    CLUSTER_DYNAMICS_RECOMPUTE_TASK,
     CLUSTER_RECOMPUTE_QUEUE,
+    COLLECT_TOPIC_STATS_TASK,
     FAILED_TASKS_QUEUE,
     KEYWORD_EXTRACTION_QUEUE,
+    KEYWORD_EXTRACTION_TASK,
     OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     OPENALEX_TOPIC_STATS_QUEUE,
     PAPER_INDEXING_QUEUE,
+    PAPER_INDEXING_TASK,
+    RECOMPUTE_TOPIC_CLUSTERS_TASK,
     TOPIC_QUARTER_REPORT_QUEUE,
+    TOPIC_QUARTER_REPORT_TASK,
 )
 
 ACTIVE_TASKS_QUEUE = "queue:admin_data_coverage_active"
@@ -60,9 +68,15 @@ WORKFLOW_PRESETS = {
 class AdminCoverageTaskService:
     """Orchestrate admin-triggered ML tasks while keeping workers unchanged."""
 
-    def __init__(self, session: Session | None, redis_adapter: RedisAdapter) -> None:
+    def __init__(
+        self,
+        session: Session | None,
+        redis_adapter: RedisAdapter,
+        settings: Settings | None = None,
+    ) -> None:
         self.session = session
         self.redis = redis_adapter
+        self.settings = settings or get_settings()
 
     def worker_status(self) -> dict[str, Any]:
         try:
@@ -235,7 +249,11 @@ class AdminCoverageTaskService:
             "updatedAt": self._now_iso(),
             "message": "Task queued.",
         }
-        self.redis.set_json(self._task_key(task_id), record, TRACKING_TTL_SECONDS)
+        self.redis.set_json(
+            self._task_key(task_id),
+            record,
+            self.settings.admin.tracking_ttl_seconds,
+        )
         self.redis.enqueue(ACTIVE_TASKS_QUEUE, {"task_id": task_id})
         self.redis.enqueue(queue_name, payload)
         return record
@@ -261,20 +279,20 @@ class AdminCoverageTaskService:
                 OPENALEX_TOPIC_STATS_QUEUE,
                 {
                     **common,
-                    "task_type": "collect_topic_stats",
+                    "task_type": COLLECT_TOPIC_STATS_TASK,
                     "date_from": date_from,
                     "date_to": date_to,
                     "taxonomy_scope": "topic",
                     "topic_ids": topic_ids,
-                    "languages": ["en", "ru"],
-                    "types": ["article"],
-                    "batch_size": 500,
-                    "request_workers": 8,
-                    "rate_limit_rps": 10.0,
-                    "max_retries": 5,
-                    "group_by_page_size": 200,
-                    "normalize_january_first": True,
-                    "primary_topic_only": True,
+                    "languages": list(self.settings.openalex.languages),
+                    "types": list(self.settings.openalex.types),
+                    "batch_size": self.settings.openalex.stats_batch_size,
+                    "request_workers": self.settings.openalex.stats_request_workers,
+                    "rate_limit_rps": self.settings.openalex.stats_rate_limit_rps,
+                    "max_retries": self.settings.openalex.stats_max_retries,
+                    "group_by_page_size": self.settings.openalex.stats_group_by_page_size,
+                    "normalize_january_first": self.settings.openalex.normalize_january_first,
+                    "primary_topic_only": self.settings.openalex.primary_topic_only,
                     "show_progress": False,
                 },
                 topic_ids,
@@ -285,27 +303,27 @@ class AdminCoverageTaskService:
                 OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
                 {
                     **common,
-                    "task_type": "bootstrap_papers",
+                    "task_type": BOOTSTRAP_PAPERS_TASK,
                     "date_from": date_from,
                     "date_to": date_to,
                     "topic_ids": topic_ids,
                     "source_topic_ids": topic_ids,
-                    "target_count": 20,
+                    "target_count": self.settings.openalex.bootstrap_target_count,
                     "target_scope": "month",
                     "target_unit": "topic",
-                    "languages": ["en", "ru"],
-                    "types": ["article"],
-                    "batch_size": 500,
-                    "request_workers": 8,
-                    "db_workers": 2,
-                    "rate_limit_rps": 70.0,
-                    "seed": 42,
-                    "per_page": 100,
-                    "max_retries": 5,
+                    "languages": list(self.settings.openalex.languages),
+                    "types": list(self.settings.openalex.types),
+                    "batch_size": self.settings.openalex.bootstrap_batch_size,
+                    "request_workers": self.settings.openalex.bootstrap_request_workers,
+                    "db_workers": self.settings.openalex.bootstrap_db_workers,
+                    "rate_limit_rps": self.settings.openalex.bootstrap_rate_limit_rps,
+                    "seed": self.settings.openalex.bootstrap_seed,
+                    "per_page": self.settings.openalex.bootstrap_per_page,
+                    "max_retries": self.settings.openalex.bootstrap_max_retries,
                     "skip_existing": False,
                     "enqueue_indexing": False,
                     "enqueue_cluster_dynamics": False,
-                    "primary_topic_only": True,
+                    "primary_topic_only": self.settings.openalex.primary_topic_only,
                     "workflow_date_from": date_from,
                     "workflow_date_to": date_to,
                     "workflow_granularity": "month",
@@ -325,7 +343,7 @@ class AdminCoverageTaskService:
                     PAPER_INDEXING_QUEUE,
                     {
                         **common,
-                        "task_type": "paper_indexing",
+                        "task_type": PAPER_INDEXING_TASK,
                         "paper_ids": paper_ids,
                         "force_reindex": False,
                         "source_topic_ids": tracked_topics,
@@ -340,7 +358,7 @@ class AdminCoverageTaskService:
                 KEYWORD_EXTRACTION_QUEUE,
                 {
                     **common,
-                    "task_type": "keyword_extraction",
+                    "task_type": KEYWORD_EXTRACTION_TASK,
                     "paper_ids": paper_ids,
                     "skip_processed": True,
                     "skip_non_english": False,
@@ -354,7 +372,7 @@ class AdminCoverageTaskService:
                     CLUSTER_RECOMPUTE_QUEUE,
                     {
                         **common,
-                        "task_type": "recompute_topic_clusters",
+                        "task_type": RECOMPUTE_TOPIC_CLUSTERS_TASK,
                         "topic_ids": topic_ids,
                         "workflow_date_from": date_from,
                         "workflow_date_to": date_to,
@@ -367,7 +385,7 @@ class AdminCoverageTaskService:
                 CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
                 {
                     **common,
-                    "task_type": "cluster_dynamics_recompute",
+                    "task_type": CLUSTER_DYNAMICS_RECOMPUTE_TASK,
                     "cluster_ids": [f"topic:{topic_id}" for topic_id in topic_ids],
                     "date_from": date_from,
                     "date_to": date_to,
@@ -381,7 +399,7 @@ class AdminCoverageTaskService:
                 TOPIC_QUARTER_REPORT_QUEUE,
                 {
                     **common,
-                    "task_type": "topic_quarter_report",
+                    "task_type": TOPIC_QUARTER_REPORT_TASK,
                     "requests": [
                         {
                             "topic_id": topic_id,
@@ -391,7 +409,7 @@ class AdminCoverageTaskService:
                         for topic_id in topic_ids
                     ],
                     "force": False,
-                    "report_language": "ru",
+                    "report_language": self.settings.operations.topic_report_language,
                 },
                 topic_ids,
             )
@@ -400,7 +418,10 @@ class AdminCoverageTaskService:
     def _reconcile_tasks(self) -> set[str]:
         completed_panels: set[str] = set()
         failed_ids = self._failed_task_ids()
-        for marker in self.redis.peek_queue(ACTIVE_TASKS_QUEUE, MAX_TRACKED_ITEMS):
+        for marker in self.redis.peek_queue(
+            ACTIVE_TASKS_QUEUE,
+            self.settings.admin.max_tracked_items,
+        ):
             task_id = str(marker.get("task_id") or "")
             if not task_id:
                 self.redis.remove_from_queue(ACTIVE_TASKS_QUEUE, marker)
@@ -438,12 +459,19 @@ class AdminCoverageTaskService:
         record["status"] = status
         record["message"] = message
         record["updatedAt"] = self._now_iso()
-        self.redis.set_json(self._task_key(str(record["id"])), record, RECENT_TTL_SECONDS)
+        self.redis.set_json(
+            self._task_key(str(record["id"])),
+            record,
+            self.settings.admin.recent_ttl_seconds,
+        )
         self.redis.remove_from_queue(ACTIVE_TASKS_QUEUE, marker)
         self.redis.enqueue(RECENT_TASKS_QUEUE, {"task_id": str(record["id"])})
 
     def _reconcile_workflows(self) -> None:
-        for marker in self.redis.peek_queue(ACTIVE_WORKFLOWS_QUEUE, MAX_TRACKED_ITEMS):
+        for marker in self.redis.peek_queue(
+            ACTIVE_WORKFLOWS_QUEUE,
+            self.settings.admin.max_tracked_items,
+        ):
             workflow_id = str(marker.get("workflow_id") or "")
             record = self.redis.get_json(self._workflow_key(workflow_id)) if workflow_id else None
             if record is None:
@@ -512,7 +540,7 @@ class AdminCoverageTaskService:
         record["status"] = "completed"
         record["currentStage"] = None
         record["message"] = "Workflow completed."
-        self._save_workflow(record, ttl_seconds=RECENT_TTL_SECONDS)
+        self._save_workflow(record, ttl_seconds=self.settings.admin.recent_ttl_seconds)
         self._move_workflow_to_recent(record)
 
     def _move_workflow_to_recent(self, record: dict[str, Any]) -> None:
@@ -783,7 +811,14 @@ class AdminCoverageTaskService:
         month_index = value.year * 12 + value.month - 1 + count
         return date(month_index // 12, month_index % 12 + 1, 1)
 
-    def _records(self, queue_name: str, marker_field: str, *, limit: int = MAX_TRACKED_ITEMS) -> list[dict[str, Any]]:
+    def _records(
+        self,
+        queue_name: str,
+        marker_field: str,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        limit = limit or self.settings.admin.max_tracked_items
         records: list[dict[str, Any]] = []
         seen: set[str] = set()
         prefix = TASK_KEY_PREFIX if marker_field == "task_id" else WORKFLOW_KEY_PREFIX
@@ -797,7 +832,13 @@ class AdminCoverageTaskService:
                 records.append(record)
         return records
 
-    def _save_workflow(self, record: dict[str, Any], *, ttl_seconds: int = TRACKING_TTL_SECONDS) -> None:
+    def _save_workflow(
+        self,
+        record: dict[str, Any],
+        *,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        ttl_seconds = ttl_seconds or self.settings.admin.tracking_ttl_seconds
         record["updatedAt"] = self._now_iso()
         self.redis.set_json(self._workflow_key(str(record["id"])), record, ttl_seconds)
 
@@ -806,7 +847,10 @@ class AdminCoverageTaskService:
             created = datetime.fromisoformat(str(record["createdAt"]))
         except ValueError:
             return True
-        return datetime.now(timezone.utc) - created > STALE_AFTER
+        return (
+            datetime.now(timezone.utc) - created
+            > timedelta(hours=self.settings.admin.stale_after_hours)
+        )
 
     def _task_key(self, task_id: str) -> str:
         return f"{TASK_KEY_PREFIX}:{task_id}"

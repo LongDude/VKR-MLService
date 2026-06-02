@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
+from ml.task_contracts import CLUSTER_DYNAMICS_RECOMPUTE_TASK
+
 CLUSTER_DYNAMICS_DEDUPE_KEY_PREFIX = "ml:dedupe:cd"
 DEFAULT_CLUSTER_DYNAMICS_DEDUPE_TTL_SECONDS = 24 * 60 * 60
 
@@ -78,7 +80,7 @@ def build_cluster_dynamics_message(
     granularity: str = "month",
 ) -> dict[str, Any]:
     return {
-        "task_type": "cluster_dynamics_recompute",
+        "task_type": CLUSTER_DYNAMICS_RECOMPUTE_TASK,
         "cluster_ids": list(
             dict.fromkeys(str(cluster_id) for cluster_id in cluster_ids)
         ),

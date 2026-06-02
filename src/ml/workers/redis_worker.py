@@ -18,23 +18,29 @@ from ml.services.openalex_cooldown import (
     OPENALEX_COOLDOWN_KEY,
     OPENALEX_TOPIC_STATS_PENDING_QUEUE,
 )
+from ml.task_contracts import (
+    ADMIN_COVERAGE_TASK_RESULT_KEY_PREFIX,
+    CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
+    CLUSTER_RECOMPUTE_QUEUE,
+    ENTITY_INDEXING_QUEUE,
+    FAILED_TASKS_QUEUE,
+    KEYWORD_EXTRACTION_QUEUE,
+    KEYWORD_EXTRACTION_TASK,
+    ML_WORKER_SHUTDOWN_KEY,
+    OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+    OPENALEX_TOPIC_STATS_QUEUE,
+    PAPER_INDEXING_QUEUE,
+    PAPER_INDEXING_TASK,
+    RECOMPUTE_TOPIC_CLUSTERS_TASK,
+    RESUME_BOOTSTRAP_PAPERS_TASK,
+    TOPIC_QUARTER_REPORT_QUEUE,
+    USER_PROFILE_RECOMPUTE_QUEUE,
+)
 from ml.workers.task_handlers import MLTaskHandler
 
 # TODO: вынести параметры в файл настроек
 # TODO: Разработать корректную систему типов для сообщений - вместо словарей использовать контракты
 
-KEYWORD_EXTRACTION_QUEUE = "queue:keyword_extraction"
-OPENALEX_TOPIC_STATS_QUEUE = "queue:openalex_topic_stats"
-OPENALEX_BOOTSTRAP_PAPERS_QUEUE = "queue:openalex_bootstrap_papers"
-PAPER_INDEXING_QUEUE = "queue:paper_indexing"
-ENTITY_INDEXING_QUEUE = "queue:entity_indexing"
-CLUSTER_RECOMPUTE_QUEUE = "queue:cluster_recompute"
-CLUSTER_DYNAMICS_RECOMPUTE_QUEUE = "queue:cluster_dynamics_recompute"
-TOPIC_QUARTER_REPORT_QUEUE = "queue:topic_quarter_reports"
-USER_PROFILE_RECOMPUTE_QUEUE = "queue:user_profile_recompute"
-FAILED_TASKS_QUEUE = "queue:failed_tasks"
-ML_WORKER_SHUTDOWN_KEY = "ml:worker:shutdown"
-ADMIN_COVERAGE_TASK_RESULT_KEY_PREFIX = "admin:data_coverage:result"
 ADMIN_COVERAGE_TASK_RESULT_TTL_SECONDS = 7 * 24 * 60 * 60
 
 DEFAULT_QUEUE_ORDER = (
@@ -75,6 +81,7 @@ class RedisMLWorker:
         idle_sleep_seconds: float = 1.0,
         show_progress: bool = False,
         event_sink: EventSink | None = None,
+        admin_result_ttl_seconds: int = ADMIN_COVERAGE_TASK_RESULT_TTL_SECONDS,
         logger: logging.Logger | None = None,
     ) -> None:
         self.redis_adapter = redis_adapter
@@ -95,6 +102,7 @@ class RedisMLWorker:
         self.event_sink = event_sink or (
             TqdmEventSink() if show_progress else NoopEventSink()
         )
+        self.admin_result_ttl_seconds = max(1, int(admin_result_ttl_seconds))
         self.logger = logger or logging.getLogger(__name__)
         self._stop_requested = False
         self._current_queue_name: str | None = None
@@ -193,7 +201,7 @@ class RedisMLWorker:
             queue_name == OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE
             and "task_type" not in message
         ):
-            return {"task_type": "resume_bootstrap_papers", "page": message}
+            return {"task_type": RESUME_BOOTSTRAP_PAPERS_TASK, "page": message}
         return message
 
     def _active_queues(self) -> tuple[str, ...]:
@@ -380,7 +388,7 @@ class RedisMLWorker:
             if paper_ids:
                 result.append(
                     {
-                        "task_type": "keyword_extraction",
+                        "task_type": KEYWORD_EXTRACTION_TASK,
                         "paper_ids": paper_ids,
                         "top_k": top_k,
                         "min_score": min_score,
@@ -525,7 +533,7 @@ class RedisMLWorker:
             self.redis_adapter.set_json(
                 f"{ADMIN_COVERAGE_TASK_RESULT_KEY_PREFIX}:{task_id}",
                 self._result_payload(result),
-                ADMIN_COVERAGE_TASK_RESULT_TTL_SECONDS,
+                self.admin_result_ttl_seconds,
             )
         except Exception:
             self.logger.exception(
@@ -551,7 +559,7 @@ class RedisMLWorker:
         queue_name: str,
         message: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        if message.get("task_type") != "paper_indexing":
+        if message.get("task_type") != PAPER_INDEXING_TASK:
             return [message]
         max_task_size = self.max_task_sizes.get(queue_name)
         if max_task_size is None:
@@ -565,7 +573,7 @@ class RedisMLWorker:
         workflow_fields = self._paper_indexing_workflow_fields(message)
         return [
             {
-                "task_type": "paper_indexing",
+                "task_type": PAPER_INDEXING_TASK,
                 "paper_ids": paper_ids[index : index + max_task_size],
                 "force_reindex": force_reindex,
                 **workflow_fields,
@@ -579,7 +587,7 @@ class RedisMLWorker:
         queue_name: str,
         message: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        if message.get("task_type") != "keyword_extraction":
+        if message.get("task_type") != KEYWORD_EXTRACTION_TASK:
             return [message]
         max_task_size = self.max_task_sizes.get(queue_name)
         if max_task_size is None:
@@ -594,7 +602,7 @@ class RedisMLWorker:
         )
         return [
             {
-                "task_type": "keyword_extraction",
+                "task_type": KEYWORD_EXTRACTION_TASK,
                 "paper_ids": paper_ids[index : index + max_task_size],
                 "top_k": top_k,
                 "min_score": min_score,
@@ -610,10 +618,7 @@ class RedisMLWorker:
         queue_name: str,
         message: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        if message.get("task_type") not in {
-            "cluster_recompute",
-            "recompute_topic_clusters",
-        }:
+        if message.get("task_type") != RECOMPUTE_TOPIC_CLUSTERS_TASK:
             return [message]
 
         max_task_size = self.max_task_sizes.get(queue_name)
@@ -649,7 +654,7 @@ class RedisMLWorker:
         }
 
     def _is_simple_paper_indexing_message(self, message: dict[str, Any]) -> bool:
-        if message.get("task_type") != "paper_indexing":
+        if message.get("task_type") != PAPER_INDEXING_TASK:
             return False
         allowed_keys = {
             "task_type",
@@ -683,7 +688,7 @@ class RedisMLWorker:
         paper_ids: list[int],
     ) -> dict[str, Any]:
         return {
-            "task_type": "paper_indexing",
+            "task_type": PAPER_INDEXING_TASK,
             "paper_ids": list(paper_ids),
             "force_reindex": bool(message.get("force_reindex", False)),
             **self._paper_indexing_workflow_fields(message),
@@ -751,7 +756,7 @@ class RedisMLWorker:
         return str(value)
 
     def _is_simple_keyword_extraction_message(self, message: dict[str, Any]) -> bool:
-        if message.get("task_type") != "keyword_extraction":
+        if message.get("task_type") != KEYWORD_EXTRACTION_TASK:
             return False
         allowed_keys = {
             "task_type",
@@ -780,10 +785,7 @@ class RedisMLWorker:
         )
 
     def _is_simple_cluster_recompute_message(self, message: dict[str, Any]) -> bool:
-        if message.get("task_type") not in {
-            "cluster_recompute",
-            "recompute_topic_clusters",
-        }:
+        if message.get("task_type") != RECOMPUTE_TOPIC_CLUSTERS_TASK:
             return False
         if message.get("cluster_id"):
             return False

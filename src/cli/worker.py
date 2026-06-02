@@ -4,14 +4,11 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import sys
 import time
 from datetime import date
 from pathlib import Path
 from typing import Any
-
-from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 SRC_DIR = BASE_DIR.parent
@@ -27,7 +24,13 @@ from adapters import (
     QdrantAdapter,
     RedisAdapter,
 )
-from core.config import Settings
+from core.config import Settings, load_settings
+from core.dependencies import (
+    create_chat_adapter,
+    create_embedding_adapter,
+    create_qdrant_adapter,
+    create_redis_client,
+)
 from core.exceptions import AppError
 from dto.openalex import (
     OpenAlexBootstrapRequestDTO,
@@ -67,19 +70,21 @@ from ml.services.openalex_paper_downloader import OpenAlexPaperDownloader
 from ml.services.openalex_paper_importer import OpenAlexPaperImporter
 from ml.services.openalex_paper_plan import OpenAlexPaperPlanService
 from ml.services.openalex_rate_limiter import AsyncRateLimiter
-from ml.workers.redis_worker import (
+from ml.task_contracts import (
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
-    DEFAULT_QUEUE_ORDER,
     ENTITY_INDEXING_QUEUE,
     KEYWORD_EXTRACTION_QUEUE,
-    OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE,
     OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
-    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
     OPENALEX_TOPIC_STATS_QUEUE,
     PAPER_INDEXING_QUEUE,
     TOPIC_QUARTER_REPORT_QUEUE,
     USER_PROFILE_RECOMPUTE_QUEUE,
+)
+from ml.workers.redis_worker import (
+    DEFAULT_QUEUE_ORDER,
+    OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE,
+    OPENALEX_TOPIC_STATS_PENDING_QUEUE,
     RedisMLWorker,
 )
 from ml.workers.task_handlers import MLTaskHandler
@@ -103,29 +108,9 @@ from ml.services.openalex_topic_stats import (
 )
 from ml.services.worker_heartbeat import WorkerHeartbeat
 
-QUEUE_ALIASES = {
-    "openalex_topic_stats": OPENALEX_TOPIC_STATS_QUEUE,
-    "collect_topic_stats": OPENALEX_TOPIC_STATS_QUEUE,
-    "collect-topic-stats": OPENALEX_TOPIC_STATS_QUEUE,
-    "openalex_topic_stats_pending": OPENALEX_TOPIC_STATS_PENDING_QUEUE,
-    "openalex_bootstrap_papers": OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
-    "bootstrap_papers": OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
-    "bootstrap-papers": OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
-    "openalex_bootstrap_papers_pending": OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE,
-    "keyword_extraction": KEYWORD_EXTRACTION_QUEUE,
-    "paper_indexing": PAPER_INDEXING_QUEUE,
-    "entity_indexing": ENTITY_INDEXING_QUEUE,
-    "research_entities_indexing": ENTITY_INDEXING_QUEUE,
-    "cluster_recompute": CLUSTER_RECOMPUTE_QUEUE,
-    "cluster_dynamics_recompute": CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
-    "topic_quarter_reports": TOPIC_QUARTER_REPORT_QUEUE,
-    "topic_quarter_report": TOPIC_QUARTER_REPORT_QUEUE,
-    "user_profile_recompute": USER_PROFILE_RECOMPUTE_QUEUE,
-}
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse worker CLI command and command-specific arguments."""
+    settings = _preload_settings(argv)
     parser = argparse.ArgumentParser(description="ML worker CLI utilities.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -135,10 +120,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     run_parser.add_argument(
         "--queues",
-        default=",".join(DEFAULT_QUEUE_ORDER),
+        default=",".join(settings.worker.queues),
         help=(
-            "Comma-separated queues to process. Accepts names like "
-            "paper_indexing,cluster_recompute or full queue:* names."
+            "Comma-separated full queue:* Redis names to process."
         ),
     )
     run_parser.add_argument(
@@ -150,13 +134,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run_parser.add_argument(
         "--idle-sleep",
         type=float,
-        default=2.0,
+        default=settings.worker.idle_sleep_seconds,
         help="Seconds to sleep when no tasks are available. Defaults to 2.",
     )
     run_parser.add_argument(
         "--dequeue-timeout-seconds",
         type=int,
-        default=30,
+        default=settings.worker.dequeue_timeout_seconds,
         help="Redis BLPOP timeout for active queues. Defaults to 30.",
     )
     run_parser.add_argument(
@@ -172,23 +156,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run_parser.add_argument(
         "--no-progress",
         action="store_true",
+        default=not settings.worker.show_progress,
         help="Disable tqdm progress bars for worker tasks.",
     )
     run_parser.add_argument(
         "--event-redis",
         action="store_true",
+        default=settings.worker.event_redis,
         help="Write latest task status events to Redis.",
     )
     run_parser.add_argument(
         "--event-ttl-seconds",
         type=int,
-        default=24 * 60 * 60,
+        default=settings.worker.event_ttl_seconds,
         help="TTL for Redis event status keys. Defaults to 86400.",
     )
     run_parser.add_argument(
         "--keyword-extraction-batch-size",
         type=int,
-        default=128,
+        default=settings.worker.keyword_extraction_batch_size,
         help=(
             "Maximum queue:keyword_extraction messages to combine into one "
             "KeywordExtractionPipeline.run_papers call. Defaults to 128."
@@ -197,7 +183,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run_parser.add_argument(
         "--max-keyword-task-size",
         type=int,
-        default=None,
+        default=settings.worker.max_keyword_task_size,
         help=(
             "Maximum paper_ids per keyword_extraction handler call. Defaults to "
             "--keyword-extraction-batch-size."
@@ -206,7 +192,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run_parser.add_argument(
         "--paper-indexing-batch-size",
         type=int,
-        default=128,
+        default=settings.worker.paper_indexing_batch_size,
         help=(
             "Maximum queue:paper_indexing messages to combine into one "
             "PaperIndexingPipeline.run_many call. Defaults to 128."
@@ -215,7 +201,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run_parser.add_argument(
         "--max-paper-task-size",
         type=int,
-        default=None,
+        default=settings.worker.max_paper_task_size,
         help=(
             "Maximum paper_ids per paper_indexing handler call. Defaults to "
             "--paper-indexing-batch-size."
@@ -224,7 +210,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run_parser.add_argument(
         "--cluster-recompute-batch-size",
         type=int,
-        default=50,
+        default=settings.worker.cluster_recompute_batch_size,
         help=(
             "Maximum queue:cluster_recompute topic messages to combine into one "
             "cluster recompute batch. Defaults to 50."
@@ -233,22 +219,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run_parser.add_argument(
         "--cluster-recompute-workers",
         type=int,
-        default=1,
+        default=settings.worker.cluster_recompute_workers,
         help="Parallel workers inside one cluster recompute batch. Defaults to 1.",
     )
     run_parser.add_argument(
         "--max-cluster-task-size",
         type=int,
-        default=None,
+        default=settings.worker.max_cluster_task_size,
         help=(
             "Maximum topic_ids per cluster recompute handler call. Defaults to "
             "--cluster-recompute-batch-size."
         ),
     )
     run_parser.add_argument(
+        "--config-file",
+        default=None,
+        help="Optional TOML override file. Defaults to ML_CONFIG_FILE when set.",
+    )
+    run_parser.add_argument(
         "--env-file",
-        default=str(PROJECT_DIR / ".env"),
-        help="Path to .env file. Defaults to project .env.",
+        default=None,
+        help="Optional .env path. Defaults to ML_ENV_FILE or project .env.",
     )
     run_parser.add_argument(
         "--database-url",
@@ -268,14 +259,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_redis_args(run_parser)
     add_qdrant_args(run_parser)
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.settings = settings
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the requested worker command."""
     args = parse_args(argv)
-    load_dotenv(args.env_file)
-    configure_logging(getattr(args, "verbose", 0))
+    args.settings = load_settings(
+        config_file=getattr(args, "config_file", None),
+        env_file=args.env_file,
+    )
+    configure_logging(getattr(args, "verbose", 0), settings=_settings(args))
 
     try:
         if args.command == "run":
@@ -338,7 +334,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     queue_names = parse_queues(args.queues)
-    database_url = args.database_url or Settings.from_env().database_url
+    database_url = args.database_url or _settings(args).database_url
     engine = create_db_engine(database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
@@ -348,15 +344,13 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         redis_adapter = RedisAdapter(build_redis_client(args))
         event_sink = build_event_sink(args, redis_adapter=redis_adapter)
         qdrant_adapter = build_qdrant_adapter(args)
-        embedding_adapter = LMStudioEmbeddingAdapter(
-            base_url=args.lmstudio_url
-            or os.getenv("LMSTUDIO_BASE_URL")
-            or "http://localhost:1234",
+        embedding_adapter = create_embedding_adapter(
+            _settings(args),
+            base_url=args.lmstudio_url,
         )
-        chat_adapter = LMStudioChatAdapter(
-            base_url=args.lmstudio_url
-            or os.getenv("LMSTUDIO_BASE_URL")
-            or "http://localhost:1234",
+        chat_adapter = create_chat_adapter(
+            _settings(args),
+            base_url=args.lmstudio_url,
         )
 
         with SessionLocal() as session:
@@ -367,9 +361,9 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 qdrant_adapter=qdrant_adapter,
                 embedding_adapter=embedding_adapter,
                 chat_adapter=chat_adapter,
+                settings=_settings(args),
                 embedding_model=args.embedding_model
-                or os.getenv("EMBEDDING_MODEL")
-                or DEFAULT_EMBEDDING_MODEL,
+                or _settings(args).infrastructure.embedding_model,
                 event_sink=event_sink,
                 cluster_recompute_workers=args.cluster_recompute_workers,
                 cluster_recompute_pipeline_factory=(
@@ -403,6 +397,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 dequeue_timeout_seconds=args.dequeue_timeout_seconds,
                 show_progress=not args.no_progress,
                 event_sink=event_sink,
+                admin_result_ttl_seconds=_settings(args).admin.result_ttl_seconds,
             )
             logging.getLogger(__name__).info(
                 "Starting Redis ML worker queues=%s max_tasks=%s progress=%s verbosity=%s",
@@ -411,7 +406,12 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 not args.no_progress,
                 args.verbose,
             )
-            heartbeat = WorkerHeartbeat(redis_adapter, queues=queue_names)
+            heartbeat = WorkerHeartbeat(
+                redis_adapter,
+                queues=queue_names,
+                interval_seconds=_settings(args).worker.heartbeat_interval_seconds,
+                ttl_seconds=_settings(args).worker.heartbeat_ttl_seconds,
+            )
             heartbeat.start()
 
             if args.max_tasks is None:
@@ -462,6 +462,7 @@ def build_task_handler(
     qdrant_adapter: QdrantAdapter,
     embedding_adapter: LMStudioEmbeddingAdapter,
     chat_adapter: LMStudioChatAdapter,
+    settings: Settings,
     embedding_model: str,
     event_sink: EventSink,
     cluster_recompute_workers: int = 1,
@@ -559,10 +560,12 @@ def build_task_handler(
         user_profile_pipeline=user_profile_pipeline,
         openalex_topic_stats_collector_factory=build_openalex_topic_stats_collector_factory(
             session,
+            settings=settings,
         ),
         openalex_paper_bootstrap_runner=build_openalex_paper_bootstrap_runner(
             session_factory=session_factory,
             redis_adapter=redis_adapter,
+            settings=settings,
         ),
         redis_adapter=redis_adapter,
         event_sink=event_sink,
@@ -571,7 +574,11 @@ def build_task_handler(
     )
 
 
-def build_openalex_topic_stats_collector_factory(session: Any) -> Any:
+def build_openalex_topic_stats_collector_factory(
+    session: Any,
+    *,
+    settings: Settings,
+) -> Any:
     """Build OpenAlex topic stats collectors from worker task messages."""
 
     def _message_bool(message: dict[str, Any], field: str, default: bool) -> bool:
@@ -590,17 +597,17 @@ def build_openalex_topic_stats_collector_factory(session: Any) -> Any:
         openalex_url = (
             str(message.get("openalex_url")).strip()
             if message.get("openalex_url")
-            else os.getenv("OPENALEX_BASE_URL") or "https://api.openalex.org"
+            else settings.openalex.base_url
         )
         api_key = (
             str(message.get("openalex_api_key")).strip()
             if message.get("openalex_api_key")
-            else os.getenv("OPENALEX_API_KEY")
+            else settings.openalex.api_key
         )
         mailto = (
             str(message.get("openalex_mailto")).strip()
             if message.get("openalex_mailto")
-            else os.getenv("OPENALEX_MAILTO")
+            else settings.openalex.mailto
         )
         return OpenAlexTopicStatsCollector(
             taxonomy_repository=TaxonomyRepository(session),
@@ -611,13 +618,26 @@ def build_openalex_topic_stats_collector_factory(session: Any) -> Any:
                 api_key=api_key or None,
                 mailto=mailto or None,
             ),
-            request_workers=max(1, int(message.get("request_workers") or 8)),
-            rate_limiter=SyncRateLimiter(float(message.get("rate_limit_rps") or 10.0)),
-            max_retries=max(0, int(message.get("max_retries") or 5)),
-            rate_limit_defer_after_seconds=float(
-                message.get("rate_limit_defer_after_seconds") or 120.0
+            request_workers=max(
+                1,
+                int(message.get("request_workers") or settings.openalex.stats_request_workers),
             ),
-            primary_topic_only=_message_bool(message, "primary_topic_only", True),
+            rate_limiter=SyncRateLimiter(
+                float(message.get("rate_limit_rps") or settings.openalex.stats_rate_limit_rps)
+            ),
+            max_retries=max(
+                0,
+                int(message.get("max_retries") or settings.openalex.stats_max_retries),
+            ),
+            rate_limit_defer_after_seconds=float(
+                message.get("rate_limit_defer_after_seconds")
+                or settings.openalex.rate_limit_defer_after_seconds
+            ),
+            primary_topic_only=_message_bool(
+                message,
+                "primary_topic_only",
+                settings.openalex.primary_topic_only,
+            ),
         )
 
     return factory
@@ -627,13 +647,14 @@ def build_openalex_paper_bootstrap_runner(
     *,
     session_factory: Any,
     redis_adapter: RedisAdapter,
+    settings: Settings,
 ) -> Any:
     """Build a callable that runs OpenAlex paper bootstrap from worker messages."""
 
     def runner(message: dict[str, Any]) -> Any:
         task_type = str(message.get("task_type") or "bootstrap_papers")
         request = (
-            build_openalex_bootstrap_request(message, session_factory)
+            build_openalex_bootstrap_request(message, session_factory, settings=settings)
             if task_type != "resume_bootstrap_papers"
             else None
         )
@@ -644,36 +665,45 @@ def build_openalex_paper_bootstrap_runner(
                 downloader=OpenAlexPaperDownloader(
                     base_url=str(
                         message.get("openalex_url")
-                        or os.getenv("OPENALEX_BASE_URL")
-                        or "https://api.openalex.org"
+                        or settings.openalex.base_url
                     ),
                     request_workers=(
                         request.request_workers
                         if request is not None
-                        else int(message.get("request_workers") or 8)
+                        else int(
+                            message.get("request_workers")
+                            or settings.openalex.bootstrap_request_workers
+                        )
                     ),
                     rate_limiter=AsyncRateLimiter(
                         request.rate_limit_rps
                         if request is not None
-                        else float(message.get("rate_limit_rps") or 70.0)
+                        else float(
+                            message.get("rate_limit_rps")
+                            or settings.openalex.bootstrap_rate_limit_rps
+                        )
                     ),
                     max_retries=(
                         request.max_retries
                         if request is not None
-                        else int(message.get("max_retries") or 5)
+                        else int(
+                            message.get("max_retries")
+                            or settings.openalex.bootstrap_max_retries
+                        )
                     ),
                     api_key=(
                         str(message.get("openalex_api_key")).strip()
                         if message.get("openalex_api_key")
-                        else os.getenv("OPENALEX_API_KEY") or None
+                        else settings.openalex.api_key
                     ),
                     mailto=(
                         str(message.get("openalex_mailto")).strip()
                         if message.get("openalex_mailto")
-                        else os.getenv("OPENALEX_MAILTO") or None
+                        else settings.openalex.mailto
                     ),
                     rate_limit_defer_after_seconds=float(
-                        message.get("rate_limit_defer_after_seconds") or 120.0
+                        message.get("rate_limit_defer_after_seconds")
+                        or settings.openalex.rate_limit_defer_after_seconds
                     ),
                 ),
                 importer=OpenAlexPaperImporter(
@@ -681,7 +711,10 @@ def build_openalex_paper_bootstrap_runner(
                     batch_size=(
                         request.batch_size
                         if request is not None
-                        else int(message.get("batch_size") or 500)
+                        else int(
+                            message.get("batch_size")
+                            or settings.openalex.bootstrap_batch_size
+                        )
                     ),
                 ),
                 redis_adapter=redis_adapter,
@@ -699,7 +732,10 @@ def build_openalex_paper_bootstrap_runner(
             return asyncio.run(
                 pipeline.resume_pages(
                     bootstrap_pending_pages_from_message(message),
-                    db_workers=int(message.get("db_workers") or 2),
+                    db_workers=int(
+                        message.get("db_workers")
+                        or settings.openalex.bootstrap_db_workers
+                    ),
                     skip_existing=_bool_message(message, "skip_existing", False),
                     enqueue_indexing=_bool_message(message, "enqueue_indexing", False),
                     show_progress=_bool_message(message, "show_progress", False),
@@ -713,6 +749,8 @@ def build_openalex_paper_bootstrap_runner(
 def build_openalex_bootstrap_request(
     message: dict[str, Any],
     session_factory: Any,
+    *,
+    settings: Settings,
 ) -> OpenAlexBootstrapRequestDTO:
     topic_ids = _int_list_message(message, "topic_ids")
     field_ids = _optional_int_list_message(message, "field_ids")
@@ -724,7 +762,11 @@ def build_openalex_bootstrap_request(
         build_openalex_topic_targets(
             session_factory,
             topic_ids=topic_ids,
-            primary_topic_only=_bool_message(message, "primary_topic_only", True),
+            primary_topic_only=_bool_message(
+                message,
+                "primary_topic_only",
+                settings.openalex.primary_topic_only,
+            ),
         )
         if topic_ids
         else []
@@ -748,19 +790,29 @@ def build_openalex_bootstrap_request(
         monthly_counts_redis_key=message.get("stats_redis_key"),
         monthly_counts_csv=message.get("monthly_counts_csv"),
         missing_stats_policy=str(message.get("missing_stats_policy") or "error"),
-        languages=_str_list_message(message, "languages", ["en", "ru"]),
-        types=_str_list_message(message, "types", ["article"]),
+        languages=_str_list_message(
+            message,
+            "languages",
+            list(settings.openalex.languages),
+        ),
+        types=_str_list_message(message, "types", list(settings.openalex.types)),
         openalex_filter_parts=_str_list_message(message, "openalex_filter_parts", []),
         local_field_ids=field_ids or [],
         local_subfield_ids=subfield_ids or [],
-        batch_size=int(message.get("batch_size") or 500),
-        request_workers=int(message.get("request_workers") or 8),
-        db_workers=int(message.get("db_workers") or 2),
-        rate_limit_rps=float(message.get("rate_limit_rps") or 70.0),
-        seed=int(message.get("seed") or 42),
+        batch_size=int(message.get("batch_size") or settings.openalex.bootstrap_batch_size),
+        request_workers=int(
+            message.get("request_workers") or settings.openalex.bootstrap_request_workers
+        ),
+        db_workers=int(message.get("db_workers") or settings.openalex.bootstrap_db_workers),
+        rate_limit_rps=float(
+            message.get("rate_limit_rps") or settings.openalex.bootstrap_rate_limit_rps
+        ),
+        seed=int(message.get("seed") or settings.openalex.bootstrap_seed),
         max_rounds=1,
-        per_page=int(message.get("per_page") or 100),
-        max_retries=int(message.get("max_retries") or 5),
+        per_page=int(message.get("per_page") or settings.openalex.bootstrap_per_page),
+        max_retries=int(
+            message.get("max_retries") or settings.openalex.bootstrap_max_retries
+        ),
         skip_existing=_bool_message(message, "skip_existing", False),
         enqueue_indexing=_bool_message(message, "enqueue_indexing", False),
         dry_run=_bool_message(message, "dry_run", False),
@@ -928,10 +980,9 @@ def build_cluster_recompute_pipeline_factory(
 
     def factory() -> tuple[TrendRecomputePipeline, Any]:
         session = session_factory()
-        chat_adapter = LMStudioChatAdapter(
-            base_url=args.lmstudio_url
-            or os.getenv("LMSTUDIO_BASE_URL")
-            or "http://localhost:1234",
+        chat_adapter = create_chat_adapter(
+            _settings(args),
+            base_url=args.lmstudio_url,
         )
         pipeline = TrendRecomputePipeline(
             ClusterAnalyticsFacade(
@@ -1003,7 +1054,7 @@ def run_limited_worker(
 
 
 def parse_queues(value: str | None) -> tuple[str, ...]:
-    """Parse comma-separated queue aliases into Redis queue names."""
+    """Parse comma-separated full Redis queue names."""
     if value is None or not value.strip():
         return tuple(DEFAULT_QUEUE_ORDER)
 
@@ -1012,14 +1063,12 @@ def parse_queues(value: str | None) -> tuple[str, ...]:
         item = raw_item.strip()
         if not item:
             continue
-        queue_name = QUEUE_ALIASES.get(item, item)
-        if not queue_name.startswith("queue:"):
+        if not item.startswith("queue:"):
             raise ValueError(
-                f"Unknown queue {item!r}. Use one of {sorted(QUEUE_ALIASES)} "
-                "or a full queue:* name."
+                f"Unknown queue {item!r}. Use a full queue:* name."
             )
-        if queue_name not in queue_names:
-            queue_names.append(queue_name)
+        if item not in queue_names:
+            queue_names.append(item)
 
     if not queue_names:
         raise ValueError("--queues must contain at least one queue name.")
@@ -1078,38 +1127,24 @@ def add_qdrant_args(parser: argparse.ArgumentParser) -> None:
 
 
 def build_redis_client(args: argparse.Namespace) -> Any:
-    """Build a redis-py client from CLI arguments or environment variables."""
-    try:
-        from redis import Redis
-    except ImportError as exc:
-        raise RuntimeError(
-            "redis package is not installed. Install dependencies from requirements.txt."
-        ) from exc
-
-    redis_url = args.redis_url or os.getenv("REDIS_URL")
-    if redis_url:
-        return Redis.from_url(redis_url)
-    return Redis(
-        host=args.redis_host or os.getenv("REDIS_HOST") or "localhost",
-        port=args.redis_port or _optional_int_env("REDIS_PORT") or 6379,
-        db=args.redis_db
-        if args.redis_db is not None
-        else _optional_int_env("REDIS_DB") or 0,
-        password=os.getenv("REDIS_PASSWORD") or None,
+    """Build a redis-py client from settings and CLI overrides."""
+    return create_redis_client(
+        _settings(args),
+        url=args.redis_url,
+        host=args.redis_host,
+        port=args.redis_port,
+        db=args.redis_db,
     )
 
 
 def build_qdrant_adapter(args: argparse.Namespace) -> QdrantAdapter:
-    """Build QdrantAdapter from CLI arguments or environment variables."""
-    qdrant_url = args.qdrant_url or os.getenv("QDRANT_URL")
-    api_key = args.qdrant_api_key or os.getenv("QDRANT_API_KEY")
-    if qdrant_url:
-        return QdrantAdapter(url=qdrant_url, api_key=api_key)
-
-    return QdrantAdapter(
-        host=args.qdrant_host or os.getenv("QDRANT_HOST") or "localhost",
-        port=args.qdrant_port or _optional_int_env("QDRANT_PORT") or 6333,
-        api_key=api_key,
+    """Build QdrantAdapter from settings and CLI overrides."""
+    return create_qdrant_adapter(
+        _settings(args),
+        url=args.qdrant_url,
+        host=args.qdrant_host,
+        port=args.qdrant_port,
+        api_key=args.qdrant_api_key,
     )
 
 
@@ -1136,16 +1171,9 @@ def build_event_sink(
     return CompositeEventSink(sinks, logger=logging.getLogger("ml.worker.events"))
 
 
-def _optional_int_env(name: str) -> int | None:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return None
-    return int(value)
-
-
-def configure_logging(verbosity: int = 0) -> None:
+def configure_logging(verbosity: int = 0, *, settings: Settings | None = None) -> None:
     """Configure basic worker logging."""
-    env_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    env_level = (settings or load_settings()).infrastructure.log_level.upper()
     if verbosity <= 0:
         level = getattr(logging, env_level, logging.INFO)
     elif verbosity == 1:
@@ -1168,6 +1196,24 @@ def configure_logging(verbosity: int = 0) -> None:
         logging.getLogger("httpx").setLevel(logging.DEBUG)
         logging.getLogger("httpcore").setLevel(logging.DEBUG)
         logging.getLogger("qdrant_client").setLevel(logging.DEBUG)
+
+
+def _preload_settings(argv: list[str] | None) -> Settings:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config-file", default=None)
+    parser.add_argument("--env-file", default=None)
+    args, _unknown = parser.parse_known_args(argv)
+    return load_settings(config_file=args.config_file, env_file=args.env_file)
+
+
+def _settings(args: argparse.Namespace) -> Settings:
+    settings = getattr(args, "settings", None)
+    if isinstance(settings, Settings):
+        return settings
+    return load_settings(
+        config_file=getattr(args, "config_file", None),
+        env_file=getattr(args, "env_file", None),
+    )
 
 
 def print_json(payload: dict[str, Any], *, stream: Any = sys.stdout) -> None:

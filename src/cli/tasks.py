@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
-
-from dotenv import load_dotenv
-
 
 BASE_DIR = Path(__file__).resolve().parent
 SRC_DIR = BASE_DIR.parent
@@ -19,10 +15,13 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from adapters import QdrantAdapter, RedisAdapter
-from core.config import Settings
+from core.config import Settings, load_settings
+from core.dependencies import create_qdrant_adapter, create_redis_client
 from core.exceptions import AppError
+from dto.keywords import PaperKeywordExtractionBatchRequestDTO
 from ml.constants import PAPERS_COLLECTION
 from ml.services.quarter_periods import QuarterPeriodService
+from ml.services.task_enqueuers import KeywordExtractionTaskEnqueuer
 from ml.services.openalex_cooldown import OPENALEX_COOLDOWN_KEY
 from ml.services.cluster_recompute_tasks import (
     acquire_cluster_recompute_topic_ids,
@@ -34,18 +33,28 @@ from ml.services.cluster_dynamics_tasks import (
     build_cluster_dynamics_message,
     release_cluster_dynamics_dedupe_keys,
 )
-from ml.workers.redis_worker import (
+from ml.task_contracts import (
+    BOOTSTRAP_PAPERS_TASK,
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
+    COLLECT_TOPIC_STATS_TASK,
+    ENTITY_INDEXING_QUEUE,
+    ENTITY_INDEXING_TASK,
     FAILED_TASKS_QUEUE,
+    KEYWORD_EXTRACTION_QUEUE,
     ML_WORKER_SHUTDOWN_KEY,
     OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     OPENALEX_TOPIC_STATS_QUEUE,
+    PAPER_INDEXING_TASK,
     PAPER_INDEXING_QUEUE,
+    RECOMPUTE_TOPIC_CLUSTERS_TASK,
     TOPIC_QUARTER_REPORT_QUEUE,
+    TOPIC_QUARTER_REPORT_TASK,
+    USER_PROFILE_RECOMPUTE_QUEUE,
+    USER_PROFILE_RECOMPUTE_TASK,
 )
 from models.session import create_db_engine, create_session_factory
-from repositories import PaperRepository, TaxonomyRepository
+from repositories import PaperRepository, TaxonomyRepository, UserRepository
 
 
 DEFAULT_PAGE_SIZE = 1000
@@ -291,7 +300,7 @@ class TopicQuarterReportTaskEnqueuer:
         ]
         messages = [
             {
-                "task_type": "topic_quarter_report",
+                "task_type": TOPIC_QUARTER_REPORT_TASK,
                 "requests": chunk,
                 "force": bool(force),
                 "report_language": report_language,
@@ -459,7 +468,7 @@ class OpenAlexTopicStatsTaskEnqueuer:
         show_progress: bool,
     ) -> list[dict[str, Any]]:
         base = {
-            "task_type": "collect_topic_stats",
+            "task_type": COLLECT_TOPIC_STATS_TASK,
             "date_from": date_from.isoformat(),
             "date_to": date_to.isoformat(),
             "taxonomy_scope": taxonomy_scope,
@@ -586,7 +595,7 @@ class PaperIndexingTaskEnqueuer:
             self.redis_adapter.enqueue(
                 self.queue_name,
                 {
-                    "task_type": "paper_indexing",
+                    "task_type": PAPER_INDEXING_TASK,
                     "paper_id": paper_id,
                     "force_reindex": force_reindex,
                 },
@@ -664,11 +673,12 @@ class PaperIndexingTaskEnqueuer:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse task CLI command and command-specific arguments."""
+    settings = _preload_settings(argv)
     parser = argparse.ArgumentParser(description="Redis task enqueueing CLI utilities.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     enqueue_parser = subparsers.add_parser(
-        "enqueue-indexing",
+        "enqueue-paper-indexing",
         help="Enqueue paper indexing tasks into Redis without running ML locally.",
     )
     enqueue_parser.add_argument(
@@ -702,9 +712,50 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_redis_args(enqueue_parser)
     add_qdrant_args(enqueue_parser)
 
+    keyword_parser = subparsers.add_parser(
+        "enqueue-keyword-extraction",
+        help="Enqueue paper keyword extraction tasks without running ML locally.",
+    )
+    keyword_parser.add_argument("paper_ids", nargs="*", type=int)
+    keyword_parser.add_argument("--paper-ids", dest="paper_ids_csv", default=None)
+    keyword_parser.add_argument("--date-from", type=parse_iso_date, default=None)
+    keyword_parser.add_argument("--date-to", type=parse_iso_date, default=None)
+    keyword_parser.add_argument("--topic-id", type=int, default=None)
+    keyword_parser.add_argument("--field-id", type=int, default=None)
+    keyword_parser.add_argument("--limit", type=int, default=None)
+    keyword_parser.add_argument("--offset", type=int, default=0)
+    keyword_parser.add_argument("--batch-size", type=int, default=settings.operations.keyword_extraction_batch_size)
+    keyword_parser.add_argument("--top-k", type=int, default=settings.operations.keyword_extraction_top_k)
+    keyword_parser.add_argument("--min-score", type=float, default=None)
+    keyword_parser.add_argument(
+        "--skip-processed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    keyword_parser.add_argument("--skip-non-english", action="store_true")
+    keyword_parser.add_argument("--dry-run", action="store_true")
+    add_database_args(keyword_parser)
+    add_redis_args(keyword_parser)
+
+    entities_parser = subparsers.add_parser(
+        "enqueue-research-entities",
+        help="Enqueue research entity indexing without running ML locally.",
+    )
+    entities_parser.add_argument(
+        "--entity-type",
+        choices=["all", "domain", "field", "subfield", "topic", "keyword"],
+        default="all",
+    )
+    entities_parser.add_argument("--limit", type=int, default=settings.operations.research_entities_limit)
+    entities_parser.add_argument("--offset", type=int, default=0)
+    entities_parser.add_argument("--batch-size", type=int, default=settings.operations.research_entities_batch_size)
+    entities_parser.add_argument("--force-reindex", action="store_true")
+    entities_parser.add_argument("--dry-run", action="store_true")
+    add_database_args(entities_parser)
+    add_redis_args(entities_parser)
+
     stats_parser = subparsers.add_parser(
         "enqueue-topic-stats",
-        aliases=["enqueue-collect-topic-stats"],
         help="Enqueue high-priority OpenAlex collect-topic-stats worker tasks.",
     )
     stats_scope = stats_parser.add_mutually_exclusive_group(required=True)
@@ -743,54 +794,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     stats_parser.add_argument(
         "--languages",
-        default="en,ru",
+        default=",".join(settings.openalex.languages),
         help="Comma-separated OpenAlex languages. Defaults to en,ru.",
     )
     stats_parser.add_argument(
         "--types",
-        default="article",
+        default=",".join(settings.openalex.types),
         help="Comma-separated OpenAlex work types. Defaults to article.",
     )
     stats_parser.add_argument(
         "--batch-size",
         type=int,
-        default=500,
+        default=settings.openalex.stats_batch_size,
         help="PostgreSQL upsert batch size used by worker. Defaults to 500.",
     )
     stats_parser.add_argument(
         "--task-batch-size",
         type=int,
-        default=100,
+        default=settings.openalex.stats_task_batch_size,
         help="Maximum topic ids per Redis task for topic scope. Defaults to 100.",
     )
     stats_parser.add_argument(
         "--request-workers",
         type=int,
-        default=8,
+        default=settings.openalex.stats_request_workers,
         help="Concurrent OpenAlex request workers used by worker. Defaults to 8.",
     )
     stats_parser.add_argument(
         "--rate-limit-rps",
         type=float,
-        default=10.0,
+        default=settings.openalex.stats_rate_limit_rps,
         help="OpenAlex request rate used by worker. Defaults to 10.",
     )
     stats_parser.add_argument(
         "--max-retries",
         type=int,
-        default=5,
+        default=settings.openalex.stats_max_retries,
         help="Retries for rate-limit/service/network errors. Defaults to 5.",
     )
     stats_parser.add_argument(
         "--group-by-page-size",
         type=int,
-        default=200,
+        default=settings.openalex.stats_group_by_page_size,
         help="OpenAlex group_by page size for field/subfield scope, max 200.",
     )
     stats_parser.add_argument(
         "--normalize-january-first",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=settings.openalex.normalize_january_first,
         help=(
             "Estimate and remove January-1 artificial publication dates. "
             "Enabled by default; use --no-normalize-january-first to disable."
@@ -799,7 +850,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     stats_parser.add_argument(
         "--primary-topic-only",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=settings.openalex.primary_topic_only,
         help=(
             "Use primary_topic.id instead of topics.id filter. "
             "Enabled by default; use --no-primary-topic-only to disable."
@@ -857,24 +908,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     bootstrap_parser.add_argument(
         "--target-count",
         type=int,
-        default=20,
+        default=settings.openalex.bootstrap_target_count,
         help="Target sample papers per topic/month. Defaults to 20.",
     )
     bootstrap_parser.add_argument(
         "--task-batch-size",
         type=int,
-        default=100,
+        default=settings.openalex.bootstrap_task_batch_size,
         help="Maximum topic ids per Redis task. Defaults to 100.",
     )
-    bootstrap_parser.add_argument("--languages", default="en,ru")
-    bootstrap_parser.add_argument("--types", default="article")
-    bootstrap_parser.add_argument("--batch-size", type=int, default=500)
-    bootstrap_parser.add_argument("--request-workers", type=int, default=8)
-    bootstrap_parser.add_argument("--db-workers", type=int, default=2)
-    bootstrap_parser.add_argument("--rate-limit-rps", type=float, default=70.0)
-    bootstrap_parser.add_argument("--seed", type=int, default=42)
-    bootstrap_parser.add_argument("--per-page", type=int, default=100)
-    bootstrap_parser.add_argument("--max-retries", type=int, default=5)
+    bootstrap_parser.add_argument("--languages", default=",".join(settings.openalex.languages))
+    bootstrap_parser.add_argument("--types", default=",".join(settings.openalex.types))
+    bootstrap_parser.add_argument("--batch-size", type=int, default=settings.openalex.bootstrap_batch_size)
+    bootstrap_parser.add_argument("--request-workers", type=int, default=settings.openalex.bootstrap_request_workers)
+    bootstrap_parser.add_argument("--db-workers", type=int, default=settings.openalex.bootstrap_db_workers)
+    bootstrap_parser.add_argument("--rate-limit-rps", type=float, default=settings.openalex.bootstrap_rate_limit_rps)
+    bootstrap_parser.add_argument("--seed", type=int, default=settings.openalex.bootstrap_seed)
+    bootstrap_parser.add_argument("--per-page", type=int, default=settings.openalex.bootstrap_per_page)
+    bootstrap_parser.add_argument("--max-retries", type=int, default=settings.openalex.bootstrap_max_retries)
     bootstrap_parser.add_argument("--skip-existing", action="store_true")
     bootstrap_parser.add_argument(
         "--no-enqueue-indexing",
@@ -889,16 +940,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     bootstrap_parser.add_argument(
         "--primary-topic-only",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=settings.openalex.primary_topic_only,
     )
     bootstrap_parser.add_argument("--openalex-url", default=None)
     bootstrap_parser.add_argument("--openalex-api-key", default=None)
     bootstrap_parser.add_argument("--openalex-mailto", default=None)
     bootstrap_parser.add_argument("--dry-run", action="store_true")
     bootstrap_parser.add_argument(
+        "--config-file",
+        default=None,
+        help="Optional TOML override file. Defaults to ML_CONFIG_FILE when set.",
+    )
+    bootstrap_parser.add_argument(
         "--env-file",
-        default=str(PROJECT_DIR / ".env"),
-        help="Path to .env file. Defaults to project .env.",
+        default=None,
+        help="Optional .env path. Defaults to ML_ENV_FILE or project .env.",
     )
     add_redis_args(bootstrap_parser)
 
@@ -907,9 +963,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Show OpenAlex worker cooldown status stored in Redis.",
     )
     cooldown_parser.add_argument(
+        "--config-file",
+        default=None,
+        help="Optional TOML override file. Defaults to ML_CONFIG_FILE when set.",
+    )
+    cooldown_parser.add_argument(
         "--env-file",
-        default=str(PROJECT_DIR / ".env"),
-        help="Path to .env file. Defaults to project .env.",
+        default=None,
+        help="Optional .env path. Defaults to ML_ENV_FILE or project .env.",
     )
     add_redis_args(cooldown_parser)
 
@@ -929,9 +990,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="How long the shutdown request remains valid. Defaults to 3600.",
     )
     shutdown_parser.add_argument(
+        "--config-file",
+        default=None,
+        help="Optional TOML override file. Defaults to ML_CONFIG_FILE when set.",
+    )
+    shutdown_parser.add_argument(
         "--env-file",
-        default=str(PROJECT_DIR / ".env"),
-        help="Path to .env file. Defaults to project .env.",
+        default=None,
+        help="Optional .env path. Defaults to ML_ENV_FILE or project .env.",
     )
     add_redis_args(shutdown_parser)
 
@@ -941,9 +1007,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     add_topic_scope_args(cluster_parser)
     cluster_parser.add_argument(
+        "--date-from",
+        type=parse_iso_date,
+        default=None,
+        help="Optional lower publication bound for --period-selected.",
+    )
+    cluster_parser.add_argument(
+        "--date-to",
+        type=parse_iso_date,
+        default=None,
+        help="Optional upper publication bound for --period-selected.",
+    )
+    cluster_parser.add_argument(
         "--batch-size",
         type=int,
-        default=50,
+        default=settings.operations.cluster_recompute_batch_size,
         help="Maximum topic ids per Redis message. Defaults to 50.",
     )
     cluster_parser.add_argument(
@@ -996,6 +1074,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Schedule dynamics for all topics, optionally constrained by --limit/--offset.",
     )
+    dynamics_scope.add_argument(
+        "--cached-clusters",
+        action="store_true",
+        help="Schedule dynamics for cached top trend clusters from Redis.",
+    )
     dynamics_parser.add_argument(
         "--date-from",
         type=parse_iso_date,
@@ -1029,7 +1112,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     dynamics_parser.add_argument(
         "--batch-size",
         type=int,
-        default=50,
+        default=settings.operations.cluster_dynamics_batch_size,
         help="Maximum cluster ids per Redis message. Defaults to 50.",
     )
     dynamics_parser.add_argument(
@@ -1076,7 +1159,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     report_parser.add_argument(
         "--batch-size",
         type=int,
-        default=50,
+        default=settings.operations.topic_reports_batch_size,
         help="Maximum topic-quarter requests per Redis message. Defaults to 50.",
     )
     report_parser.add_argument(
@@ -1086,7 +1169,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     report_parser.add_argument(
         "--report-language",
-        default="ru",
+        default=settings.operations.topic_report_language,
         help="Narrative language for generated report text. Defaults to ru.",
     )
     report_parser.add_argument(
@@ -1101,6 +1184,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     add_database_args(report_parser)
     add_redis_args(report_parser)
+
+    profiles_parser = subparsers.add_parser(
+        "enqueue-user-profiles",
+        help="Enqueue one or all user profile recomputation tasks.",
+    )
+    dynamics_parser.add_argument(
+        "--limit-clusters",
+        type=int,
+        default=100,
+        help="Maximum cached clusters for --cached-clusters. Defaults to 100.",
+    )
+    profile_scope = profiles_parser.add_mutually_exclusive_group(required=True)
+    profile_scope.add_argument("--user-id", type=int, default=None)
+    profile_scope.add_argument("--all-users", action="store_true")
+    profiles_parser.add_argument("--batch-size", type=int, default=settings.operations.user_profiles_batch_size)
+    profiles_parser.add_argument("--force", action="store_true")
+    profiles_parser.add_argument("--dry-run", action="store_true")
+    add_database_args(profiles_parser)
+    add_redis_args(profiles_parser)
 
     restore_parser = subparsers.add_parser(
         "restore-failed",
@@ -1129,7 +1231,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     restore_parser.add_argument(
         "--split-paper-indexing-batch-size",
-        "--split-batch-size",
         dest="split_paper_indexing_batch_size",
         type=int,
         default=128,
@@ -1145,7 +1246,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     restore_parser.add_argument(
         "--split-cluster-recompute-batch-size",
-        "--split-cluster-batch-size",
         dest="split_cluster_recompute_batch_size",
         type=int,
         default=50,
@@ -1167,18 +1267,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_database_args(restore_parser)
     add_redis_args(restore_parser)
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.settings = settings
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the requested task CLI command."""
     args = parse_args(argv)
-    load_dotenv(args.env_file)
+    args.settings = load_settings(
+        config_file=getattr(args, "config_file", None),
+        env_file=args.env_file,
+    )
 
     try:
-        if args.command == "enqueue-indexing":
+        if args.command == "enqueue-paper-indexing":
             payload = run_enqueue_indexing(args)
-        elif args.command in {"enqueue-topic-stats", "enqueue-collect-topic-stats"}:
+        elif args.command == "enqueue-keyword-extraction":
+            payload = run_enqueue_keyword_extraction(args)
+        elif args.command == "enqueue-research-entities":
+            payload = run_enqueue_research_entities(args)
+        elif args.command == "enqueue-topic-stats":
             payload = run_enqueue_topic_stats_collection(args)
         elif args.command == "enqueue-bootstrap-papers":
             payload = run_enqueue_bootstrap_papers(args)
@@ -1192,6 +1301,8 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_enqueue_cluster_dynamics(args)
         elif args.command == "enqueue-topic-reports":
             payload = run_enqueue_topic_reports(args)
+        elif args.command == "enqueue-user-profiles":
+            payload = run_enqueue_user_profiles(args)
         elif args.command == "restore-failed":
             payload = run_restore_failed(args)
         else:
@@ -1223,7 +1334,7 @@ def run_enqueue_indexing(args: argparse.Namespace) -> dict[str, Any]:
     file_paper_ids = read_paper_ids_file(args.paper_ids) if args.paper_ids else []
 
     if args.date_from is not None or args.date_to is not None:
-        database_url = args.database_url or Settings.from_env().database_url
+        database_url = args.database_url or _settings(args).database_url
         engine = create_db_engine(database_url, echo=False)
         SessionLocal = create_session_factory(engine, expire_on_commit=False)
         try:
@@ -1254,11 +1365,89 @@ def run_enqueue_indexing(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     return {
-        "command": "enqueue-indexing",
+        "command": "enqueue-paper-indexing",
         "date_from": args.date_from,
         "date_to": args.date_to,
         "paper_ids_file": args.paper_ids,
         "result": result,
+    }
+
+
+def run_enqueue_keyword_extraction(args: argparse.Namespace) -> dict[str, Any]:
+    """Enqueue canonical keyword extraction tasks."""
+    paper_ids = list(args.paper_ids)
+    if args.paper_ids_csv:
+        paper_ids.extend(parse_int_csv_arg(args.paper_ids_csv))
+    paper_ids = list(dict.fromkeys(paper_ids))
+    has_filters = any(
+        value is not None
+        for value in (args.date_from, args.date_to, args.topic_id, args.field_id)
+    )
+    if paper_ids and has_filters:
+        raise ValueError("Use either paper ids or filter mode, not both.")
+    if not paper_ids and not has_filters:
+        raise ValueError(
+            "Provide paper ids or at least one of --date-from/--date-to/--topic-id/--field-id."
+        )
+    if args.date_from is not None and args.date_to is not None and args.date_from > args.date_to:
+        raise ValueError("--date-from must be before or equal to --date-to.")
+
+    engine = create_db_engine(args.database_url or _settings(args).database_url, echo=False)
+    SessionLocal = create_session_factory(engine, expire_on_commit=False)
+    try:
+        with SessionLocal() as session:
+            result = KeywordExtractionTaskEnqueuer(
+                paper_repository=PaperRepository(session),
+                redis_adapter=(
+                    None
+                    if args.dry_run
+                    else RedisAdapter(build_redis_client(args))
+                ),
+            ).enqueue(
+                PaperKeywordExtractionBatchRequestDTO(
+                    paper_ids=paper_ids,
+                    date_from=args.date_from,
+                    date_to=args.date_to,
+                    topic_id=args.topic_id,
+                    field_id=args.field_id,
+                    limit=args.limit,
+                    offset=args.offset,
+                    batch_size=args.batch_size,
+                    top_k=args.top_k,
+                    min_score=args.min_score,
+                    skip_processed=bool(args.skip_processed),
+                    skip_non_english=bool(args.skip_non_english),
+                ),
+                dry_run=bool(args.dry_run),
+            )
+    finally:
+        engine.dispose()
+    return {"command": "enqueue-keyword-extraction", "result": result}
+
+
+def run_enqueue_research_entities(args: argparse.Namespace) -> dict[str, Any]:
+    """Enqueue canonical research entity indexing task."""
+    if args.limit is not None and args.limit < 0:
+        raise ValueError("--limit must be non-negative.")
+    if args.offset < 0:
+        raise ValueError("--offset must be non-negative.")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive.")
+    message = {
+        "task_type": ENTITY_INDEXING_TASK,
+        "entity_type": args.entity_type,
+        "limit": args.limit,
+        "offset": args.offset,
+        "batch_size": args.batch_size,
+        "force_reindex": bool(args.force_reindex),
+    }
+    _enqueue_messages(args, ENTITY_INDEXING_QUEUE, [message])
+    return {
+        "command": "enqueue-research-entities",
+        "queue": ENTITY_INDEXING_QUEUE,
+        "dry_run": bool(args.dry_run),
+        "messages": 1,
+        "sample": [message],
     }
 
 
@@ -1313,7 +1502,7 @@ def run_enqueue_bootstrap_papers(args: argparse.Namespace) -> dict[str, Any]:
     for chunk in chunked(topic_ids, args.task_batch_size):
         messages.append(
             {
-                "task_type": "bootstrap_papers",
+                "task_type": BOOTSTRAP_PAPERS_TASK,
                 "date_from": args.date_from.isoformat(),
                 "date_to": args.date_to.isoformat(),
                 "topic_ids": chunk,
@@ -1399,6 +1588,29 @@ def run_enqueue_cluster_recompute(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--batch-size must be a positive integer.")
     if args.cluster_workers <= 0:
         raise ValueError("--cluster-workers must be a positive integer.")
+    if args.period_selected:
+        if args.date_from is None or args.date_to is None:
+            raise ValueError("--period-selected requires --date-from and --date-to.")
+        if args.date_from > args.date_to:
+            raise ValueError("--date-from must be before or equal to --date-to.")
+        message = {
+            "task_type": RECOMPUTE_TOPIC_CLUSTERS_TASK,
+            "date_from": args.date_from.isoformat(),
+            "date_to": args.date_to.isoformat(),
+            "limit": args.limit,
+            "batch_size": args.batch_size,
+            "force_summary": bool(args.force_summary),
+            "cluster_workers": args.cluster_workers,
+        }
+        _enqueue_messages(args, CLUSTER_RECOMPUTE_QUEUE, [message])
+        return {
+            "command": "enqueue-cluster-recompute",
+            "queue": CLUSTER_RECOMPUTE_QUEUE,
+            "dry_run": bool(args.dry_run),
+            "period_selected": True,
+            "messages": 1,
+            "sample": [message],
+        }
     topic_ids = resolve_topic_ids_for_scope(args)
     redis_adapter = None if args.dry_run else RedisAdapter(build_redis_client(args))
     result = ClusterRecomputeTaskEnqueuer(redis_adapter=redis_adapter).enqueue(
@@ -1425,7 +1637,18 @@ def run_enqueue_cluster_dynamics(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--batch-size must be a positive integer.")
     if args.date_from > args.date_to:
         raise ValueError("--date-from must be before or equal to --date-to.")
-    if args.cluster_ids:
+    if args.cached_clusters:
+        if args.limit_clusters <= 0:
+            raise ValueError("--limit-clusters must be a positive integer.")
+        redis_adapter = RedisAdapter(build_redis_client(args))
+        index = redis_adapter.get_json("ml:trend_clusters:index") or {}
+        cluster_ids = [
+            str(value)
+            for value in index.get("cluster_ids", [])[: args.limit_clusters]
+        ]
+        if not cluster_ids:
+            raise ValueError("No cached cluster ids found in Redis.")
+    elif args.cluster_ids:
         cluster_ids = parse_csv_arg(args.cluster_ids)
     else:
         cluster_ids = [
@@ -1486,6 +1709,65 @@ def run_enqueue_topic_reports(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def run_enqueue_user_profiles(args: argparse.Namespace) -> dict[str, Any]:
+    """Enqueue canonical user profile recomputation tasks."""
+    if args.user_id is not None and args.user_id <= 0:
+        raise ValueError("--user-id must be a positive integer.")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be a positive integer.")
+    if args.user_id is not None:
+        user_ids = [args.user_id]
+    else:
+        engine = create_db_engine(args.database_url or _settings(args).database_url, echo=False)
+        SessionLocal = create_session_factory(engine, expire_on_commit=False)
+        try:
+            with SessionLocal() as session:
+                user_ids = []
+                offset = 0
+                while True:
+                    page = UserRepository(session).list_ids(
+                        limit=args.batch_size,
+                        offset=offset,
+                    )
+                    if not page:
+                        break
+                    user_ids.extend(int(user_id) for user_id in page)
+                    offset += len(page)
+                    if len(page) < args.batch_size:
+                        break
+        finally:
+            engine.dispose()
+    messages = [
+        {
+            "task_type": USER_PROFILE_RECOMPUTE_TASK,
+            "user_id": user_id,
+            "force": bool(args.force),
+        }
+        for user_id in user_ids
+    ]
+    _enqueue_messages(args, USER_PROFILE_RECOMPUTE_QUEUE, messages)
+    return {
+        "command": "enqueue-user-profiles",
+        "queue": USER_PROFILE_RECOMPUTE_QUEUE,
+        "dry_run": bool(args.dry_run),
+        "users": len(user_ids),
+        "messages": len(messages),
+        "sample": messages[:3],
+    }
+
+
+def _enqueue_messages(
+    args: argparse.Namespace,
+    queue_name: str,
+    messages: list[dict[str, Any]],
+) -> None:
+    if args.dry_run:
+        return
+    redis_adapter = RedisAdapter(build_redis_client(args))
+    for message in messages:
+        redis_adapter.enqueue(queue_name, message)
+
+
 def resolve_report_topic_ids(args: argparse.Namespace) -> list[int]:
     """Resolve topic ids for topic report task enqueueing."""
     return resolve_topic_ids_for_scope(args)
@@ -1523,7 +1805,7 @@ def resolve_topic_ids_for_scope(args: argparse.Namespace) -> list[int]:
         raise ValueError("--limit must be non-negative.")
     if offset < 0:
         raise ValueError("--offset must be non-negative.")
-    database_url = args.database_url or Settings.from_env().database_url
+    database_url = args.database_url or _settings(args).database_url
     engine = create_db_engine(database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
     try:
@@ -1765,7 +2047,7 @@ class FailedTaskRestorer:
         split_cluster_recompute: bool,
         split_cluster_recompute_batch_size: int,
     ) -> list[dict[str, Any]]:
-        if split_paper_indexing and message.get("task_type") == "paper_indexing":
+        if split_paper_indexing and message.get("task_type") == PAPER_INDEXING_TASK:
             paper_ids = message.get("paper_ids")
             if (
                 isinstance(paper_ids, list)
@@ -1774,7 +2056,7 @@ class FailedTaskRestorer:
                 force_reindex = bool(message.get("force_reindex", False))
                 return [
                     {
-                        "task_type": "paper_indexing",
+                        "task_type": PAPER_INDEXING_TASK,
                         "paper_ids": chunk,
                         "force_reindex": force_reindex,
                     }
@@ -1783,7 +2065,7 @@ class FailedTaskRestorer:
 
         if (
             split_cluster_recompute
-            and message.get("task_type") in {"cluster_recompute", "recompute_topic_clusters"}
+            and message.get("task_type") == "recompute_topic_clusters"
         ):
             topic_ids = message.get("topic_ids")
             if (
@@ -1853,9 +2135,14 @@ def run_restore_failed(args: argparse.Namespace) -> dict[str, Any]:
 def add_database_args(parser: argparse.ArgumentParser) -> None:
     """Add shared environment and database connection arguments."""
     parser.add_argument(
+        "--config-file",
+        default=None,
+        help="Optional TOML override file. Defaults to ML_CONFIG_FILE when set.",
+    )
+    parser.add_argument(
         "--env-file",
-        default=str(PROJECT_DIR / ".env"),
-        help="Path to .env file. Defaults to project .env.",
+        default=None,
+        help="Optional .env path. Defaults to ML_ENV_FILE or project .env.",
     )
     parser.add_argument(
         "--database-url",
@@ -1995,36 +2282,29 @@ def parse_csv_arg(value: str) -> list[str]:
 
 
 def build_redis_client(args: argparse.Namespace) -> Any:
-    """Build a redis-py client from CLI arguments or environment variables."""
-    try:
-        from redis import Redis
-    except ImportError as exc:
-        raise RuntimeError(
-            "redis package is not installed. Install dependencies from requirements.txt."
-        ) from exc
-
-    redis_url = args.redis_url or os.getenv("REDIS_URL")
-    if redis_url:
-        return Redis.from_url(redis_url)
-    return Redis(
-        host=args.redis_host or os.getenv("REDIS_HOST") or "localhost",
-        port=args.redis_port or _optional_int_env("REDIS_PORT") or 6379,
-        db=args.redis_db if args.redis_db is not None else _optional_int_env("REDIS_DB") or 0,
-        password=os.getenv("REDIS_PASSWORD") or None,
+    """Build a redis-py client from settings and CLI overrides."""
+    return create_redis_client(
+        _settings(args),
+        url=args.redis_url,
+        host=args.redis_host,
+        port=args.redis_port,
+        db=args.redis_db,
+    )
+    scope.add_argument(
+        "--period-selected",
+        action="store_true",
+        help="Schedule one worker-side bulk recomputation selected by publication period.",
     )
 
 
 def build_qdrant_adapter(args: argparse.Namespace) -> QdrantAdapter:
-    """Build QdrantAdapter from CLI arguments or environment variables."""
-    qdrant_url = args.qdrant_url or os.getenv("QDRANT_URL")
-    api_key = args.qdrant_api_key or os.getenv("QDRANT_API_KEY")
-    if qdrant_url:
-        return QdrantAdapter(url=qdrant_url, api_key=api_key)
-
-    return QdrantAdapter(
-        host=args.qdrant_host or os.getenv("QDRANT_HOST") or "localhost",
-        port=args.qdrant_port or _optional_int_env("QDRANT_PORT") or 6333,
-        api_key=api_key,
+    """Build QdrantAdapter from settings and CLI overrides."""
+    return create_qdrant_adapter(
+        _settings(args),
+        url=args.qdrant_url,
+        host=args.qdrant_host,
+        port=args.qdrant_port,
+        api_key=args.qdrant_api_key,
     )
 
 
@@ -2053,11 +2333,22 @@ def chunked_strings(values: list[str], size: int) -> list[list[str]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
 
 
-def _optional_int_env(name: str) -> int | None:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return None
-    return int(value)
+def _settings(args: argparse.Namespace) -> Settings:
+    settings = getattr(args, "settings", None)
+    if isinstance(settings, Settings):
+        return settings
+    return load_settings(
+        config_file=getattr(args, "config_file", None),
+        env_file=getattr(args, "env_file", None),
+    )
+
+
+def _preload_settings(argv: list[str] | None) -> Settings:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config-file", default=None)
+    parser.add_argument("--env-file", default=None)
+    args, _unknown = parser.parse_known_args(argv)
+    return load_settings(config_file=args.config_file, env_file=args.env_file)
 
 
 def print_json(payload: dict[str, Any], *, stream: Any = sys.stdout) -> None:

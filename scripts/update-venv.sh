@@ -8,5 +8,5 @@ source $ROOT/.venv-lin/bin/activate
 # Установка основного стека библиотек.
 pip install --upgrade pip setuptools wheel
 
-pip install -r $ROOT/core/requirements.txt
+pip install -r $ROOT/requirements.txt
 echo "Installation complete!"

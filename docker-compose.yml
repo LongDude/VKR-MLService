@@ -104,7 +104,7 @@ services:
       dockerfile: ./Dockerfile
     container_name: vkr-ml-worker
     restart: unless-stopped
-    command: ["python", "-m", "cli.worker", "run", "--no-progress", "--event-redis"]
+    command: ["python", "-m", "cli.worker", "run"]
     networks:
       - ml_network
       - vkr-inner-network
@@ -122,6 +122,8 @@ services:
       - QDRANT_PORT=6333
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - LMSTUDIO_BASE_URL=http://host.docker.internal:1234
+      - ML_WORKER_SHOW_PROGRESS=false
+      - ML_WORKER_EVENT_REDIS=true
     volumes:
       - ./:/app
     depends_on:

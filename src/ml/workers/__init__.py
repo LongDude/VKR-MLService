@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-from .redis_worker import (
+from ml.task_contracts import (
     CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
     CLUSTER_RECOMPUTE_QUEUE,
-    DEFAULT_QUEUE_ORDER,
     ENTITY_INDEXING_QUEUE,
     FAILED_TASKS_QUEUE,
     KEYWORD_EXTRACTION_QUEUE,
     ML_WORKER_SHUTDOWN_KEY,
     PAPER_INDEXING_QUEUE,
-    RedisMLWorker,
     TOPIC_QUARTER_REPORT_QUEUE,
     USER_PROFILE_RECOMPUTE_QUEUE,
 )
+from .redis_worker import DEFAULT_QUEUE_ORDER, RedisMLWorker
 from .task_handlers import MLTaskHandler
 
 __all__ = [

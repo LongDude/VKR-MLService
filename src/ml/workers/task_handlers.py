@@ -21,6 +21,18 @@ from ml.services.cluster_dynamics_tasks import (
     build_cluster_dynamics_message,
     release_cluster_dynamics_dedupe_keys,
 )
+from ml.task_contracts import (
+    BOOTSTRAP_PAPERS_TASK,
+    CLUSTER_DYNAMICS_RECOMPUTE_TASK,
+    COLLECT_TOPIC_STATS_TASK,
+    ENTITY_INDEXING_TASK,
+    KEYWORD_EXTRACTION_TASK,
+    PAPER_INDEXING_TASK,
+    RECOMPUTE_TOPIC_CLUSTERS_TASK,
+    RESUME_BOOTSTRAP_PAPERS_TASK,
+    TOPIC_QUARTER_REPORT_TASK,
+    USER_PROFILE_RECOMPUTE_TASK,
+)
 from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.services.openalex_cooldown import (
     OPENALEX_TOPIC_STATS_PENDING_QUEUE,
@@ -93,27 +105,23 @@ class MLTaskHandler:
         message = cast(dict[str, Any], message)  # purely for type-checking
 
         task_type = self._required_str(message, "task_type")
-        if task_type == "keyword_extraction":
+        if task_type == KEYWORD_EXTRACTION_TASK:
             return self._handle_keyword_extraction(message)
-        if task_type in {"collect_topic_stats", "collect-topic-stats"}:
+        if task_type == COLLECT_TOPIC_STATS_TASK:
             return self._handle_collect_topic_stats(message)
-        if task_type in {
-            "bootstrap_papers",
-            "bootstrap-papers",
-            "resume_bootstrap_papers",
-        }:
+        if task_type in {BOOTSTRAP_PAPERS_TASK, RESUME_BOOTSTRAP_PAPERS_TASK}:
             return self._handle_bootstrap_papers(message)
-        if task_type == "paper_indexing":
+        if task_type == PAPER_INDEXING_TASK:
             return self._handle_paper_indexing(message)
-        if task_type in {"entity_indexing", "research_entities_indexing"}:
+        if task_type == ENTITY_INDEXING_TASK:
             return self._handle_entity_indexing(message)
-        if task_type in {"cluster_recompute", "recompute_topic_clusters"}:
+        if task_type == RECOMPUTE_TOPIC_CLUSTERS_TASK:
             return self._handle_cluster_recompute(message)
-        if task_type == "cluster_dynamics_recompute":
+        if task_type == CLUSTER_DYNAMICS_RECOMPUTE_TASK:
             return self._handle_cluster_dynamics_recompute(message)
-        if task_type == "topic_quarter_report":
+        if task_type == TOPIC_QUARTER_REPORT_TASK:
             return self._handle_topic_quarter_report(message)
-        if task_type == "user_profile_recompute":
+        if task_type == USER_PROFILE_RECOMPUTE_TASK:
             return self._handle_user_profile_recompute(message)
 
         raise InvalidRequestError(
@@ -152,7 +160,7 @@ class MLTaskHandler:
         return self._batch_result(
             result,
             "Keyword extraction completed",
-            task_type="keyword_extraction",
+            task_type=KEYWORD_EXTRACTION_TASK,
         )
 
     def _handle_paper_indexing(self, message: dict[str, Any]) -> OperationResultDTO:
@@ -172,7 +180,7 @@ class MLTaskHandler:
             return self._batch_result(
                 result,
                 "Paper indexing batch completed",
-                task_type="paper_indexing",
+                task_type=PAPER_INDEXING_TASK,
             )
 
         response = pipeline.run_one(
@@ -224,7 +232,7 @@ class MLTaskHandler:
             success=result.failed == 0,
             message="OpenAlex topic stats collection completed",
             details={
-                "task_type": "collect_topic_stats",
+                "task_type": COLLECT_TOPIC_STATS_TASK,
                 **self._dump_dto(result),
             },
         )
@@ -264,7 +272,7 @@ class MLTaskHandler:
             source_queue=str(
                 source_message.get("source_queue") or "queue:openalex_topic_stats"
             ),
-            task_type="collect_topic_stats",
+            task_type=COLLECT_TOPIC_STATS_TASK,
         )
 
     def _handle_bootstrap_papers(self, message: dict[str, Any]) -> OperationResultDTO:
@@ -280,7 +288,7 @@ class MLTaskHandler:
             success=failed == 0,
             message="OpenAlex paper bootstrap completed",
             details={
-                "task_type": "bootstrap_papers",
+                "task_type": BOOTSTRAP_PAPERS_TASK,
                 **details,
             },
         )
@@ -300,7 +308,7 @@ class MLTaskHandler:
         return self._batch_result(
             result,
             "Research entity indexing completed",
-            task_type="entity_indexing",
+            task_type=ENTITY_INDEXING_TASK,
         )
 
     def _handle_cluster_recompute(self, message: dict[str, Any]) -> OperationResultDTO:
@@ -339,7 +347,7 @@ class MLTaskHandler:
             cluster_workers = max(1, cluster_workers)
             self._emit(
                 "cluster_batch_started",
-                "cluster_recompute",
+                RECOMPUTE_TOPIC_CLUSTERS_TASK,
                 entity_id="worker_batch",
                 stage="topics",
                 current=0,
@@ -384,7 +392,7 @@ class MLTaskHandler:
                         )
             self._emit(
                 "cluster_batch_completed",
-                "cluster_recompute",
+                RECOMPUTE_TOPIC_CLUSTERS_TASK,
                 entity_id="worker_batch",
                 stage="topics",
                 current=len(topic_ids),
@@ -401,7 +409,7 @@ class MLTaskHandler:
             return self._batch_result(
                 result,
                 "Topic cluster recompute completed",
-                task_type="cluster_recompute",
+                task_type=RECOMPUTE_TOPIC_CLUSTERS_TASK,
             )
 
         result = pipeline.recompute_all(
@@ -414,7 +422,7 @@ class MLTaskHandler:
         return self._batch_result(
             result,
             "All clusters recompute completed",
-            task_type="cluster_recompute",
+            task_type=RECOMPUTE_TOPIC_CLUSTERS_TASK,
         )
 
     def _paper_workflow_options(self, message: dict[str, Any]) -> dict[str, Any]:
@@ -540,7 +548,7 @@ class MLTaskHandler:
     ) -> None:
         self._emit(
             "cluster_batch_progress",
-            "cluster_recompute",
+            RECOMPUTE_TOPIC_CLUSTERS_TASK,
             entity_id="worker_batch",
             stage="topics",
             current=index,
@@ -585,7 +593,7 @@ class MLTaskHandler:
             return self._batch_result(
                 result,
                 "Cluster dynamics recompute batch completed",
-                task_type="cluster_dynamics_recompute",
+                task_type=CLUSTER_DYNAMICS_RECOMPUTE_TASK,
             )
 
         result = pipeline.recompute(
@@ -597,7 +605,7 @@ class MLTaskHandler:
         return self._batch_result(
             result,
             "Cluster dynamics recompute completed",
-            task_type="cluster_dynamics_recompute",
+            task_type=CLUSTER_DYNAMICS_RECOMPUTE_TASK,
         )
 
     def _handle_topic_quarter_report(
@@ -615,7 +623,7 @@ class MLTaskHandler:
         return self._batch_result(
             result,
             "Topic quarter report batch completed",
-            task_type="topic_quarter_report",
+            task_type=TOPIC_QUARTER_REPORT_TASK,
         )
 
     def _handle_user_profile_recompute(

@@ -16,7 +16,7 @@ CLI_MODULES = [
     CliModule(
         module="cli.data",
         command="python -m cli.data",
-        description="Local data validation, coverage analysis, and OpenAlex stats maintenance.",
+        description="Data validation, repair, Qdrant initialization, and synchronization.",
     ),
     CliModule(
         module="cli.worker",
@@ -26,27 +26,12 @@ CLI_MODULES = [
     CliModule(
         module="cli.tasks",
         command="python -m cli.tasks",
-        description="Task queue maintenance utilities.",
-    ),
-    CliModule(
-        module="cli.index_paper",
-        command="python -m cli.index_paper",
-        description="Single-paper indexing utility.",
-    ),
-    CliModule(
-        module="cli.extract_keywords",
-        command="python -m cli.extract_keywords",
-        description="Extract paper keyphrases into PostgreSQL or Redis tasks.",
-    ),
-    CliModule(
-        module="cli.init_qdrant",
-        command="python -m cli.init_qdrant",
-        description="Qdrant collection initialization.",
+        description="Redis task enqueueing and queue maintenance utilities.",
     ),
     CliModule(
         module="cli.ml",
         command="python -m cli.ml",
-        description="ML facade command utilities.",
+        description="Local ML pipeline execution utilities.",
     ),
 ]
 

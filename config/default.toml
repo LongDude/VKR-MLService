@@ -1,0 +1,83 @@
+[infrastructure]
+redis_host = "localhost"
+redis_port = 6379
+redis_db = 0
+qdrant_host = "localhost"
+qdrant_port = 6333
+lmstudio_url = "http://localhost:1234"
+embedding_model = "qwen3-embedding"
+log_level = "INFO"
+
+[openalex]
+base_url = "https://api.openalex.org"
+languages = ["en", "ru"]
+types = ["article"]
+stats_batch_size = 500
+stats_task_batch_size = 100
+stats_request_workers = 8
+stats_rate_limit_rps = 10.0
+stats_max_retries = 5
+stats_group_by_page_size = 200
+normalize_january_first = true
+primary_topic_only = true
+bootstrap_target_count = 20
+bootstrap_batch_size = 500
+bootstrap_task_batch_size = 100
+bootstrap_request_workers = 8
+bootstrap_db_workers = 2
+bootstrap_rate_limit_rps = 70.0
+bootstrap_seed = 42
+bootstrap_per_page = 100
+bootstrap_max_retries = 5
+cooldown_fallback_seconds = 900
+rate_limit_defer_after_seconds = 120.0
+
+[worker]
+queues = [
+  "queue:openalex_topic_stats_pending",
+  "queue:openalex_bootstrap_papers_pending",
+  "queue:openalex_topic_stats",
+  "queue:openalex_bootstrap_papers",
+  "queue:keyword_extraction",
+  "queue:paper_indexing",
+  "queue:entity_indexing",
+  "queue:cluster_recompute",
+  "queue:cluster_dynamics_recompute",
+  "queue:topic_quarter_reports",
+  "queue:user_profile_recompute",
+]
+idle_sleep_seconds = 2.0
+dequeue_timeout_seconds = 30
+show_progress = true
+event_redis = false
+event_ttl_seconds = 86400
+keyword_extraction_batch_size = 128
+paper_indexing_batch_size = 128
+cluster_recompute_batch_size = 50
+cluster_recompute_workers = 1
+heartbeat_interval_seconds = 10.0
+heartbeat_ttl_seconds = 45
+
+[operations]
+paper_indexing_batch_size = 200
+keyword_extraction_batch_size = 200
+keyword_extraction_top_k = 10
+research_entities_batch_size = 128
+research_entities_limit = 10000
+cluster_recompute_batch_size = 50
+cluster_dynamics_batch_size = 50
+topic_reports_batch_size = 50
+topic_report_language = "ru"
+user_profiles_batch_size = 100
+event_ttl_seconds = 86400
+
+[data]
+sample_limit = 20
+qdrant_distance = "Cosine"
+
+[admin]
+tracking_ttl_seconds = 604800
+recent_ttl_seconds = 86400
+stale_after_hours = 24
+max_tracked_items = 5000
+result_ttl_seconds = 604800

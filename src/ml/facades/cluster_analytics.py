@@ -15,6 +15,7 @@ from dto.trends import TrendClusterDTO, TrendMetricsDTO
 from ml.constants import PAPERS_COLLECTION, TREND_CLUSTERS_COLLECTION
 from ml.facades.summaries import SummaryFacade
 from ml.services.events import EventSink, MLEvent, NoopEventSink
+from ml.task_contracts import RECOMPUTE_TOPIC_CLUSTERS_TASK
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.scoring import ScoringService
 from ml.services.trend_status import TrendStatusService
@@ -857,7 +858,7 @@ class ClusterAnalyticsFacade:
         self.event_sink.emit(
             MLEvent(
                 event_type=event_type,
-                task_type="cluster_recompute",
+                task_type=RECOMPUTE_TOPIC_CLUSTERS_TASK,
                 entity_id=entity_id,
                 stage=stage,
                 current=current,

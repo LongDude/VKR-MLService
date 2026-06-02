@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from calendar import monthrange
 from collections import defaultdict
@@ -10,7 +9,6 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Callable, cast
 
-from dotenv import load_dotenv
 from sqlalchemy import CursorResult, delete, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 
@@ -21,14 +19,26 @@ PROJECT_DIR = SRC_DIR.parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from adapters import QdrantAdapter
 from adapters.redis_adapter import RedisAdapter
-from core.config import Settings
+from core.config import Settings, load_settings
+from core.dependencies import create_qdrant_adapter, create_redis_client
+from ml.facades.cluster_db_sync import ClusterDbSyncFacade
+from ml.services.events import NoopEventSink
+from ml.services.qdrant_collections import QdrantCollectionInitializer
 from ml.services.cluster_dynamics_tasks import (
     acquire_cluster_dynamics_cluster_ids,
     build_cluster_dynamics_message,
     release_cluster_dynamics_dedupe_keys,
 )
 from ml.services.quarter_periods import QuarterPeriodService
+from ml.task_contracts import (
+    BOOTSTRAP_PAPERS_TASK,
+    CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
+    COLLECT_TOPIC_STATS_TASK,
+    OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
+    OPENALEX_TOPIC_STATS_QUEUE,
+)
 from models import (
     Domain,
     Field,
@@ -45,13 +55,9 @@ from models import (
 )
 from models.session import create_db_engine, create_session_factory
 from repositories.openalex_yearly_topic_stats import OpenAlexYearlyTopicStatsRepository
+from repositories.research_clusters import ResearchClusterRepository
 
 SAMPLE_LIMIT = 20
-OPENALEX_TOPIC_STATS_QUEUE = "queue:openalex_topic_stats"
-OPENALEX_BOOTSTRAP_PAPERS_QUEUE = "queue:openalex_bootstrap_papers"
-CLUSTER_DYNAMICS_RECOMPUTE_QUEUE = "queue:cluster_dynamics_recompute"
-
-
 class LocalDataValidator:
     """Validate local PostgreSQL data quality before ML indexing."""
 
@@ -950,6 +956,7 @@ class DataCoverageAnalyzer:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse data CLI command and command-specific arguments."""
+    settings = _preload_settings(argv)
     parser = argparse.ArgumentParser(description="Data maintenance CLI utilities.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -969,8 +976,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     validate_parser.add_argument(
         "--env-file",
-        default=str(PROJECT_DIR / ".env"),
-        help="Path to .env file. Defaults to project .env.",
+        default=None,
+        help="Optional .env path. Defaults to ML_ENV_FILE or project .env.",
     )
     validate_parser.add_argument(
         "--database-url",
@@ -1016,8 +1023,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     yearly_parser.add_argument(
         "--env-file",
-        default=str(PROJECT_DIR / ".env"),
-        help="Path to .env file. Defaults to project .env.",
+        default=None,
+        help="Optional .env path. Defaults to ML_ENV_FILE or project .env.",
     )
     yearly_parser.add_argument(
         "--database-url",
@@ -1065,7 +1072,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     jan_parser.add_argument(
         "--sample-limit",
         type=int,
-        default=SAMPLE_LIMIT,
+        default=settings.data.sample_limit,
         help="Maximum detailed topic rows in the report.",
     )
     jan_parser.add_argument(
@@ -1075,8 +1082,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     jan_parser.add_argument(
         "--env-file",
-        default=str(PROJECT_DIR / ".env"),
-        help="Path to .env file. Defaults to project .env.",
+        default=None,
+        help="Optional .env path. Defaults to ML_ENV_FILE or project .env.",
     )
     jan_parser.add_argument(
         "--database-url",
@@ -1086,7 +1093,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     coverage_parser = subparsers.add_parser(
         "analyze-coverage",
-        aliases=["analyze-data-coverage"],
         help=("Analyze monthly and quarterly database coverage for fields or topics."),
     )
     coverage_parser.add_argument(
@@ -1114,7 +1120,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     coverage_parser.add_argument(
         "--sample-limit",
         type=int,
-        default=SAMPLE_LIMIT,
+        default=settings.data.sample_limit,
         help="Maximum detailed topics/periods per coverage section. Defaults to 20.",
     )
     coverage_parser.add_argument(
@@ -1135,7 +1141,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     coverage_parser.add_argument(
         "--enqueue-task-batch-size",
         type=int,
-        default=100,
+        default=settings.openalex.stats_task_batch_size,
         help="Maximum topic ids per enqueued collect_topic_stats task. Defaults to 100.",
     )
     coverage_parser.add_argument(
@@ -1151,47 +1157,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     coverage_parser.add_argument(
         "--cluster-dynamics-batch-size",
         type=int,
-        default=50,
+        default=settings.operations.cluster_dynamics_batch_size,
         help="Maximum cluster ids per enqueued cluster dynamics task. Defaults to 50.",
     )
     coverage_parser.add_argument(
         "--languages",
-        default="en,ru",
+        default=",".join(settings.openalex.languages),
         help="Comma-separated OpenAlex languages for enqueued stats tasks. Defaults to en,ru.",
     )
     coverage_parser.add_argument(
         "--types",
-        default="article",
+        default=",".join(settings.openalex.types),
         help="Comma-separated OpenAlex work types for enqueued stats tasks. Defaults to article.",
     )
     coverage_parser.add_argument(
         "--collect-batch-size",
         type=int,
-        default=500,
+        default=settings.openalex.stats_batch_size,
         help="PostgreSQL upsert batch size for enqueued stats tasks. Defaults to 500.",
     )
     coverage_parser.add_argument(
         "--request-workers",
         type=int,
-        default=8,
+        default=settings.openalex.stats_request_workers,
         help="OpenAlex request workers for enqueued stats tasks. Defaults to 8.",
     )
     coverage_parser.add_argument(
         "--rate-limit-rps",
         type=float,
-        default=10.0,
+        default=settings.openalex.stats_rate_limit_rps,
         help="OpenAlex request rate for enqueued stats tasks. Defaults to 10.",
     )
     coverage_parser.add_argument(
         "--max-retries",
         type=int,
-        default=5,
+        default=settings.openalex.stats_max_retries,
         help="OpenAlex retry count for enqueued stats tasks. Defaults to 5.",
     )
     coverage_parser.add_argument(
         "--normalize-january-first",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=settings.openalex.normalize_january_first,
         help=(
             "Estimate and remove January-1 artificial publication dates in "
             "enqueued stats tasks. Enabled by default."
@@ -1200,7 +1206,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     coverage_parser.add_argument(
         "--primary-topic-only",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=settings.openalex.primary_topic_only,
         help=(
             "Use primary_topic.id instead of topics.id filter in enqueued stats tasks. "
             "Enabled by default."
@@ -1228,8 +1234,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     coverage_parser.add_argument(
         "--env-file",
-        default=str(PROJECT_DIR / ".env"),
-        help="Path to .env file. Defaults to project .env.",
+        default=None,
+        help="Optional .env path. Defaults to ML_ENV_FILE or project .env.",
     )
     coverage_parser.add_argument(
         "--database-url",
@@ -1240,7 +1246,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     sample_coverage_parser = subparsers.add_parser(
         "analyze-sample-month-coverage",
-        aliases=["analyze-samples-coverage"],
         help="Analyze local monthly paper sample coverage for topics in one field.",
     )
     sample_coverage_parser.add_argument(
@@ -1269,7 +1274,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sample_coverage_parser.add_argument(
         "--sample-limit",
         type=int,
-        default=SAMPLE_LIMIT,
+        default=settings.data.sample_limit,
         help="Maximum detailed topics/periods in the report. Defaults to 20.",
     )
     sample_coverage_parser.add_argument(
@@ -1285,7 +1290,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sample_coverage_parser.add_argument(
         "--enqueue-task-batch-size",
         type=int,
-        default=100,
+        default=settings.openalex.bootstrap_task_batch_size,
         help="Maximum topic ids per enqueued bootstrap_papers task. Defaults to 100.",
     )
     sample_coverage_parser.add_argument(
@@ -1296,59 +1301,59 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sample_coverage_parser.add_argument(
         "--target-count",
         type=int,
-        default=20,
+        default=settings.openalex.bootstrap_target_count,
         help="Target sample papers per enqueued topic/month batch. Defaults to 20.",
     )
     sample_coverage_parser.add_argument(
         "--languages",
-        default="en,ru",
+        default=",".join(settings.openalex.languages),
         help="Comma-separated OpenAlex languages for enqueued bootstrap tasks. Defaults to en,ru.",
     )
     sample_coverage_parser.add_argument(
         "--types",
-        default="article",
+        default=",".join(settings.openalex.types),
         help="Comma-separated OpenAlex work types for enqueued bootstrap tasks. Defaults to article.",
     )
     sample_coverage_parser.add_argument(
         "--batch-size",
         type=int,
-        default=500,
+        default=settings.openalex.bootstrap_batch_size,
         help="PostgreSQL import batch size for enqueued bootstrap tasks. Defaults to 500.",
     )
     sample_coverage_parser.add_argument(
         "--request-workers",
         type=int,
-        default=8,
+        default=settings.openalex.bootstrap_request_workers,
         help="OpenAlex request workers for enqueued bootstrap tasks. Defaults to 8.",
     )
     sample_coverage_parser.add_argument(
         "--db-workers",
         type=int,
-        default=2,
+        default=settings.openalex.bootstrap_db_workers,
         help="PostgreSQL import workers for enqueued bootstrap tasks. Defaults to 2.",
     )
     sample_coverage_parser.add_argument(
         "--rate-limit-rps",
         type=float,
-        default=70.0,
+        default=settings.openalex.bootstrap_rate_limit_rps,
         help="OpenAlex request rate for enqueued bootstrap tasks. Defaults to 70.",
     )
     sample_coverage_parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=settings.openalex.bootstrap_seed,
         help="Base OpenAlex sample seed for enqueued bootstrap tasks. Defaults to 42.",
     )
     sample_coverage_parser.add_argument(
         "--per-page",
         type=int,
-        default=100,
+        default=settings.openalex.bootstrap_per_page,
         help="OpenAlex per-page value for enqueued bootstrap tasks. Defaults to 100.",
     )
     sample_coverage_parser.add_argument(
         "--max-retries",
         type=int,
-        default=5,
+        default=settings.openalex.bootstrap_max_retries,
         help="OpenAlex retry count for enqueued bootstrap tasks. Defaults to 5.",
     )
     sample_coverage_parser.add_argument(
@@ -1364,7 +1369,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sample_coverage_parser.add_argument(
         "--primary-topic-only",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=settings.openalex.primary_topic_only,
         help="Use primary_topic topic filters in bootstrap task processors. Enabled by default.",
     )
     sample_coverage_parser.add_argument(
@@ -1389,8 +1394,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     sample_coverage_parser.add_argument(
         "--env-file",
-        default=str(PROJECT_DIR / ".env"),
-        help="Path to .env file. Defaults to project .env.",
+        default=None,
+        help="Optional .env path. Defaults to ML_ENV_FILE or project .env.",
     )
     sample_coverage_parser.add_argument(
         "--database-url",
@@ -1399,13 +1404,76 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     add_redis_args(sample_coverage_parser)
 
-    return parser.parse_args(argv)
+    sync_parser = subparsers.add_parser(
+        "sync-clusters-db",
+        help="Synchronize research cluster PostgreSQL rows from Qdrant.",
+    )
+    sync_parser.add_argument("--scope", choices=["all", "clusters", "periods"], default="all")
+    sync_parser.add_argument("--batch-size", type=int, default=256)
+    sync_parser.add_argument("--cluster-id", default=None)
+    sync_parser.add_argument("--dry-run", action="store_true")
+    sync_parser.add_argument("--no-prune-missing", action="store_true")
+    sync_parser.add_argument("--database-url", default=None)
+    add_qdrant_args(sync_parser)
+
+    init_parser = subparsers.add_parser(
+        "init-qdrant",
+        help="Initialize Qdrant collections and payload indexes.",
+    )
+    init_parser.add_argument("vector_size", type=int)
+    init_parser.add_argument(
+        "--collection",
+        choices=[
+            "all",
+            "papers",
+            "research_entities",
+            "trend_clusters",
+            "trend_cluster_periods",
+            "user_profiles",
+        ],
+        default="all",
+    )
+    init_parser.add_argument(
+        "--distance",
+        choices=["Cosine", "Dot", "Euclid", "Manhattan"],
+        default=settings.data.qdrant_distance,
+    )
+    add_qdrant_args(init_parser)
+
+    command_parsers = [
+        validate_parser,
+        yearly_parser,
+        jan_parser,
+        coverage_parser,
+        sample_coverage_parser,
+        sync_parser,
+        init_parser,
+    ]
+    for command_parser in command_parsers:
+        command_parser.add_argument(
+            "--config-file",
+            default=None,
+            help="Optional TOML override file. Defaults to ML_CONFIG_FILE when set.",
+        )
+        if not any(action.dest == "env_file" for action in command_parser._actions):
+            command_parser.add_argument(
+                "--env-file",
+                default=None,
+                help="Optional .env path. Defaults to ML_ENV_FILE or project .env.",
+            )
+
+    args = parser.parse_args(argv)
+    args.settings = settings
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the requested data CLI command."""
     args = parse_args(argv)
-    load_dotenv(args.env_file)
+    args.settings = load_settings(
+        config_file=getattr(args, "config_file", None),
+        env_file=args.env_file,
+    )
 
     try:
         if args.command == "validate-local-data":
@@ -1414,16 +1482,17 @@ def main(argv: list[str] | None = None) -> int:
             report = run_rebuild_openalex_yearly_topic_stats(args)
         elif args.command == "check-openalex-jan1-anomalies":
             report = run_check_openalex_jan1_anomalies(args)
-        elif args.command in {"analyze-coverage", "analyze-data-coverage"}:
+        elif args.command == "analyze-coverage":
             report = run_analyze_coverage(args)
-        elif args.command in {
-            "analyze-sample-month-coverage",
-            "analyze-samples-coverage",
-        }:
+        elif args.command == "analyze-sample-month-coverage":
             report = run_analyze_sample_month_coverage(args)
+        elif args.command == "sync-clusters-db":
+            report = run_sync_clusters_db(args)
+        elif args.command == "init-qdrant":
+            report = run_init_qdrant(args)
         else:
             raise AssertionError(f"Unhandled command: {args.command}")
-        if args.report_json:
+        if getattr(args, "report_json", None):
             write_report(Path(args.report_json), report)
     except Exception as exc:
         print_json(
@@ -1444,7 +1513,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def run_validate_local_data(args: argparse.Namespace) -> dict[str, Any]:
     """Validate local data and optionally apply safe fixes."""
-    database_url = args.database_url or Settings.from_env().database_url
+    database_url = args.database_url or _settings(args).database_url
     engine = create_db_engine(database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
@@ -1475,7 +1544,7 @@ def run_rebuild_openalex_yearly_topic_stats(args: argparse.Namespace) -> dict[st
     if args.date_from > args.date_to:
         raise ValueError("--date-from must be before or equal to --date-to.")
     topic_ids = parse_int_csv_arg(args.topic_ids) if args.topic_ids else None
-    database_url = args.database_url or Settings.from_env().database_url
+    database_url = args.database_url or _settings(args).database_url
     engine = create_db_engine(database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
@@ -1527,7 +1596,7 @@ def run_check_openalex_jan1_anomalies(args: argparse.Namespace) -> dict[str, Any
     topic_ids = parse_int_csv_arg(args.topic_ids) if args.topic_ids else None
     field_ids = parse_int_csv_arg(args.field_ids) if args.field_ids else None
     subfield_ids = parse_int_csv_arg(args.subfield_ids) if args.subfield_ids else None
-    database_url = args.database_url or Settings.from_env().database_url
+    database_url = args.database_url or _settings(args).database_url
     engine = create_db_engine(database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
@@ -1577,7 +1646,7 @@ def run_analyze_coverage(args: argparse.Namespace) -> dict[str, Any]:
     if field_ids and topic_ids:
         raise ValueError("--field-ids and --topic-ids are mutually exclusive.")
 
-    database_url = args.database_url or Settings.from_env().database_url
+    database_url = args.database_url or _settings(args).database_url
     engine = create_db_engine(database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
@@ -1653,7 +1722,7 @@ def run_analyze_sample_month_coverage(args: argparse.Namespace) -> dict[str, Any
         raise ValueError("--max-retries must be non-negative.")
 
     topic_ids = parse_int_csv_arg(args.topic_ids) if args.topic_ids else None
-    database_url = args.database_url or Settings.from_env().database_url
+    database_url = args.database_url or _settings(args).database_url
     engine = create_db_engine(database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
@@ -1700,6 +1769,73 @@ def run_analyze_sample_month_coverage(args: argparse.Namespace) -> dict[str, Any
         engine.dispose()
 
 
+def run_sync_clusters_db(args: argparse.Namespace) -> dict[str, Any]:
+    """Synchronize research cluster read-model tables from Qdrant."""
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be a positive integer.")
+    engine = create_db_engine(args.database_url or _settings(args).database_url, echo=False)
+    SessionLocal = create_session_factory(engine, expire_on_commit=False)
+    try:
+        with SessionLocal() as session:
+            facade = ClusterDbSyncFacade(
+                qdrant_adapter=build_qdrant_adapter(args),
+                research_cluster_repository=ResearchClusterRepository(session),
+                event_sink=NoopEventSink(),
+            )
+            common_kwargs = {
+                "batch_size": args.batch_size,
+                "cluster_id": args.cluster_id,
+                "prune_missing": not args.no_prune_missing,
+                "dry_run": bool(args.dry_run),
+            }
+            if args.scope == "clusters":
+                result = facade.sync_clusters_from_qdrant(**common_kwargs)
+            elif args.scope == "periods":
+                result = facade.sync_periods_from_qdrant(**common_kwargs)
+            else:
+                result = facade.sync_all(**common_kwargs)
+            if args.dry_run:
+                session.rollback()
+            else:
+                session.commit()
+        return {
+            "command": "sync-clusters-db",
+            "scope": args.scope,
+            "cluster_id": args.cluster_id,
+            "dry_run": bool(args.dry_run),
+            "prune_missing": not args.no_prune_missing,
+            "result": result.model_dump(mode="json"),
+        }
+    finally:
+        engine.dispose()
+
+
+def run_init_qdrant(args: argparse.Namespace) -> dict[str, Any]:
+    """Initialize requested Qdrant collections and payload indexes."""
+    if args.vector_size <= 0:
+        raise ValueError("vector_size must be a positive integer.")
+    initializer = QdrantCollectionInitializer(
+        build_qdrant_adapter(args),
+        distance=args.distance,
+    )
+    handlers = {
+        "all": initializer.ensure_all,
+        "papers": initializer.ensure_papers_collection,
+        "research_entities": initializer.ensure_research_entities_collection,
+        "trend_clusters": initializer.ensure_trend_clusters_collection,
+        "trend_cluster_periods": initializer.ensure_trend_cluster_periods_collection,
+        "user_profiles": initializer.ensure_user_profiles_collection,
+    }
+    handlers[args.collection](args.vector_size)
+    return {
+        "command": "init-qdrant",
+        "status": "ok",
+        "collection": args.collection,
+        "vector_size": args.vector_size,
+        "distance": args.distance,
+    }
+
+
 def enqueue_missing_sample_tasks(
     report: dict[str, Any],
     *,
@@ -1744,7 +1880,7 @@ def enqueue_missing_sample_tasks(
         ):
             messages.append(
                 {
-                    "task_type": "bootstrap_papers",
+                    "task_type": BOOTSTRAP_PAPERS_TASK,
                     "date_from": _iso_date_value(period["period_start"]),
                     "date_to": _iso_date_value(period["period_end"]),
                     "field_id": field_id,
@@ -1902,7 +2038,7 @@ def enqueue_missing_topic_stats_tasks(
         ):
             messages.append(
                 {
-                    "task_type": "collect_topic_stats",
+                    "task_type": COLLECT_TOPIC_STATS_TASK,
                     "date_from": _iso_date_value(period["period_start"]),
                     "date_to": _iso_date_value(period["period_end"]),
                     "taxonomy_scope": "topic",
@@ -2229,33 +2365,52 @@ def add_redis_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def build_redis_client(args: argparse.Namespace) -> Any:
-    """Build a redis-py client from CLI arguments or environment variables."""
-    try:
-        from redis import Redis
-    except ImportError as exc:
-        raise RuntimeError(
-            "redis package is not installed. Install dependencies from requirements.txt."
-        ) from exc
+def add_qdrant_args(parser: argparse.ArgumentParser) -> None:
+    """Add Qdrant connection arguments."""
+    parser.add_argument("--qdrant-url", default=None)
+    parser.add_argument("--qdrant-host", default=None)
+    parser.add_argument("--qdrant-port", type=int, default=None)
+    parser.add_argument("--qdrant-api-key", default=None)
 
-    redis_url = args.redis_url or os.getenv("REDIS_URL")
-    if redis_url:
-        return Redis.from_url(redis_url)
-    return Redis(
-        host=args.redis_host or os.getenv("REDIS_HOST") or "localhost",
-        port=args.redis_port or _optional_int_env("REDIS_PORT") or 6379,
-        db=args.redis_db
-        if args.redis_db is not None
-        else _optional_int_env("REDIS_DB") or 0,
-        password=os.getenv("REDIS_PASSWORD") or None,
+
+def build_redis_client(args: argparse.Namespace) -> Any:
+    """Build a redis-py client from settings and CLI overrides."""
+    return create_redis_client(
+        _settings(args),
+        url=args.redis_url,
+        host=args.redis_host,
+        port=args.redis_port,
+        db=args.redis_db,
     )
 
 
-def _optional_int_env(name: str) -> int | None:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return None
-    return int(value)
+def build_qdrant_adapter(args: argparse.Namespace) -> QdrantAdapter:
+    """Build QdrantAdapter from settings and CLI overrides."""
+    return create_qdrant_adapter(
+        _settings(args),
+        url=args.qdrant_url,
+        host=args.qdrant_host,
+        port=args.qdrant_port,
+        api_key=args.qdrant_api_key,
+    )
+
+
+def _preload_settings(argv: list[str] | None) -> Settings:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config-file", default=None)
+    parser.add_argument("--env-file", default=None)
+    args, _unknown = parser.parse_known_args(argv)
+    return load_settings(config_file=args.config_file, env_file=args.env_file)
+
+
+def _settings(args: argparse.Namespace) -> Settings:
+    settings = getattr(args, "settings", None)
+    if isinstance(settings, Settings):
+        return settings
+    return load_settings(
+        config_file=getattr(args, "config_file", None),
+        env_file=getattr(args, "env_file", None),
+    )
 
 
 if __name__ == "__main__":

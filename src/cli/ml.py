@@ -3,14 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 from typing import Any
-
-from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 SRC_DIR = BASE_DIR.parent
@@ -25,19 +22,30 @@ from adapters import (
     QdrantAdapter,
     RedisAdapter,
 )
-from core.config import Settings
+from core.config import Settings, load_settings
+from core.dependencies import (
+    create_chat_adapter,
+    create_embedding_adapter,
+    create_qdrant_adapter,
+    create_redis_client,
+)
 from core.exceptions import AppError
+from dto.keywords import PaperKeywordExtractionBatchRequestDTO
+from dto.papers import PaperBatchIndexingRequestDTO
 from dto.topic_reports import TopicQuarterReportGenerateRequestDTO
 from ml.constants import DEFAULT_EMBEDDING_MODEL
 from ml.facades import (
     ClusterAnalyticsFacade,
-    ClusterDbSyncFacade,
     ClusterDynamicsFacade,
+    KeywordExtractionFacade,
+    PaperIndexingFacade,
     ResearchEntityIndexingFacade,
     SummaryFacade,
     TopicQuarterReportFacade,
     UserProfileFacade,
 )
+from ml.pipelines.keyword_extraction_pipeline import KeywordExtractionPipeline
+from ml.pipelines.paper_indexing_pipeline import PaperIndexingPipeline
 from ml.pipelines.topic_quarter_report_pipeline import TopicQuarterReportPipeline
 from ml.services.events import (
     CompositeEventSink,
@@ -49,15 +57,11 @@ from ml.services.events import (
     TqdmEventSink,
 )
 from ml.services.quarter_periods import QuarterPeriodService
-from ml.workers.redis_worker import (
-    CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
-    CLUSTER_RECOMPUTE_QUEUE,
-    ENTITY_INDEXING_QUEUE,
-    USER_PROFILE_RECOMPUTE_QUEUE,
-)
 from models.session import create_db_engine, create_session_factory
 from repositories import (
     FavouriteRepository,
+    AuthorRepository,
+    InstitutionRepository,
     OpenAlexTopicStatsRepository,
     PaperGraphRepository,
     PaperRepository,
@@ -71,6 +75,7 @@ from repositories import (
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse ML CLI command and command-specific arguments."""
+    settings = _preload_settings(argv)
     parser = argparse.ArgumentParser(description="ML-service command line utilities.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -87,7 +92,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     research_parser.add_argument(
         "--limit",
         type=int,
-        default=10000,
+        default=settings.operations.research_entities_limit,
         help="Maximum number of entities to index. Defaults to 10000.",
     )
     research_parser.add_argument(
@@ -104,10 +109,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     research_parser.add_argument(
         "--batch-size",
         type=int,
-        default=128,
+        default=settings.operations.research_entities_batch_size,
         help="Embedding and Qdrant upsert batch size. Defaults to 128.",
     )
-    add_runtime_args(research_parser)
+    add_runtime_args(research_parser, settings=settings)
     add_common_connection_args(research_parser)
     add_redis_connection_args(research_parser)
 
@@ -141,7 +146,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     trends_parser.add_argument(
         "--batch-size",
         type=int,
-        default=50,
+        default=settings.operations.cluster_recompute_batch_size,
         help="Topic page size for recomputation. Defaults to 50.",
     )
     trends_parser.add_argument(
@@ -150,7 +155,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1,
         help="Parallel topic cluster recompute workers. Defaults to 1.",
     )
-    add_runtime_args(trends_parser)
+    add_runtime_args(trends_parser, settings=settings)
     add_common_connection_args(trends_parser)
     add_redis_connection_args(trends_parser)
 
@@ -193,7 +198,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=100,
         help="Maximum number of clusters when --all-clusters is used.",
     )
-    add_runtime_args(dynamics_parser)
+    add_runtime_args(dynamics_parser, settings=settings)
     add_common_connection_args(dynamics_parser)
     add_redis_connection_args(dynamics_parser)
 
@@ -226,10 +231,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     report_parser.add_argument(
         "--report-language",
-        default="ru",
+        default=settings.operations.topic_report_language,
         help="Narrative language for generated report text. Defaults to ru.",
     )
-    add_runtime_args(report_parser, include_enqueue=False)
+    add_runtime_args(report_parser, settings=settings)
     add_common_connection_args(report_parser)
     add_redis_connection_args(report_parser)
 
@@ -252,7 +257,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     user_profile_parser.add_argument(
         "--batch-size",
         type=int,
-        default=100,
+        default=settings.operations.user_profiles_batch_size,
         help="User page size when --all-users is used. Defaults to 100.",
     )
     user_profile_parser.add_argument(
@@ -260,53 +265,76 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Force profile recalculation. Recompute mode always upserts current vectors.",
     )
-    add_runtime_args(user_profile_parser)
+    add_runtime_args(user_profile_parser, settings=settings)
     add_common_connection_args(user_profile_parser)
     add_redis_connection_args(user_profile_parser)
 
-    sync_parser = subparsers.add_parser(
-        "sync-clusters-db",
-        help="Synchronize research cluster DB rows from Qdrant collections.",
+    paper_parser = subparsers.add_parser(
+        "index-papers",
+        help="Index local PostgreSQL papers into Qdrant.",
     )
-    sync_parser.add_argument(
-        "--scope",
-        choices=["all", "clusters", "periods"],
-        default="all",
-        help="Qdrant data to synchronize. Defaults to all.",
-    )
-    sync_parser.add_argument(
+    paper_parser.add_argument("paper_ids", nargs="*", type=int)
+    paper_parser.add_argument("--paper-ids", dest="paper_ids_csv", default=None)
+    paper_parser.add_argument("--date-from", type=parse_iso_date, default=None)
+    paper_parser.add_argument("--date-to", type=parse_iso_date, default=None)
+    paper_parser.add_argument("--limit", type=int, default=None)
+    paper_parser.add_argument("--offset", type=int, default=0)
+    paper_parser.add_argument(
         "--batch-size",
         type=int,
-        default=256,
-        help="Qdrant scroll batch size. Defaults to 256.",
+        default=settings.operations.paper_indexing_batch_size,
     )
-    sync_parser.add_argument(
-        "--cluster-id",
-        default=None,
-        help="Limit sync to one cluster id, for example topic:120.",
-    )
-    sync_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Validate Qdrant payloads without writing to PostgreSQL or pruning.",
-    )
-    sync_parser.add_argument(
-        "--no-prune-missing",
-        action="store_true",
-        help="Do not delete DB rows missing from Qdrant.",
-    )
-    add_runtime_args(sync_parser, include_enqueue=False)
-    add_common_connection_args(sync_parser)
-    add_redis_connection_args(sync_parser)
+    paper_parser.add_argument("--force-reindex", action="store_true")
+    add_runtime_args(paper_parser, settings=settings)
+    add_common_connection_args(paper_parser)
+    add_redis_connection_args(paper_parser)
 
-    return parser.parse_args(argv)
+    keyword_parser = subparsers.add_parser(
+        "extract-keywords",
+        help="Extract keyphrases into papers.extracted_keywords locally.",
+    )
+    keyword_parser.add_argument("paper_ids", nargs="*", type=int)
+    keyword_parser.add_argument("--paper-ids", dest="paper_ids_csv", default=None)
+    keyword_parser.add_argument("--date-from", type=parse_iso_date, default=None)
+    keyword_parser.add_argument("--date-to", type=parse_iso_date, default=None)
+    keyword_parser.add_argument("--topic-id", type=int, default=None)
+    keyword_parser.add_argument("--field-id", type=int, default=None)
+    keyword_parser.add_argument("--limit", type=int, default=None)
+    keyword_parser.add_argument("--offset", type=int, default=0)
+    keyword_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=settings.operations.keyword_extraction_batch_size,
+    )
+    keyword_parser.add_argument(
+        "--top-k",
+        type=int,
+        default=settings.operations.keyword_extraction_top_k,
+    )
+    keyword_parser.add_argument("--min-score", type=float, default=None)
+    keyword_parser.add_argument(
+        "--skip-processed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    keyword_parser.add_argument("--skip-non-english", action="store_true")
+    add_runtime_args(keyword_parser, settings=settings)
+    add_common_connection_args(keyword_parser)
+    add_redis_connection_args(keyword_parser)
+
+    args = parser.parse_args(argv)
+    args.settings = settings
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the requested ML CLI command."""
     args = parse_args(argv)
-    load_dotenv(args.env_file)
-    configure_logging(getattr(args, "verbose", 0))
+    args.settings = load_settings(
+        config_file=getattr(args, "config_file", None),
+        env_file=args.env_file,
+    )
+    configure_logging(getattr(args, "verbose", 0), settings=_settings(args))
 
     try:
         if args.command == "index-research-entities":
@@ -319,8 +347,10 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_generate_topic_report(args)
         elif args.command == "recompute-user-profile":
             payload = run_recompute_user_profile(args)
-        elif args.command == "sync-clusters-db":
-            payload = run_sync_clusters_db(args)
+        elif args.command == "index-papers":
+            payload = run_index_papers(args)
+        elif args.command == "extract-keywords":
+            payload = run_extract_keywords(args)
         else:
             raise AssertionError(f"Unhandled command: {args.command}")
     except AppError as exc:
@@ -345,27 +375,15 @@ def main(argv: list[str] | None = None) -> int:
 
 def run_index_research_entities(args: argparse.Namespace) -> dict[str, Any]:
     """Index research entities through ResearchEntityIndexingFacade."""
-    if args.enqueue:
-        message = {
-            "task_type": "entity_indexing",
-            "entity_type": args.entity_type,
-            "limit": args.limit,
-            "offset": args.offset,
-            "batch_size": args.batch_size,
-            "force_reindex": bool(args.force_reindex),
-        }
-        return enqueue_messages(args, ENTITY_INDEXING_QUEUE, [message])
-
-    database_url = args.database_url or Settings.from_env().database_url
+    database_url = args.database_url or _settings(args).database_url
     engine = create_db_engine(database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
     try:
         event_sink = build_event_sink(args)
-        embedding_adapter = LMStudioEmbeddingAdapter(
-            base_url=args.lmstudio_url
-            or os.getenv("LMSTUDIO_BASE_URL")
-            or "http://localhost:1234",
+        embedding_adapter = create_embedding_adapter(
+            _settings(args),
+            base_url=args.lmstudio_url,
         )
         qdrant_adapter = build_qdrant_adapter(args)
 
@@ -376,8 +394,7 @@ def run_index_research_entities(args: argparse.Namespace) -> dict[str, Any]:
                 embedding_adapter=embedding_adapter,
                 qdrant_adapter=qdrant_adapter,
                 embedding_model=args.embedding_model
-                or os.getenv("EMBEDDING_MODEL")
-                or DEFAULT_EMBEDDING_MODEL,
+                or _settings(args).infrastructure.embedding_model,
                 event_sink=event_sink,
             )
             result = facade.index_all_entities(
@@ -398,21 +415,10 @@ def run_index_research_entities(args: argparse.Namespace) -> dict[str, Any]:
 
 def run_recompute_trends(args: argparse.Namespace) -> dict[str, Any]:
     """Recompute topic-based trend clusters through ClusterAnalyticsFacade."""
-    if args.enqueue:
-        message = {
-            "task_type": "cluster_recompute",
-            "date_from": args.date_from.isoformat(),
-            "date_to": args.date_to.isoformat(),
-            "limit": args.limit,
-            "batch_size": args.batch_size,
-            "force_summary": bool(args.force_summary),
-            "cluster_workers": args.cluster_workers,
-        }
-        return enqueue_messages(args, CLUSTER_RECOMPUTE_QUEUE, [message])
     if args.cluster_workers <= 0:
         raise ValueError("--cluster-workers must be a positive integer.")
 
-    database_url = args.database_url or Settings.from_env().database_url
+    database_url = args.database_url or _settings(args).database_url
     engine = create_db_engine(database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
@@ -421,10 +427,9 @@ def run_recompute_trends(args: argparse.Namespace) -> dict[str, Any]:
         qdrant_adapter = build_qdrant_adapter(args)
         redis_adapter = RedisAdapter(build_redis_client(args))
         summary_facade = SummaryFacade(
-            chat_adapter=LMStudioChatAdapter(
-                base_url=args.lmstudio_url
-                or os.getenv("LMSTUDIO_BASE_URL")
-                or "http://localhost:1234",
+            chat_adapter=create_chat_adapter(
+                _settings(args),
+                base_url=args.lmstudio_url,
             )
         )
 
@@ -477,27 +482,7 @@ def run_recompute_trends(args: argparse.Namespace) -> dict[str, Any]:
 
 def run_recompute_cluster_dynamics(args: argparse.Namespace) -> dict[str, Any]:
     """Recompute time dynamics for one or many trend clusters."""
-    if args.enqueue:
-        redis_adapter = RedisAdapter(build_redis_client(args))
-        cluster_ids = resolve_cluster_ids_for_dynamics_enqueue(args, redis_adapter)
-        messages = [
-            {
-                "task_type": "cluster_dynamics_recompute",
-                "cluster_id": cluster_id,
-                "date_from": args.date_from.isoformat(),
-                "date_to": args.date_to.isoformat(),
-                "granularity": args.granularity,
-            }
-            for cluster_id in cluster_ids
-        ]
-        return enqueue_messages(
-            args,
-            CLUSTER_DYNAMICS_RECOMPUTE_QUEUE,
-            messages,
-            redis_adapter=redis_adapter,
-        )
-
-    database_url = args.database_url or Settings.from_env().database_url
+    database_url = args.database_url or _settings(args).database_url
     engine = create_db_engine(database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
@@ -558,7 +543,7 @@ def run_generate_topic_report(args: argparse.Namespace) -> dict[str, Any]:
         for period in periods
     ]
 
-    database_url = args.database_url or Settings.from_env().database_url
+    database_url = args.database_url or _settings(args).database_url
     engine = create_db_engine(database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
@@ -567,10 +552,9 @@ def run_generate_topic_report(args: argparse.Namespace) -> dict[str, Any]:
             RedisAdapter(build_redis_client(args)) if args.event_redis else None
         )
         event_sink = build_event_sink(args, redis_adapter=redis_adapter)
-        chat_adapter = LMStudioChatAdapter(
-            base_url=args.lmstudio_url
-            or os.getenv("LMSTUDIO_BASE_URL")
-            or "http://localhost:1234",
+        chat_adapter = create_chat_adapter(
+            _settings(args),
+            base_url=args.lmstudio_url,
         )
 
         with SessionLocal() as session:
@@ -614,35 +598,11 @@ def run_recompute_user_profile(args: argparse.Namespace) -> dict[str, Any]:
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be a positive integer.")
 
-    database_url = args.database_url or Settings.from_env().database_url
+    database_url = args.database_url or _settings(args).database_url
     engine = create_db_engine(database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
 
     try:
-        if args.enqueue:
-            redis_adapter = RedisAdapter(build_redis_client(args))
-            with SessionLocal() as session:
-                if args.user_id is not None:
-                    user_ids = [args.user_id]
-                else:
-                    user_ids = list_user_ids(
-                        UserRepository(session),
-                        batch_size=args.batch_size,
-                    )
-                return enqueue_messages(
-                    args,
-                    USER_PROFILE_RECOMPUTE_QUEUE,
-                    [
-                        {
-                            "task_type": "user_profile_recompute",
-                            "user_id": user_id,
-                            "force": bool(args.force),
-                        }
-                        for user_id in user_ids
-                    ],
-                    redis_adapter=redis_adapter,
-                )
-
         event_sink = build_event_sink(args)
         qdrant_adapter = build_qdrant_adapter(args)
 
@@ -678,55 +638,120 @@ def run_recompute_user_profile(args: argparse.Namespace) -> dict[str, Any]:
         engine.dispose()
 
 
-def run_sync_clusters_db(args: argparse.Namespace) -> dict[str, Any]:
-    """Synchronize research cluster read-model tables from Qdrant."""
-    if args.batch_size <= 0:
-        raise ValueError("--batch-size must be a positive integer.")
+def run_index_papers(args: argparse.Namespace) -> dict[str, Any]:
+    """Index local papers through PaperIndexingPipeline."""
+    paper_ids = _resolve_cli_paper_ids(args)
+    if paper_ids and (args.date_from is not None or args.date_to is not None):
+        raise ValueError("Use either paper ids or a date range, not both.")
+    if not paper_ids and args.date_from is None and args.date_to is None:
+        raise ValueError("Provide paper ids or at least one date boundary.")
+    if args.date_from is not None and args.date_to is not None and args.date_from > args.date_to:
+        raise ValueError("--date-from must be before or equal to --date-to.")
 
-    database_url = args.database_url or Settings.from_env().database_url
-    engine = create_db_engine(database_url, echo=False)
+    engine = create_db_engine(args.database_url or _settings(args).database_url, echo=False)
     SessionLocal = create_session_factory(engine, expire_on_commit=False)
-
     try:
-        redis_adapter = (
-            RedisAdapter(build_redis_client(args)) if args.event_redis else None
-        )
+        redis_adapter = RedisAdapter(build_redis_client(args))
         event_sink = build_event_sink(args, redis_adapter=redis_adapter)
-        qdrant_adapter = build_qdrant_adapter(args)
-
         with SessionLocal() as session:
-            facade = ClusterDbSyncFacade(
-                qdrant_adapter=qdrant_adapter,
-                research_cluster_repository=ResearchClusterRepository(session),
-                event_sink=event_sink,
+            pipeline = PaperIndexingPipeline(
+                PaperIndexingFacade(
+                    paper_repository=PaperRepository(session),
+                    taxonomy_repository=TaxonomyRepository(session),
+                    author_repository=AuthorRepository(session),
+                    institution_repository=InstitutionRepository(session),
+                    embedding_adapter=create_embedding_adapter(
+                        _settings(args),
+                        base_url=args.lmstudio_url,
+                    ),
+                    qdrant_adapter=build_qdrant_adapter(args),
+                    redis_adapter=redis_adapter,
+                    embedding_model=args.embedding_model
+                    or _settings(args).infrastructure.embedding_model,
+                    event_sink=event_sink,
+                )
             )
-            common_kwargs = {
-                "batch_size": args.batch_size,
-                "cluster_id": args.cluster_id,
-                "prune_missing": not args.no_prune_missing,
-                "dry_run": bool(args.dry_run),
-            }
-            if args.scope == "clusters":
-                result = facade.sync_clusters_from_qdrant(**common_kwargs)
-            elif args.scope == "periods":
-                result = facade.sync_periods_from_qdrant(**common_kwargs)
-            else:
-                result = facade.sync_all(**common_kwargs)
-            if args.dry_run:
-                session.rollback()
-            else:
-                session.commit()
-
-        return {
-            "command": "sync-clusters-db",
-            "scope": args.scope,
-            "cluster_id": args.cluster_id,
-            "dry_run": bool(args.dry_run),
-            "prune_missing": not args.no_prune_missing,
-            "result": result.model_dump(mode="json"),
-        }
+            result = pipeline.facade.index_batch(
+                PaperBatchIndexingRequestDTO(
+                    paper_ids=paper_ids,
+                    date_from=args.date_from,
+                    date_to=args.date_to,
+                    limit=args.limit,
+                    offset=args.offset,
+                    batch_size=args.batch_size,
+                    force_reindex=bool(args.force_reindex),
+                )
+            )
+            session.commit()
+        return {"command": "index-papers", "result": result.model_dump(mode="json")}
     finally:
         engine.dispose()
+
+
+def run_extract_keywords(args: argparse.Namespace) -> dict[str, Any]:
+    """Extract paper keywords through KeywordExtractionPipeline."""
+    paper_ids = _resolve_cli_paper_ids(args)
+    has_filters = any(
+        value is not None
+        for value in (args.date_from, args.date_to, args.topic_id, args.field_id)
+    )
+    if paper_ids and has_filters:
+        raise ValueError("Use either paper ids or filter mode, not both.")
+    if not paper_ids and not has_filters:
+        raise ValueError(
+            "Provide paper ids or at least one of --date-from/--date-to/--topic-id/--field-id."
+        )
+    if args.date_from is not None and args.date_to is not None and args.date_from > args.date_to:
+        raise ValueError("--date-from must be before or equal to --date-to.")
+
+    engine = create_db_engine(args.database_url or _settings(args).database_url, echo=False)
+    SessionLocal = create_session_factory(engine, expire_on_commit=False)
+    try:
+        event_sink = build_event_sink(args)
+        with SessionLocal() as session:
+            pipeline = KeywordExtractionPipeline(
+                KeywordExtractionFacade(
+                    paper_repository=PaperRepository(session),
+                    embedding_adapter=create_embedding_adapter(
+                        _settings(args),
+                        base_url=args.lmstudio_url,
+                    ),
+                    embedding_model=args.embedding_model
+                    or _settings(args).infrastructure.embedding_model,
+                    event_sink=event_sink,
+                )
+            )
+            result = pipeline.run_papers(
+                PaperKeywordExtractionBatchRequestDTO(
+                    paper_ids=paper_ids,
+                    date_from=args.date_from,
+                    date_to=args.date_to,
+                    topic_id=args.topic_id,
+                    field_id=args.field_id,
+                    limit=args.limit,
+                    offset=args.offset,
+                    batch_size=args.batch_size,
+                    top_k=args.top_k,
+                    min_score=args.min_score,
+                    skip_processed=bool(args.skip_processed),
+                    skip_non_english=bool(args.skip_non_english),
+                )
+            )
+            session.commit()
+        return {"command": "extract-keywords", "result": result.model_dump(mode="json")}
+    finally:
+        engine.dispose()
+
+
+def _resolve_cli_paper_ids(args: argparse.Namespace) -> list[int]:
+    paper_ids = list(args.paper_ids)
+    if args.paper_ids_csv:
+        paper_ids.extend(
+            int(value.strip())
+            for value in args.paper_ids_csv.split(",")
+            if value.strip()
+        )
+    return list(dict.fromkeys(paper_ids))
 
 
 def resolve_cluster_ids_for_dynamics(
@@ -742,10 +767,9 @@ def resolve_cluster_ids_for_dynamics(
         return [args.cluster_id]
 
     summary_facade = SummaryFacade(
-        chat_adapter=LMStudioChatAdapter(
-            base_url=args.lmstudio_url
-            or os.getenv("LMSTUDIO_BASE_URL")
-            or "http://localhost:1234",
+        chat_adapter=create_chat_adapter(
+            _settings(args),
+            base_url=args.lmstudio_url,
         )
     )
     analytics_facade = ClusterAnalyticsFacade(
@@ -761,26 +785,6 @@ def resolve_cluster_ids_for_dynamics(
         cluster.cluster_key
         for cluster in analytics_facade.get_top_clusters(limit=args.limit_clusters)
     ]
-
-
-def resolve_cluster_ids_for_dynamics_enqueue(
-    args: argparse.Namespace,
-    redis_adapter: RedisAdapter,
-) -> list[str]:
-    """Resolve dynamics cluster ids for enqueue mode without Qdrant/LMStudio work."""
-    if args.cluster_id:
-        return [args.cluster_id]
-
-    index = redis_adapter.get_json("ml:trend_clusters:index") or {}
-    cluster_ids = [str(value) for value in index.get("cluster_ids", [])]
-    if args.limit_clusters is not None:
-        cluster_ids = cluster_ids[: args.limit_clusters]
-    if not cluster_ids:
-        raise ValueError(
-            "No cached cluster ids found in Redis. Recompute trends first or "
-            "pass --cluster-id for enqueue mode."
-        )
-    return cluster_ids
 
 
 def recompute_cluster_dynamics_batch(
@@ -857,10 +861,9 @@ def recompute_trends_parallel(
                 qdrant_adapter=build_qdrant_adapter(args),
                 redis_adapter=redis_adapter,
                 summary_facade=SummaryFacade(
-                    chat_adapter=LMStudioChatAdapter(
-                        base_url=args.lmstudio_url
-                        or os.getenv("LMSTUDIO_BASE_URL")
-                        or "http://localhost:1234",
+                    chat_adapter=create_chat_adapter(
+                        _settings(args),
+                        base_url=args.lmstudio_url,
                     )
                 ),
                 research_cluster_repository=ResearchClusterRepository(session),
@@ -1018,9 +1021,14 @@ def list_user_ids(user_repository: UserRepository, *, batch_size: int) -> list[i
 def add_common_connection_args(parser: argparse.ArgumentParser) -> None:
     """Add shared database, LMStudio, and Qdrant connection arguments."""
     parser.add_argument(
+        "--config-file",
+        default=None,
+        help="Optional TOML override file. Defaults to ML_CONFIG_FILE when set.",
+    )
+    parser.add_argument(
         "--env-file",
-        default=str(PROJECT_DIR / ".env"),
-        help="Path to .env file. Defaults to project .env.",
+        default=None,
+        help="Optional .env path. Defaults to ML_ENV_FILE or project .env.",
     )
     parser.add_argument(
         "--database-url",
@@ -1063,15 +1071,9 @@ def add_common_connection_args(parser: argparse.ArgumentParser) -> None:
 def add_runtime_args(
     parser: argparse.ArgumentParser,
     *,
-    include_enqueue: bool = True,
+    settings: Settings,
 ) -> None:
-    """Add shared execution mode, progress, and event arguments."""
-    if include_enqueue:
-        parser.add_argument(
-            "--enqueue",
-            action="store_true",
-            help="Enqueue Redis task(s) for worker instead of running heavy ML work now.",
-        )
+    """Add shared progress and event arguments for local execution."""
     parser.add_argument(
         "-v",
         "--verbose",
@@ -1095,7 +1097,7 @@ def add_runtime_args(
     parser.add_argument(
         "--event-ttl-seconds",
         type=int,
-        default=24 * 60 * 60,
+        default=settings.operations.event_ttl_seconds,
         help="TTL for Redis event status keys. Defaults to 86400.",
     )
 
@@ -1126,26 +1128,6 @@ def add_redis_connection_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def enqueue_messages(
-    args: argparse.Namespace,
-    queue_name: str,
-    messages: list[dict[str, Any]],
-    *,
-    redis_adapter: RedisAdapter | None = None,
-) -> dict[str, Any]:
-    """Enqueue prepared ML task messages and return a compact report."""
-    adapter = redis_adapter or RedisAdapter(build_redis_client(args))
-    for message in messages:
-        adapter.enqueue(queue_name, message)
-    return {
-        "command": args.command,
-        "enqueue": True,
-        "queue": queue_name,
-        "messages": len(messages),
-        "sample": messages[:3],
-    }
-
-
 def build_event_sink(
     args: argparse.Namespace,
     redis_adapter: RedisAdapter | None = None,
@@ -1170,29 +1152,19 @@ def build_event_sink(
 
 
 def build_qdrant_adapter(args: argparse.Namespace) -> QdrantAdapter:
-    """Build QdrantAdapter from CLI arguments or environment variables."""
-    qdrant_url = args.qdrant_url or os.getenv("QDRANT_URL")
-    api_key = args.qdrant_api_key or os.getenv("QDRANT_API_KEY")
-    if qdrant_url:
-        return QdrantAdapter(url=qdrant_url, api_key=api_key)
-
-    return QdrantAdapter(
-        host=args.qdrant_host or os.getenv("QDRANT_HOST") or "localhost",
-        port=args.qdrant_port or _optional_int_env("QDRANT_PORT") or 6333,
-        api_key=api_key,
+    """Build QdrantAdapter from settings and CLI overrides."""
+    return create_qdrant_adapter(
+        _settings(args),
+        url=args.qdrant_url,
+        host=args.qdrant_host,
+        port=args.qdrant_port,
+        api_key=args.qdrant_api_key,
     )
 
 
-def _optional_int_env(name: str) -> int | None:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return None
-    return int(value)
-
-
-def configure_logging(verbosity: int = 0) -> None:
+def configure_logging(verbosity: int = 0, *, settings: Settings | None = None) -> None:
     """Configure CLI logging and dependency request logs."""
-    env_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    env_level = (settings or load_settings()).infrastructure.log_level.upper()
     if verbosity <= 0:
         level = getattr(logging, env_level, logging.INFO)
     elif verbosity == 1:
@@ -1218,24 +1190,13 @@ def configure_logging(verbosity: int = 0) -> None:
 
 
 def build_redis_client(args: argparse.Namespace) -> Any:
-    """Build a redis-py client from CLI arguments or environment variables."""
-    try:
-        from redis import Redis
-    except ImportError as exc:
-        raise RuntimeError(
-            "redis package is not installed. Install dependencies from requirements.txt."
-        ) from exc
-
-    redis_url = args.redis_url or os.getenv("REDIS_URL")
-    if redis_url:
-        return Redis.from_url(redis_url)
-    return Redis(
-        host=args.redis_host or os.getenv("REDIS_HOST") or "localhost",
-        port=args.redis_port or _optional_int_env("REDIS_PORT") or 6379,
-        db=args.redis_db
-        if args.redis_db is not None
-        else _optional_int_env("REDIS_DB") or 0,
-        password=os.getenv("REDIS_PASSWORD") or None,
+    """Build a redis-py client from settings and CLI overrides."""
+    return create_redis_client(
+        _settings(args),
+        url=args.redis_url,
+        host=args.redis_host,
+        port=args.redis_port,
+        db=args.redis_db,
     )
 
 
@@ -1252,6 +1213,24 @@ def parse_iso_date(value: str) -> date:
 def print_json(payload: dict[str, Any], *, stream: Any = sys.stdout) -> None:
     """Print JSON with stable UTF-8 output."""
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str), file=stream)
+
+
+def _preload_settings(argv: list[str] | None) -> Settings:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config-file", default=None)
+    parser.add_argument("--env-file", default=None)
+    args, _unknown = parser.parse_known_args(argv)
+    return load_settings(config_file=args.config_file, env_file=args.env_file)
+
+
+def _settings(args: argparse.Namespace) -> Settings:
+    settings = getattr(args, "settings", None)
+    if isinstance(settings, Settings):
+        return settings
+    return load_settings(
+        config_file=getattr(args, "config_file", None),
+        env_file=getattr(args, "env_file", None),
+    )
 
 
 if __name__ == "__main__":

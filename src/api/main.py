@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import secrets
 from functools import lru_cache
 from typing import Iterator
@@ -11,7 +10,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from adapters.qdrant_adapter import QdrantAdapter
 from adapters.redis_adapter import RedisAdapter
-from core.config import Settings
+from core.config import Settings, get_settings
+from core.dependencies import create_qdrant_adapter, create_redis_adapter
 from core.exceptions import (
     AppError,
     DuplicateEntityError,
@@ -46,11 +46,6 @@ from ml.services.admin_coverage_tasks import AdminCoverageTaskService
 
 
 @lru_cache(maxsize=1)
-def get_settings() -> Settings:
-    return Settings.from_env()
-
-
-@lru_cache(maxsize=1)
 def get_session_factory() -> sessionmaker[Session]:
     return create_session_factory(create_engine_from_settings(get_settings()))
 
@@ -59,37 +54,14 @@ def get_session_factory() -> sessionmaker[Session]:
 def get_qdrant_adapter() -> QdrantAdapter | None:
     settings = get_settings()
     try:
-        if settings.qdrant_url:
-            return QdrantAdapter(
-                url=settings.qdrant_url, api_key=settings.qdrant_api_key
-            )
-        if settings.qdrant_host:
-            return QdrantAdapter(
-                host=settings.qdrant_host,
-                port=settings.qdrant_port or 6333,
-                api_key=settings.qdrant_api_key,
-            )
+        return create_qdrant_adapter(settings)
     except Exception:
         return None
-    return None
 
 
 @lru_cache(maxsize=1)
 def get_redis_adapter() -> RedisAdapter:
-    from redis import Redis
-
-    redis_url = os.getenv("REDIS_URL")
-    client = (
-        Redis.from_url(redis_url)
-        if redis_url
-        else Redis(
-            host=os.getenv("REDIS_HOST") or "localhost",
-            port=int(os.getenv("REDIS_PORT") or "6379"),
-            db=int(os.getenv("REDIS_DB") or "0"),
-            password=os.getenv("REDIS_PASSWORD") or None,
-        )
-    )
-    return RedisAdapter(client)
+    return create_redis_adapter(get_settings())
 
 
 @lru_cache
@@ -126,7 +98,7 @@ def _int_list(value: object) -> list[int]:
 def require_internal_token(
     token: str | None = Header(default=None, alias="X-Internal-Token"),
 ) -> None:
-    expected = os.getenv("ML_INTERNAL_API_TOKEN") or ""
+    expected = get_settings().infrastructure.internal_api_token or ""
     if not expected:
         raise HTTPException(
             status_code=503,
@@ -170,7 +142,11 @@ def health() -> dict[str, bool]:
 
 @app.get("/internal/admin/worker-status", dependencies=[Depends(require_internal_token)])
 def admin_worker_status() -> dict:
-    return AdminCoverageTaskService(None, get_redis_adapter()).worker_status()
+    return AdminCoverageTaskService(
+        None,
+        get_redis_adapter(),
+        get_settings(),
+    ).worker_status()
 
 
 @app.post("/internal/admin/coverage-tasks", dependencies=[Depends(require_internal_token)])
@@ -179,7 +155,11 @@ def enqueue_admin_coverage_tasks(
     session: Session = Depends(get_session),
 ) -> dict:
     try:
-        return AdminCoverageTaskService(session, get_redis_adapter()).enqueue_panel(
+        return AdminCoverageTaskService(
+            session,
+            get_redis_adapter(),
+            get_settings(),
+        ).enqueue_panel(
             panel_key=str(payload.get("panelKey") or ""),
             topic_ids=_int_list(payload.get("topicIds")),
             period_from=str(payload.get("periodFrom") or ""),
@@ -193,7 +173,11 @@ def enqueue_admin_coverage_tasks(
 
 @app.get("/internal/admin/coverage-tasks", dependencies=[Depends(require_internal_token)])
 def admin_coverage_tasks(session: Session = Depends(get_session)) -> dict:
-    return AdminCoverageTaskService(session, get_redis_adapter()).list_tasks()
+    return AdminCoverageTaskService(
+        session,
+        get_redis_adapter(),
+        get_settings(),
+    ).list_tasks()
 
 
 @app.post("/internal/admin/coverage-workflows", dependencies=[Depends(require_internal_token)])
@@ -202,7 +186,11 @@ def enqueue_admin_coverage_workflow(
     session: Session = Depends(get_session),
 ) -> dict:
     try:
-        return AdminCoverageTaskService(session, get_redis_adapter()).enqueue_workflow(
+        return AdminCoverageTaskService(
+            session,
+            get_redis_adapter(),
+            get_settings(),
+        ).enqueue_workflow(
             preset=str(payload.get("preset") or ""),
             topic_ids=_int_list(payload.get("topicIds")),
             period_from=str(payload.get("periodFrom") or ""),
@@ -216,7 +204,11 @@ def enqueue_admin_coverage_workflow(
 
 @app.get("/internal/admin/coverage-workflows", dependencies=[Depends(require_internal_token)])
 def admin_coverage_workflows(session: Session = Depends(get_session)) -> dict:
-    return AdminCoverageTaskService(session, get_redis_adapter()).list_workflows()
+    return AdminCoverageTaskService(
+        session,
+        get_redis_adapter(),
+        get_settings(),
+    ).list_workflows()
 
 
 @app.post(

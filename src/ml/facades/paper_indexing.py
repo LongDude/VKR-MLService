@@ -29,15 +29,13 @@ from ml.services.cluster_recompute_tasks import (
 from ml.services.events import EventSink, MLEvent, NoopEventSink
 from ml.services.qdrant_payloads import QdrantPayloadBuilder
 from ml.services.text_preparation import TextPreparationService
+from ml.task_contracts import CLUSTER_RECOMPUTE_QUEUE
 from repositories.authors import AuthorRepository
 from repositories.institutions import InstitutionRepository
 from repositories.papers import PaperRepository
 from repositories.taxonomy import TaxonomyRepository
 from dto.enums import IndexingStatus
 from utils.hashing import calculate_text_hash
-
-CLUSTER_RECOMPUTE_QUEUE = "queue:cluster_recompute"
-
 
 class PaperIndexingFacade:
     """Index local papers into the Qdrant content collection.

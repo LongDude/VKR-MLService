@@ -2,7 +2,7 @@
 
 param(
     [string]$PythonPath = "python",
-    [string]$RequirementsPath = "core/requirements.txt"
+    [string]$RequirementsPath = "requirements.txt"
 )
 
 Write-Host "Инициализация виртуального окружения..." -ForegroundColor Green
