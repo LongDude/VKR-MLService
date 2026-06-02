@@ -32,6 +32,7 @@ from core.dependencies import (
     create_redis_client,
 )
 from core.exceptions import AppError
+from core.logging import configure_logging, get_logger, log_event
 from dto.openalex import (
     OpenAlexBootstrapRequestDTO,
     OpenAlexBootstrapTopicTargetDTO,
@@ -107,6 +108,8 @@ from ml.services.openalex_topic_stats import (
     SyncRateLimiter,
 )
 from ml.services.worker_heartbeat import WorkerHeartbeat
+
+logger = get_logger(__name__)
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse worker CLI command and command-specific arguments."""
@@ -271,7 +274,8 @@ def main(argv: list[str] | None = None) -> int:
         config_file=getattr(args, "config_file", None),
         env_file=args.env_file,
     )
-    configure_logging(getattr(args, "verbose", 0), settings=_settings(args))
+    configure_logging(_settings(args), verbosity=getattr(args, "verbose", 0))
+    log_event(logger, "cli_command_started", category="worker", command=args.command)
 
     try:
         if args.command == "run":
@@ -279,12 +283,29 @@ def main(argv: list[str] | None = None) -> int:
         else:
             raise AssertionError(f"Unhandled command: {args.command}")
     except AppError as exc:
+        log_event(
+            logger,
+            "cli_command_failed",
+            level=logging.WARNING,
+            category="worker",
+            command=args.command,
+            error_code=exc.code,
+        )
         print_json(exc.to_dict(), stream=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print_json({"command": "run", "stopped": "keyboard_interrupt"})
         return 130
     except Exception as exc:
+        log_event(
+            logger,
+            "cli_command_failed",
+            level=logging.ERROR,
+            exc_info=True,
+            category="worker",
+            command=args.command,
+            error_type=exc.__class__.__name__,
+        )
         print_json(
             {
                 "error": {
@@ -297,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    log_event(logger, "cli_command_completed", category="worker", command=args.command)
     print_json(payload)
     return 0
 
@@ -399,12 +421,13 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 event_sink=event_sink,
                 admin_result_ttl_seconds=_settings(args).admin.result_ttl_seconds,
             )
-            logging.getLogger(__name__).info(
-                "Starting Redis ML worker queues=%s max_tasks=%s progress=%s verbosity=%s",
-                ",".join(queue_names),
-                args.max_tasks,
-                not args.no_progress,
-                args.verbose,
+            log_event(
+                logger,
+                "worker_started",
+                queues=queue_names,
+                max_tasks=args.max_tasks,
+                progress=not args.no_progress,
+                verbosity=args.verbose,
             )
             heartbeat = WorkerHeartbeat(
                 redis_adapter,
@@ -452,6 +475,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         if heartbeat is not None:
             heartbeat.stop()
         engine.dispose()
+        log_event(logger, "worker_stopped", processed=processed)
 
 
 def build_task_handler(
@@ -1169,33 +1193,6 @@ def build_event_sink(
     if not sinks:
         return NoopEventSink()
     return CompositeEventSink(sinks, logger=logging.getLogger("ml.worker.events"))
-
-
-def configure_logging(verbosity: int = 0, *, settings: Settings | None = None) -> None:
-    """Configure basic worker logging."""
-    env_level = (settings or load_settings()).infrastructure.log_level.upper()
-    if verbosity <= 0:
-        level = getattr(logging, env_level, logging.INFO)
-    elif verbosity == 1:
-        level = logging.INFO
-    else:
-        level = logging.DEBUG
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-    if verbosity <= 0:
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        logging.getLogger("httpcore").setLevel(logging.WARNING)
-        logging.getLogger("qdrant_client").setLevel(logging.WARNING)
-    elif verbosity == 1:
-        logging.getLogger("httpx").setLevel(logging.INFO)
-        logging.getLogger("httpcore").setLevel(logging.WARNING)
-        logging.getLogger("qdrant_client").setLevel(logging.INFO)
-    else:
-        logging.getLogger("httpx").setLevel(logging.DEBUG)
-        logging.getLogger("httpcore").setLevel(logging.DEBUG)
-        logging.getLogger("qdrant_client").setLevel(logging.DEBUG)
 
 
 def _preload_settings(argv: list[str] | None) -> Settings:

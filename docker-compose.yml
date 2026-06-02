@@ -78,6 +78,7 @@ services:
     environment:
       - PYTHONPATH=/app/src
       - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-gresP0st}@vkr-database:5432/${POSTGRES_DB:-vkr-db}
       - QDRANT_URL=http://qdrant:6333
       - QDRANT_HOST=qdrant
@@ -112,6 +113,7 @@ services:
     environment:
       - PYTHONPATH=/app/src
       - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-gresP0st}@vkr-database:5432/${POSTGRES_DB:-vkr-db}
       - REDIS_HOST=redis
       - REDIS_PORT=6379

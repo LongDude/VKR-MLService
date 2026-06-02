@@ -9,6 +9,7 @@ from typing import Any
 from adapters.qdrant_adapter import QdrantAdapter
 from adapters.redis_adapter import RedisAdapter
 from core.exceptions import AppError, EntityNotFoundError, InvalidRequestError
+from core.logging import get_logger, logged_call
 from dto.common import BatchOperationResultDTO
 from dto.qdrant import QdrantPointDTO
 from dto.trends import TrendClusterDTO, TrendMetricsDTO
@@ -35,6 +36,7 @@ TOP_KEYWORD_LIMIT = 10
 CLUSTER_CACHE_INDEX_KEY = "ml:trend_clusters:index"
 CLUSTER_CACHE_KEY_PREFIX = "ml:trend_cluster:"
 CLUSTER_CACHE_TTL_SECONDS = 24 * 60 * 60
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -89,6 +91,7 @@ class ClusterAnalyticsFacade:
         self.papers_collection = papers_collection
         self.trend_clusters_collection = trend_clusters_collection
 
+    @logged_call(logger, "cluster_analytics_recompute_all")
     def recompute_all_clusters(
         self,
         date_from: date | None = None,
@@ -178,6 +181,7 @@ class ClusterAnalyticsFacade:
         )
         return result
 
+    @logged_call(logger, "cluster_analytics_recompute_one")
     def recompute_cluster(
         self,
         cluster_id: str,

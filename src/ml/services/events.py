@@ -6,6 +6,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Protocol
 
 from adapters.redis_adapter import RedisAdapter
+from core.logging import log_event
 
 
 @dataclass(frozen=True)
@@ -74,22 +75,25 @@ class LoggingEventSink:
             progress = f" {event.current}"
 
         message = event.message or event.stage or event.event_type
-        self.logger.info(
-            "ml_event type=%s task=%s entity=%s stage=%s%s message=%s",
-            event.event_type,
-            event.task_type,
-            event.entity_id,
-            event.stage,
-            progress,
-            message,
+        log_event(
+            self.logger,
+            "ml_event",
+            type=event.event_type,
+            task=event.task_type,
+            entity=event.entity_id,
+            stage=event.stage,
+            progress=progress.strip() or None,
+            message=message,
         )
         if self.verbosity > 1 and event.payload:
-            self.logger.debug(
-                "ml_event_payload type=%s task=%s entity=%s payload=%s",
-                event.event_type,
-                event.task_type,
-                event.entity_id,
-                event.payload,
+            log_event(
+                self.logger,
+                "ml_event_payload",
+                level=logging.DEBUG,
+                type=event.event_type,
+                task=event.task_type,
+                entity=event.entity_id,
+                payload_keys=sorted(event.payload),
             )
 
     def _should_log_default(self, event: MLEvent) -> bool:

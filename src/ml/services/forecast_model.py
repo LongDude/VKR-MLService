@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import math
+import logging
 import warnings
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import numpy as np
 import pandas as pd
+
+from core.logging import get_logger, log_event, logged_call
 
 SeriesKind = Literal["count", "share"]
 TransformKind = Literal["none", "log1p", "logit"]
@@ -18,6 +21,7 @@ ModelFamily = Literal[
     "seasonal_drift",
     "linear_trend",
 ]
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -111,6 +115,7 @@ class PublicationForecastService:
     ) -> list[dict[str, Any]]:
         return self.forecast_series_with_quality(series, horizon, kind=kind)["forecast"]
 
+    @logged_call(logger, "forecast_series")
     def forecast_series_with_quality(
         self,
         series: Any,
@@ -135,7 +140,15 @@ class PublicationForecastService:
                 interval_residual_std=selected.residual_std,
                 with_interval=True,
             )
-        except Exception:
+        except Exception as exc:
+            log_event(
+                logger,
+                "forecast_model_fallback",
+                level=logging.WARNING,
+                error_type=exc.__class__.__name__,
+                kind=kind,
+                selected_model=selected.candidate.name,
+            )
             selected = self._fallback_score(clean, kind)
             forecast = self._fit_forecast(
                 train=clean,
@@ -156,6 +169,13 @@ class PublicationForecastService:
             freq="MS",
         )
 
+        log_event(
+            logger,
+            "forecast_model_selected",
+            kind=kind,
+            model=selected.candidate.name,
+            point_count=len(clean),
+        )
         return {
             "forecast": [
                 {

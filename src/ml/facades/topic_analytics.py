@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from datetime import date
+import logging
 from typing import Any
 
 import pandas as pd
@@ -9,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from adapters.qdrant_adapter import QdrantAdapter
+from core.logging import get_logger, log_event, logged_call
 from dto.topic_analytics import (
     ForecastQualityDTO,
     ForecastQualityGroupDTO,
@@ -21,6 +23,8 @@ from dto.topic_analytics import (
 )
 from ml.constants import RESEARCH_ENTITIES_COLLECTION
 from ml.services import PublicationForecastService
+
+logger = get_logger(__name__)
 
 
 class TopicAnalyticsFacade:
@@ -37,6 +41,7 @@ class TopicAnalyticsFacade:
         self.qdrant_adapter = qdrant_adapter
         self._forecast_service = forecast_service
 
+    @logged_call(logger, "topic_analytics_insights")
     def insights(
         self, request: TopicAnalyticsInsightRequestDTO
     ) -> TopicAnalyticsInsightResponseDTO:
@@ -52,6 +57,14 @@ class TopicAnalyticsFacade:
                     monthly, request.forecast_months
                 )
             except Exception as exc:
+                log_event(
+                    logger,
+                    "topic_analytics_fallback",
+                    level=logging.WARNING,
+                    component="forecast",
+                    error_type=exc.__class__.__name__,
+                    topic_id=request.topic_id,
+                )
                 errors.append(f"Forecast unavailable: {exc}")
 
         decomposition: list[TopicDecompositionMetricDTO] = []
@@ -59,6 +72,14 @@ class TopicAnalyticsFacade:
             try:
                 decomposition = self._decomposition(request)
             except Exception as exc:
+                log_event(
+                    logger,
+                    "topic_analytics_fallback",
+                    level=logging.WARNING,
+                    component="trend_decomposition",
+                    error_type=exc.__class__.__name__,
+                    topic_id=request.topic_id,
+                )
                 errors.append(f"Trend decomposition ML metrics unavailable: {exc}")
 
         related: list[RelatedTopicDTO] = []
@@ -66,6 +87,14 @@ class TopicAnalyticsFacade:
             try:
                 related = self._related_topics(request, errors)
             except Exception as exc:
+                log_event(
+                    logger,
+                    "topic_analytics_fallback",
+                    level=logging.WARNING,
+                    component="related_topics",
+                    error_type=exc.__class__.__name__,
+                    topic_id=request.topic_id,
+                )
                 errors.append(f"Related topics unavailable: {exc}")
 
         return TopicAnalyticsInsightResponseDTO(

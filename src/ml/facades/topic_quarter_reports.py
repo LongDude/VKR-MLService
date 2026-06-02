@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from adapters.lmstudio_chat_adapter import LMStudioChatAdapter
 from core.exceptions import AppError, EntityNotFoundError, LLMGenerationError
+from core.logging import get_logger, logged_call
 from dto.common import BatchOperationResultDTO, OperationResultDTO
 from dto.topic_reports import (
     TopicQuarterReportGenerateRequestDTO,
@@ -30,6 +31,7 @@ from repositories.topic_quarter_reports import TopicQuarterReportRepository
 REPRESENTATIVE_PAPER_LIMIT = 8
 TOP_CITED_PAPER_LIMIT = 5
 ABSTRACT_CHAR_LIMIT = 1400
+logger = get_logger(__name__)
 
 
 class TopicQuarterReportFacade:
@@ -62,6 +64,7 @@ class TopicQuarterReportFacade:
         self.event_sink = event_sink or NoopEventSink()
         self.chat_model = chat_model
 
+    @logged_call(logger, "topic_quarter_report_generate_one")
     def generate_one(
         self,
         request: TopicQuarterReportGenerateRequestDTO,
@@ -192,6 +195,7 @@ class TopicQuarterReportFacade:
             },
         )
 
+    @logged_call(logger, "topic_quarter_report_generate_many")
     def generate_many(
         self,
         requests: list[TopicQuarterReportGenerateRequestDTO],

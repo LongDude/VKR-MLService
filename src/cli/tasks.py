@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ from adapters import QdrantAdapter, RedisAdapter
 from core.config import Settings, load_settings
 from core.dependencies import create_qdrant_adapter, create_redis_client
 from core.exceptions import AppError
+from core.logging import configure_logging, get_logger, log_event
 from dto.keywords import PaperKeywordExtractionBatchRequestDTO
 from ml.constants import PAPERS_COLLECTION
 from ml.services.quarter_periods import QuarterPeriodService
@@ -53,6 +55,8 @@ from ml.task_contracts import (
     USER_PROFILE_RECOMPUTE_QUEUE,
     USER_PROFILE_RECOMPUTE_TASK,
 )
+
+logger = get_logger(__name__)
 from models.session import create_db_engine, create_session_factory
 from repositories import PaperRepository, TaxonomyRepository, UserRepository
 
@@ -1267,6 +1271,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_database_args(restore_parser)
     add_redis_args(restore_parser)
 
+    command_parsers = [
+        enqueue_parser,
+        keyword_parser,
+        entities_parser,
+        stats_parser,
+        bootstrap_parser,
+        cooldown_parser,
+        shutdown_parser,
+        cluster_parser,
+        dynamics_parser,
+        report_parser,
+        profiles_parser,
+        restore_parser,
+    ]
+    for command_parser in command_parsers:
+        add_logging_args(command_parser)
+
     args = parser.parse_args(argv)
     args.settings = settings
     return args
@@ -1279,6 +1300,8 @@ def main(argv: list[str] | None = None) -> int:
         config_file=getattr(args, "config_file", None),
         env_file=args.env_file,
     )
+    configure_logging(args.settings, verbosity=getattr(args, "verbose", 0))
+    log_event(logger, "cli_command_started", category="tasks", command=args.command)
 
     try:
         if args.command == "enqueue-paper-indexing":
@@ -1308,9 +1331,26 @@ def main(argv: list[str] | None = None) -> int:
         else:
             raise AssertionError(f"Unhandled command: {args.command}")
     except AppError as exc:
+        log_event(
+            logger,
+            "cli_command_failed",
+            level=logging.WARNING,
+            category="tasks",
+            command=args.command,
+            error_code=exc.code,
+        )
         print_json(exc.to_dict(), stream=sys.stderr)
         return 1
     except Exception as exc:
+        log_event(
+            logger,
+            "cli_command_failed",
+            level=logging.ERROR,
+            exc_info=True,
+            category="tasks",
+            command=args.command,
+            error_type=exc.__class__.__name__,
+        )
         print_json(
             {
                 "error": {
@@ -1323,6 +1363,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    log_event(logger, "cli_command_completed", category="tasks", command=args.command)
     print_json(payload)
     return 0
 
@@ -2148,6 +2189,17 @@ def add_database_args(parser: argparse.ArgumentParser) -> None:
         "--database-url",
         default=None,
         help="SQLAlchemy database URL. Defaults to DATABASE_URL or POSTGRES_* envs.",
+    )
+
+
+def add_logging_args(parser: argparse.ArgumentParser) -> None:
+    """Add shared process logging verbosity arguments."""
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase logging verbosity. Use -vv for DEBUG logs.",
     )
 
 

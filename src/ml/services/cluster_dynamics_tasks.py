@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import logging
 from typing import Any
 
+from core.logging import get_logger, log_event
 from ml.task_contracts import CLUSTER_DYNAMICS_RECOMPUTE_TASK
 
 CLUSTER_DYNAMICS_DEDUPE_KEY_PREFIX = "ml:dedupe:cd"
 DEFAULT_CLUSTER_DYNAMICS_DEDUPE_TTL_SECONDS = 24 * 60 * 60
+logger = get_logger(__name__)
 
 
 def cluster_dynamics_dedupe_key(
@@ -49,6 +52,13 @@ def acquire_cluster_dynamics_cluster_ids(
         )
         if redis_adapter.acquire_lock(key, ttl_seconds=ttl_seconds):
             accepted.append(normalized_id)
+    log_event(
+        logger,
+        "cluster_dynamics_dedupe_acquired",
+        level=logging.DEBUG,
+        accepted_count=len(accepted),
+        requested_count=len(cluster_ids),
+    )
     return accepted
 
 
@@ -61,7 +71,8 @@ def release_cluster_dynamics_dedupe_keys(
     if date_from is None or date_to is None:
         return
     granularity = str(message.get("granularity") or "month")
-    for cluster_id in _cluster_ids_from_message(message):
+    cluster_ids = _cluster_ids_from_message(message)
+    for cluster_id in cluster_ids:
         redis_adapter.release_lock(
             cluster_dynamics_dedupe_key(
                 cluster_id,
@@ -70,6 +81,12 @@ def release_cluster_dynamics_dedupe_keys(
                 granularity=granularity,
             )
         )
+    log_event(
+        logger,
+        "cluster_dynamics_dedupe_released",
+        level=logging.DEBUG,
+        released_count=len(cluster_ids),
+    )
 
 
 def build_cluster_dynamics_message(

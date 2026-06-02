@@ -5,6 +5,7 @@ from typing import Any
 
 from adapters.qdrant_adapter import QdrantAdapter
 from core.exceptions import InsufficientUserProfileDataError
+from core.logging import get_logger, logged_call
 from dto.qdrant import QdrantPointDTO
 from dto.recommendations import UserProfileDTO
 from ml.constants import (
@@ -26,6 +27,7 @@ TRACKED_SUBFIELD_WEIGHT = 0.15
 TRACKED_KEYWORD_WEIGHT = 0.10
 TRACKED_DOMAIN_WEIGHT = 0.05
 PROFILE_VERSION = "v1"
+logger = get_logger(__name__)
 
 
 class UserProfileFacade:
@@ -56,6 +58,7 @@ class UserProfileFacade:
         self.research_entities_collection = research_entities_collection
         self.user_profiles_collection = user_profiles_collection
 
+    @logged_call(logger, "user_profile_recompute")
     def recompute_user_profile(
         self,
         user_id: int,

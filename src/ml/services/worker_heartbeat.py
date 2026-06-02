@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from adapters.redis_adapter import RedisAdapter
+from core.logging import log_event
 
 ML_WORKER_HEARTBEAT_KEY = "ml:worker:heartbeat"
 
@@ -42,12 +43,21 @@ class WorkerHeartbeat:
             daemon=True,
         )
         self._thread.start()
+        log_event(
+            self.logger,
+            "worker_heartbeat_started",
+            interval_seconds=self.interval_seconds,
+            queue_count=len(self.queues),
+            ttl_seconds=self.ttl_seconds,
+            worker_id=self.worker_id,
+        )
 
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=self.interval_seconds + 1.0)
             self._thread = None
+        log_event(self.logger, "worker_heartbeat_stopped", worker_id=self.worker_id)
 
     def _run(self) -> None:
         while not self._stop_event.wait(self.interval_seconds):
@@ -65,8 +75,15 @@ class WorkerHeartbeat:
                 payload,
                 ttl_seconds=self.ttl_seconds,
             )
-        except Exception:
-            self.logger.exception("Failed to publish ML worker heartbeat")
+        except Exception as exc:
+            log_event(
+                self.logger,
+                "worker_heartbeat_publish_failed",
+                level=logging.ERROR,
+                exc_info=True,
+                error_type=exc.__class__.__name__,
+                worker_id=self.worker_id,
+            )
 
 
 __all__ = ["ML_WORKER_HEARTBEAT_KEY", "WorkerHeartbeat"]

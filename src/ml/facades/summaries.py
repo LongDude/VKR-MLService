@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from adapters.lmstudio_chat_adapter import LMStudioChatAdapter
 from core.exceptions import LLMGenerationError
+from core.logging import get_logger, log_event, logged_call
 from dto.trends import ClusterSummaryDTO
 from ml.constants import DEFAULT_CHAT_MODEL
 from ml.services.text_preparation import TextPreparationService
+
+logger = get_logger(__name__)
 
 
 class SummaryFacade:
@@ -24,6 +28,7 @@ class SummaryFacade:
         )
         self.chat_model = chat_model
 
+    @logged_call(logger, "summary_cluster")
     def summarize_cluster(
         self,
         cluster_name: str,
@@ -46,9 +51,16 @@ class SummaryFacade:
             )
             payload = self._parse_json_object(content)
             return self._summary_from_payload(payload)
-        except Exception:
+        except Exception as exc:
+            log_event(
+                logger,
+                "summary_cluster_fallback",
+                level=logging.WARNING,
+                error_type=exc.__class__.__name__,
+            )
             return self._fallback_summary(top_keywords)
 
+    @logged_call(logger, "summary_cluster_name")
     def name_cluster(
         self,
         representative_titles: list[str],
@@ -68,9 +80,16 @@ class SummaryFacade:
             payload = self._parse_json_object(content)
             title = self._clean_text(payload.get("title"))
             return title or fallback_title
-        except Exception:
+        except Exception as exc:
+            log_event(
+                logger,
+                "summary_cluster_name_fallback",
+                level=logging.WARNING,
+                error_type=exc.__class__.__name__,
+            )
             return fallback_title
 
+    @logged_call(logger, "summary_recommendation_explanation")
     def explain_recommendation(
         self,
         user_interests: list[str],
@@ -92,7 +111,13 @@ class SummaryFacade:
             payload = self._parse_json_object(content)
             explanation = self._clean_text(payload.get("explanation"))
             return explanation or fallback
-        except Exception:
+        except Exception as exc:
+            log_event(
+                logger,
+                "summary_recommendation_explanation_fallback",
+                level=logging.WARNING,
+                error_type=exc.__class__.__name__,
+            )
             return fallback
 
     def _summary_from_payload(self, payload: dict[str, Any]) -> ClusterSummaryDTO:

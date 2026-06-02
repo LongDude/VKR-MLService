@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import logging
 from math import ceil
 from typing import Any
 
@@ -11,6 +12,7 @@ import httpx
 from tqdm.auto import tqdm
 
 from adapters.openalex_adapter import OpenAlexAdapter
+from core.logging import get_logger, log_event, logged_call
 from dto.external import ExternalPaperDTO
 from dto.openalex import (
     OpenAlexLoadPlanDTO,
@@ -19,6 +21,8 @@ from dto.openalex import (
     OpenAlexUnitSummaryDTO,
 )
 from ml.services.openalex_rate_limiter import AsyncRateLimiter
+
+logger = get_logger(__name__)
 
 OPENALEX_WORKS_SELECT = ",".join(
     [
@@ -90,6 +94,7 @@ class OpenAlexPaperDownloader:
         self.rate_limit_defer_after_seconds = max(0.0, rate_limit_defer_after_seconds)
         self.transport = transport
 
+    @logged_call(logger, "openalex_download_plan")
     async def fetch_plan(
         self,
         plan: OpenAlexLoadPlanDTO,
@@ -112,6 +117,7 @@ class OpenAlexPaperDownloader:
             )
         return result
 
+    @logged_call(logger, "openalex_download_pages")
     async def fetch_pages(
         self,
         pages: list[OpenAlexPendingPageDTO],
@@ -180,6 +186,15 @@ class OpenAlexPaperDownloader:
                     progress_bar.close()
 
         self._merge_page_results(result, page_results)
+        if result.deferred:
+            log_event(
+                logger,
+                "openalex_download_deferred",
+                level=logging.WARNING,
+                page_count=len(pages),
+                pending_page_count=len(result.pending_pages),
+                retry_after_seconds=result.retry_after_seconds,
+            )
         return result
 
     async def _fetch_page_worker(

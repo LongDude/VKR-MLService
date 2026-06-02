@@ -18,6 +18,7 @@ from core.exceptions import (
     EntityNotFoundError,
     InvalidRequestError,
 )
+from core.logging import get_logger, logged_call
 from dto.common import BatchOperationResultDTO
 from dto.keywords import (
     KeywordExtractionBatchRequestDTO,
@@ -48,7 +49,7 @@ except Exception:
     _pke_uns = None
     _pke_lang = None
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 DEFAULT_MODEL_NAME = "catboost_lambdamart"
 DEFAULT_TOP_K = 10
@@ -237,6 +238,7 @@ class KeywordExtractionFacade:
             items=items,
         )
 
+    @logged_call(logger, "keyword_extraction_batch")
     def extract_batch(
         self,
         request: KeywordExtractionBatchRequestDTO,
@@ -269,6 +271,7 @@ class KeywordExtractionFacade:
             )
         return responses
 
+    @logged_call(logger, "keyword_extraction_papers")
     def extract_papers(
         self,
         request: PaperKeywordExtractionBatchRequestDTO,

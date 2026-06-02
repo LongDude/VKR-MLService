@@ -7,6 +7,7 @@ from typing import Any, Iterable, Sequence
 
 from adapters.redis_adapter import RedisAdapter
 from core.exceptions import AppError
+from core.logging import log_event
 from ml.services.cluster_dynamics_tasks import release_cluster_dynamics_dedupe_keys
 from ml.services.cluster_recompute_tasks import (
     build_cluster_recompute_message,
@@ -150,6 +151,13 @@ class RedisMLWorker:
             max_messages=max_messages,
         )
         self.last_processed_message_count = len(messages)
+        log_event(
+            self.logger,
+            "worker_batch_dequeued",
+            level=logging.DEBUG,
+            message_count=len(messages),
+            queue=queue_name,
+        )
         for task_message in self._coalesce_messages(queue_name, messages):
             for executable_message in self._split_oversized_message(
                 queue_name,
@@ -246,9 +254,10 @@ class RedisMLWorker:
         if payload is None:
             return False
         self._stop_requested = True
-        self.logger.info(
-            "Worker soft shutdown requested",
-            extra={"shutdown_key": ML_WORKER_SHUTDOWN_KEY, "shutdown_payload": payload},
+        log_event(
+            self.logger,
+            "worker_soft_shutdown_requested",
+            shutdown_key=ML_WORKER_SHUTDOWN_KEY,
         )
         self._emit_worker_event(
             "worker_soft_shutdown_requested",
@@ -439,13 +448,13 @@ class RedisMLWorker:
         message: dict[str, Any],
     ) -> None:
         task_summary = self._task_summary(queue_name, message)
-        self.logger.info(
-            "Starting ML task queue=%s task_type=%s item_count=%s item_field=%s",
-            task_summary["queue_name"],
-            task_summary["task_type"],
-            task_summary["item_count"],
-            task_summary["item_field"],
-            extra=task_summary,
+        log_event(
+            self.logger,
+            "worker_task_started",
+            queue=task_summary["queue_name"],
+            task_type=task_summary["task_type"],
+            item_count=task_summary["item_count"],
+            item_field=task_summary["item_field"],
         )
         started_at = time.monotonic()
         self._current_queue_name = queue_name
@@ -500,18 +509,13 @@ class RedisMLWorker:
                     "result": result_summary,
                 },
             )
-            self.logger.info(
-                "ML task completed queue=%s task_type=%s item_count=%s elapsed_seconds=%s result=%s",
-                task_summary["queue_name"],
-                task_summary["task_type"],
-                task_summary["item_count"],
-                elapsed_seconds,
-                result_summary,
-                extra={
-                    **task_summary,
-                    "elapsed_seconds": elapsed_seconds,
-                    "task_result": result_summary,
-                },
+            log_event(
+                self.logger,
+                "worker_task_completed",
+                queue=task_summary["queue_name"],
+                task_type=task_summary["task_type"],
+                item_count=task_summary["item_count"],
+                elapsed_seconds=elapsed_seconds,
             )
         finally:
             if queue_name == CLUSTER_RECOMPUTE_QUEUE:
@@ -966,14 +970,14 @@ class RedisMLWorker:
         exc: Exception,
     ) -> None:
         error_payload = self._error_payload(exc)
-        self.logger.exception(
-            "ML task failed error=%s",
-            error_payload,
-            extra={
-                "queue_name": queue_name,
-                "task_type": message.get("task_type"),
-                "task_error": error_payload,
-            },
+        log_event(
+            self.logger,
+            "worker_task_failed",
+            level=logging.ERROR,
+            exc_info=True,
+            error_code=error_payload.get("code"),
+            queue=queue_name,
+            task_type=message.get("task_type"),
         )
         try:
             self.redis_adapter.enqueue(

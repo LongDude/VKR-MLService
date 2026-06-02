@@ -13,6 +13,7 @@ from core.exceptions import (
     EntityNotFoundError,
     InvalidRequestError,
 )
+from core.logging import get_logger, logged_call
 from dto.common import BatchOperationResultDTO
 from dto.papers import (
     PaperBatchIndexingRequestDTO,
@@ -36,6 +37,8 @@ from repositories.papers import PaperRepository
 from repositories.taxonomy import TaxonomyRepository
 from dto.enums import IndexingStatus
 from utils.hashing import calculate_text_hash
+
+logger = get_logger(__name__)
 
 class PaperIndexingFacade:
     """Index local papers into the Qdrant content collection.
@@ -77,6 +80,7 @@ class PaperIndexingFacade:
         self.collection_name = collection_name
         self.embedding_model = embedding_model
 
+    @logged_call(logger, "paper_indexing_one")
     def index_paper(
         self,
         request: PaperIndexingRequestDTO,
@@ -245,6 +249,7 @@ class PaperIndexingFacade:
             message="Paper indexed successfully",
         )
 
+    @logged_call(logger, "paper_indexing_batch")
     def index_batch(
         self,
         request: PaperBatchIndexingRequestDTO,
@@ -276,6 +281,7 @@ class PaperIndexingFacade:
             )
         return self._index_period_request(request)
 
+    @logged_call(logger, "paper_indexing_period")
     def index_period(
         self,
         date_from: date | None,

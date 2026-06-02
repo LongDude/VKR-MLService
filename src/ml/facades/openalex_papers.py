@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from adapters.redis_adapter import RedisAdapter
+from core.logging import get_logger, logged_call, log_event
 from dto.external import ExternalPaperDTO
 from dto.openalex import (
     OpenAlexBootstrapReportDTO,
@@ -23,6 +24,7 @@ from ml.services.openalex_paper_plan import OpenAlexPaperPlanService
 from repositories.papers import PaperRepository
 
 PAPER_INDEXING_QUEUE = "queue:paper_indexing"
+logger = get_logger(__name__)
 
 
 class OpenAlexPapersFacade:
@@ -51,6 +53,7 @@ class OpenAlexPapersFacade:
         self.cooldown_source_queue = cooldown_source_queue
         self.logger = logger or logging.getLogger(__name__)
 
+    @logged_call(logger, "openalex_papers_bootstrap")
     async def bootstrap(
         self,
         request: OpenAlexBootstrapRequestDTO,
@@ -81,11 +84,12 @@ class OpenAlexPapersFacade:
             report.elapsed_seconds = time.monotonic() - started_at
             return report
 
-        self.logger.info(
-            "OpenAlex paper loading: quota_units=%s plan_items=%s sample=%s",
-            len(plan.units),
-            len(plan.items),
-            plan.total_sample_count,
+        log_event(
+            self.logger,
+            "openalex_papers_plan_ready",
+            quota_units=len(plan.units),
+            plan_items=len(plan.items),
+            sample_count=plan.total_sample_count,
         )
         download = await self.downloader.fetch_plan(
             plan,
@@ -128,6 +132,7 @@ class OpenAlexPapersFacade:
         report.elapsed_seconds = time.monotonic() - started_at
         return report
 
+    @logged_call(logger, "openalex_papers_resume")
     async def resume(
         self,
         pages: list[OpenAlexPendingPageDTO],

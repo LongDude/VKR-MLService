@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 from adapters.qdrant_adapter import QdrantAdapter
 from adapters.redis_adapter import RedisAdapter
 from core.exceptions import InsufficientUserProfileDataError
+from core.logging import get_logger, log_event, logged_call
 from dto.papers import PaperShortDTO
 from dto.qdrant import QdrantSearchHitDTO
 from dto.recommendations import (
@@ -27,6 +29,7 @@ from utils.hashing import calculate_text_hash
 
 RECOMMENDATION_CACHE_TTL_SECONDS = 300
 FALLBACK_TRENDING_WINDOW_DAYS = 365 * 3
+logger = get_logger(__name__)
 
 
 class RecommendationFacade:
@@ -57,6 +60,7 @@ class RecommendationFacade:
         self.trend_clusters_collection = trend_clusters_collection
         self.cache_ttl_seconds = cache_ttl_seconds
 
+    @logged_call(logger, "recommendation_for_user")
     def recommend_for_user(
         self,
         request: RecommendationRequestDTO,
@@ -82,6 +86,13 @@ class RecommendationFacade:
                 recompute_if_missing=True,
             )
         except InsufficientUserProfileDataError as exc:
+            log_event(
+                logger,
+                "recommendation_fallback",
+                level=logging.WARNING,
+                reason="profile_unavailable",
+                user_id=request.user_id,
+            )
             response = self._fallback_trending_response(
                 request,
                 tag_topic_sets=tag_topic_sets,
@@ -101,6 +112,14 @@ class RecommendationFacade:
                 ),
             )
         except Exception as exc:
+            log_event(
+                logger,
+                "recommendation_fallback",
+                level=logging.WARNING,
+                reason="qdrant_search_failed",
+                error_type=exc.__class__.__name__,
+                user_id=request.user_id,
+            )
             response = self._fallback_trending_response(
                 request,
                 tag_topic_sets=tag_topic_sets,

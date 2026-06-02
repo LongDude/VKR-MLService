@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from adapters.qdrant_adapter import QdrantAdapter
 from core.exceptions import InvalidRequestError
+from core.logging import get_logger, log_event
 from dto.qdrant import QdrantPayloadIndexDTO
 from ml.constants import (
     PAPERS_COLLECTION,
@@ -10,6 +11,8 @@ from ml.constants import (
     TREND_CLUSTERS_COLLECTION,
     USER_PROFILES_COLLECTION,
 )
+
+logger = get_logger(__name__)
 
 
 class QdrantCollectionInitializer:
@@ -126,6 +129,13 @@ class QdrantCollectionInitializer:
                 "vector_size must be positive",
                 details={"vector_size": vector_size},
             )
+        log_event(
+            logger,
+            "qdrant_collection_initialization_started",
+            collection=collection_name,
+            index_count=len(indexes),
+            vector_size=vector_size,
+        )
         self.qdrant_adapter.ensure_collection(
             collection_name,
             vector_size=vector_size,
@@ -137,6 +147,13 @@ class QdrantCollectionInitializer:
                 self._payload_index(field_name, field_schema)
                 for field_name, field_schema in indexes
             ],
+        )
+        log_event(
+            logger,
+            "qdrant_collection_initialization_completed",
+            collection=collection_name,
+            index_count=len(indexes),
+            vector_size=vector_size,
         )
 
     def _payload_index(

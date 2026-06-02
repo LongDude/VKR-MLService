@@ -3,9 +3,11 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, is_dataclass
 from datetime import date
+import logging
 from typing import Any, Callable, Literal, cast
 
 from core.exceptions import AppError, InvalidRequestError
+from core.logging import get_logger, log_event
 from dto.common import BatchOperationResultDTO, OperationResultDTO
 from dto.keywords import PaperKeywordExtractionBatchRequestDTO
 from dto.topic_reports import TopicQuarterReportGenerateRequestDTO
@@ -44,6 +46,7 @@ from ml.services.openalex_topic_stats import (
 )
 
 Granularity = Literal["week", "month"]
+logger = get_logger(__name__)
 
 
 class MLTaskHandler:
@@ -89,6 +92,12 @@ class MLTaskHandler:
         self.cluster_recompute_pipeline_factory = cluster_recompute_pipeline_factory
 
     def handle(self, message: dict[str, Any]) -> OperationResultDTO:
+        log_event(
+            logger,
+            "worker_handler_started",
+            level=logging.DEBUG,
+            task_type=message.get("task_type") if isinstance(message, dict) else None,
+        )
         try:
             result = self._handle(message)
         except Exception:
@@ -97,6 +106,12 @@ class MLTaskHandler:
             raise
         if self.session is not None:
             self.session.commit()
+        log_event(
+            logger,
+            "worker_handler_completed",
+            level=logging.DEBUG,
+            task_type=message.get("task_type") if isinstance(message, dict) else None,
+        )
         return result
 
     def _handle(self, message: Any) -> OperationResultDTO:

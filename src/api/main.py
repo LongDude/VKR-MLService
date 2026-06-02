@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import secrets
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Iterator
 
@@ -21,6 +23,7 @@ from core.exceptions import (
     InsufficientUserProfileDataError,
     InvalidRequestError,
 )
+from core.logging import configure_logging, get_logger, log_event, logged_operation
 from dto.recommendations import (
     RecommendationRequestDTO,
     RecommendationResponseDTO,
@@ -44,24 +47,48 @@ from repositories.tracked_areas import TrackedAreaRepository
 from ml.services.forecast_model import PublicationForecastService
 from ml.services.admin_coverage_tasks import AdminCoverageTaskService
 
+logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    settings = get_settings()
+    configure_logging(settings)
+    log_event(logger, "api_started")
+    try:
+        yield
+    finally:
+        log_event(logger, "api_stopped")
+
 
 @lru_cache(maxsize=1)
 def get_session_factory() -> sessionmaker[Session]:
-    return create_session_factory(create_engine_from_settings(get_settings()))
+    with logged_operation(logger, "database_session_factory_initialization"):
+        return create_session_factory(create_engine_from_settings(get_settings()))
 
 
 @lru_cache(maxsize=1)
 def get_qdrant_adapter() -> QdrantAdapter | None:
     settings = get_settings()
     try:
-        return create_qdrant_adapter(settings)
-    except Exception:
+        log_event(logger, "qdrant_adapter_initialization_started")
+        adapter = create_qdrant_adapter(settings)
+        log_event(logger, "qdrant_adapter_initialization_completed")
+        return adapter
+    except Exception as exc:
+        log_event(
+            logger,
+            "qdrant_adapter_unavailable",
+            level=logging.WARNING,
+            error_type=exc.__class__.__name__,
+        )
         return None
 
 
 @lru_cache(maxsize=1)
 def get_redis_adapter() -> RedisAdapter:
-    return create_redis_adapter(get_settings())
+    with logged_operation(logger, "redis_adapter_initialization"):
+        return create_redis_adapter(get_settings())
 
 
 @lru_cache
@@ -108,7 +135,7 @@ def require_internal_token(
         raise HTTPException(status_code=403, detail="Invalid ML internal API token.")
 
 
-app = FastAPI(title="VKR MLService", version="1.0.0")
+app = FastAPI(title="VKR MLService", version="1.0.0", lifespan=lifespan)
 
 
 def app_error_status_code(error: AppError) -> int:
@@ -129,8 +156,16 @@ def app_error_status_code(error: AppError) -> int:
 
 @app.exception_handler(AppError)
 async def handle_app_error(_request: Request, error: AppError) -> JSONResponse:
+    status_code = app_error_status_code(error)
+    log_event(
+        logger,
+        "api_app_error",
+        level=logging.WARNING,
+        error_code=error.code,
+        status_code=status_code,
+    )
     return JSONResponse(
-        status_code=app_error_status_code(error),
+        status_code=status_code,
         content=error.to_dict(),
     )
 

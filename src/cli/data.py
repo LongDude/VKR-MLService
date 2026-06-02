@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from calendar import monthrange
 from collections import defaultdict
@@ -23,6 +24,7 @@ from adapters import QdrantAdapter
 from adapters.redis_adapter import RedisAdapter
 from core.config import Settings, load_settings
 from core.dependencies import create_qdrant_adapter, create_redis_client
+from core.logging import configure_logging, get_logger, log_event
 from ml.facades.cluster_db_sync import ClusterDbSyncFacade
 from ml.services.events import NoopEventSink
 from ml.services.qdrant_collections import QdrantCollectionInitializer
@@ -39,6 +41,8 @@ from ml.task_contracts import (
     OPENALEX_BOOTSTRAP_PAPERS_QUEUE,
     OPENALEX_TOPIC_STATS_QUEUE,
 )
+
+logger = get_logger(__name__)
 from models import (
     Domain,
     Field,
@@ -1450,6 +1454,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         init_parser,
     ]
     for command_parser in command_parsers:
+        add_logging_args(command_parser)
         command_parser.add_argument(
             "--config-file",
             default=None,
@@ -1474,6 +1479,8 @@ def main(argv: list[str] | None = None) -> int:
         config_file=getattr(args, "config_file", None),
         env_file=args.env_file,
     )
+    configure_logging(args.settings, verbosity=getattr(args, "verbose", 0))
+    log_event(logger, "cli_command_started", category="data", command=args.command)
 
     try:
         if args.command == "validate-local-data":
@@ -1495,6 +1502,15 @@ def main(argv: list[str] | None = None) -> int:
         if getattr(args, "report_json", None):
             write_report(Path(args.report_json), report)
     except Exception as exc:
+        log_event(
+            logger,
+            "cli_command_failed",
+            level=logging.ERROR,
+            exc_info=True,
+            category="data",
+            command=args.command,
+            error_type=exc.__class__.__name__,
+        )
         print_json(
             {
                 "error": {
@@ -1507,6 +1523,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    log_event(logger, "cli_command_completed", category="data", command=args.command)
     print_json(report)
     return 0
 
@@ -2362,6 +2379,17 @@ def add_redis_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="Redis database number. Defaults to REDIS_DB or 0.",
+    )
+
+
+def add_logging_args(parser: argparse.ArgumentParser) -> None:
+    """Add shared process logging verbosity arguments."""
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase logging verbosity. Use -vv for DEBUG logs.",
     )
 
 

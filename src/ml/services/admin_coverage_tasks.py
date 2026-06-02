@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+import logging
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from adapters.redis_adapter import RedisAdapter
 from core.config import Settings, get_settings
+from core.logging import get_logger, log_event, logged_call
 from repositories.taxonomy import TaxonomyRepository
 from ml.services.worker_heartbeat import ML_WORKER_HEARTBEAT_KEY
 from ml.task_contracts import (
@@ -41,6 +43,7 @@ RECENT_TTL_SECONDS = 24 * 60 * 60
 EXHAUSTED_UNIT_KEY_PREFIX = "admin:data_coverage:exhausted"
 STALE_AFTER = timedelta(hours=24)
 MAX_TRACKED_ITEMS = 5000
+logger = get_logger(__name__)
 
 PANEL_KEYS = {
     "monthly-stats",
@@ -84,6 +87,12 @@ class AdminCoverageTaskService:
             heartbeat = self.redis.get_json(ML_WORKER_HEARTBEAT_KEY)
             heartbeat_ttl = self.redis.ttl(ML_WORKER_HEARTBEAT_KEY)
         except Exception as exc:
+            log_event(
+                logger,
+                "admin_worker_status_unavailable",
+                level=logging.WARNING,
+                error_type=exc.__class__.__name__,
+            )
             return {
                 "redisAvailable": False,
                 "workerAvailable": False,
@@ -93,6 +102,14 @@ class AdminCoverageTaskService:
             }
 
         worker_available = bool(redis_available and heartbeat and heartbeat_ttl > 0)
+        if not worker_available:
+            log_event(
+                logger,
+                "admin_worker_heartbeat_missing",
+                level=logging.DEBUG,
+                heartbeat_ttl=heartbeat_ttl,
+                redis_available=bool(redis_available),
+            )
         return {
             "redisAvailable": bool(redis_available),
             "workerAvailable": worker_available,
@@ -105,6 +122,7 @@ class AdminCoverageTaskService:
             ),
         }
 
+    @logged_call(logger, "admin_coverage_panel_enqueue")
     def enqueue_panel(
         self,
         *,
@@ -139,6 +157,14 @@ class AdminCoverageTaskService:
                 continue
             tasks.append(queued)
 
+        log_event(
+            logger,
+            "admin_coverage_panel_queued",
+            enqueued_count=len(tasks),
+            panel=panel_key,
+            skipped_period_count=skipped_periods,
+            topic_count=len(topics),
+        )
         return {
             "panelKey": panel_key,
             "tasks": tasks,
@@ -146,6 +172,7 @@ class AdminCoverageTaskService:
             "skippedPeriods": skipped_periods,
         }
 
+    @logged_call(logger, "admin_coverage_workflow_enqueue")
     def enqueue_workflow(
         self,
         *,
@@ -181,6 +208,13 @@ class AdminCoverageTaskService:
         self._save_workflow(record)
         self.redis.enqueue(ACTIVE_WORKFLOWS_QUEUE, {"workflow_id": workflow_id})
         self._advance_workflow(record)
+        log_event(
+            logger,
+            "admin_coverage_workflow_queued",
+            preset=preset,
+            topic_count=len(topics),
+            workflow_id=workflow_id,
+        )
         return record
 
     def list_tasks(self) -> dict[str, Any]:

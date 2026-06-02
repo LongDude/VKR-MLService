@@ -14,6 +14,7 @@ from core.exceptions import (
     EntityNotFoundError,
     InvalidRequestError,
 )
+from core.logging import get_logger, logged_call
 from dto.common import BatchOperationResultDTO, OperationResultDTO
 from dto.qdrant import QdrantPointDTO
 from ml.constants import DEFAULT_EMBEDDING_MODEL, RESEARCH_ENTITIES_COLLECTION
@@ -25,6 +26,7 @@ from repositories.taxonomy import TaxonomyRepository
 
 DEFAULT_RECENT_WINDOW_DAYS = 365
 DEFAULT_EMBEDDING_VERSION = "v1"
+logger = get_logger(__name__)
 
 
 class ResearchEntityType(StrEnum):
@@ -82,6 +84,7 @@ class ResearchEntityIndexingFacade:
         self.recent_window_days = recent_window_days
         self.event_sink = event_sink or NoopEventSink()
 
+    @logged_call(logger, "research_entity_indexing")
     def index_all_entities(
         self,
         force_reindex: bool = False,

@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from adapters.qdrant_adapter import QdrantAdapter
 from core.exceptions import AppError, InvalidRequestError
+from core.logging import get_logger, logged_call
 from dto.common import OperationResultDTO
 from dto.qdrant import QdrantPointDTO
 from ml.constants import TREND_CLUSTER_PERIODS_COLLECTION, TREND_CLUSTERS_COLLECTION
@@ -12,6 +13,7 @@ from ml.services.events import EventSink, MLEvent, NoopEventSink
 from repositories.research_clusters import ResearchClusterRepository
 
 SyncScope = Literal["all", "clusters", "periods"]
+logger = get_logger(__name__)
 
 
 class ClusterDbSyncFacade:
@@ -32,6 +34,7 @@ class ClusterDbSyncFacade:
         self.clusters_collection = clusters_collection
         self.periods_collection = periods_collection
 
+    @logged_call(logger, "cluster_db_sync_all")
     def sync_all(
         self,
         *,
@@ -76,6 +79,7 @@ class ClusterDbSyncFacade:
             },
         )
 
+    @logged_call(logger, "cluster_db_sync_clusters")
     def sync_clusters_from_qdrant(
         self,
         *,
@@ -143,6 +147,7 @@ class ClusterDbSyncFacade:
         counters["pruned_clusters"] = pruned
         return self._sync_result("clusters", counters, cluster_id=cluster_id)
 
+    @logged_call(logger, "cluster_db_sync_periods")
     def sync_periods_from_qdrant(
         self,
         *,

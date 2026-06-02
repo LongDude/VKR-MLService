@@ -3,11 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 from adapters.redis_adapter import RedisAdapter
+from core.logging import get_logger, logged_call
 from dto.keywords import PaperKeywordExtractionBatchRequestDTO
 from ml.task_contracts import KEYWORD_EXTRACTION_QUEUE, KEYWORD_EXTRACTION_TASK
 from repositories.papers import PaperRepository
 
 DEFAULT_ENQUEUE_PAGE_SIZE = 1000
+logger = get_logger(__name__)
 
 
 class KeywordExtractionTaskEnqueuer:
@@ -24,6 +26,7 @@ class KeywordExtractionTaskEnqueuer:
         self.redis_adapter = redis_adapter
         self.queue_name = queue_name
 
+    @logged_call(logger, "keyword_extraction_task_enqueue")
     def enqueue(
         self,
         request: PaperKeywordExtractionBatchRequestDTO,

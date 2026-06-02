@@ -34,6 +34,7 @@ def test_settings_precedence_and_external_toml(tmp_path, monkeypatch) -> None:
 [infrastructure]
 database_url = "sqlite:///from-toml.db"
 redis_port = 6381
+log_level = "WARNING"
 
 [worker]
 idle_sleep_seconds = 4.0
@@ -42,7 +43,7 @@ idle_sleep_seconds = 4.0
     )
     env_file = tmp_path / "test.env"
     env_file.write_text(
-        "REDIS_PORT=6382\nML_WORKER_IDLE_SLEEP_SECONDS=5.0\n",
+        "REDIS_PORT=6382\nLOG_LEVEL=ERROR\nML_WORKER_IDLE_SLEEP_SECONDS=5.0\n",
         encoding="utf-8",
     )
     original_idle = os.environ.get("ML_WORKER_IDLE_SLEEP_SECONDS")
@@ -56,11 +57,13 @@ idle_sleep_seconds = 4.0
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("REDIS_PORT", "6383")
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     monkeypatch.delenv("ML_WORKER_IDLE_SLEEP_SECONDS", raising=False)
     try:
         settings = load_settings(config_file=config_file, env_file=env_file)
         assert settings.database_url == "sqlite:///from-toml.db"
         assert settings.infrastructure.redis_port == 6383
+        assert settings.infrastructure.log_level == "DEBUG"
         assert settings.worker.idle_sleep_seconds == 5.0
     finally:
         if original_idle is None:

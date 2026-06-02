@@ -8,6 +8,7 @@ from typing import Any
 
 from adapters.qdrant_adapter import QdrantAdapter
 from core.exceptions import EntityNotFoundError, InvalidRequestError
+from core.logging import get_logger, logged_call
 from dto.charts import ChartAxisDTO, ChartDTO, ChartPointDTO, ChartSeriesDTO
 from dto.common import BatchOperationResultDTO
 from dto.qdrant import QdrantPointDTO
@@ -25,6 +26,7 @@ from dto.enums import WorkflowGranularity
 
 REPRESENTATIVE_PAPER_LIMIT = 5
 TOP_KEYWORD_LIMIT = 10
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,7 @@ class ClusterDynamicsFacade:
         self.papers_collection = papers_collection
         self.period_collection = period_collection
 
+    @logged_call(logger, "cluster_dynamics_recompute")
     def recompute_cluster_periods(
         self,
         cluster_id: str,

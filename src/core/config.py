@@ -9,6 +9,7 @@ from typing import Any, Mapping
 import tomllib
 from dotenv import load_dotenv
 
+from core.exceptions import ConfigurationError
 from ml.constants import DEFAULT_EMBEDDING_MODEL
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -138,6 +139,7 @@ class Settings:
         _validate_port(infrastructure.redis_port, "infrastructure.redis_port")
         _validate_port(infrastructure.qdrant_port, "infrastructure.qdrant_port")
         _require_non_negative(infrastructure.redis_db, "infrastructure.redis_db")
+        _validate_log_level(infrastructure.log_level)
 
         openalex = self.openalex
         _require_text(openalex.base_url, "openalex.base_url")
@@ -474,6 +476,16 @@ def _require_non_empty_sequence(value: Any, name: str) -> None:
 def _validate_port(value: Any, name: str) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65535:
         raise ValueError(f"{name} must be between 1 and 65535")
+
+
+def _validate_log_level(value: Any) -> None:
+    allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+    if not isinstance(value, str) or value.strip().upper() not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ConfigurationError(
+            f"infrastructure.log_level must be one of: {choices}",
+            details={"log_level": value},
+        )
 
 
 __all__ = [

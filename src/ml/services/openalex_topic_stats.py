@@ -21,6 +21,7 @@ from core.exceptions import (
     ExternalServiceRateLimitError,
     ExternalServiceUnavailableError,
 )
+from core.logging import get_logger, logged_call
 from dto.external import OpenAlexSearchFiltersDTO
 from ml.services.openalex_rate_limiter import SyncRateLimiter
 from models import Topic
@@ -34,7 +35,7 @@ from repositories.openalex_yearly_topic_stats import (
 )
 from repositories.taxonomy import TaxonomyRepository
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class TaxonomyStatsScope(StrEnum):
@@ -138,6 +139,7 @@ class OpenAlexTopicStatsCollector:
         self._adapters: list[OpenAlexAdapter] = []
         self._adapters_lock = threading.Lock()
 
+    @logged_call(logger, "openalex_topic_stats_collect")
     def collect_and_store(
         self,
         *,

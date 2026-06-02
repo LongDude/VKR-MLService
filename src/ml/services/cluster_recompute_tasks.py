@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import logging
 from typing import Any
 
+from core.logging import get_logger, log_event
 from ml.task_contracts import RECOMPUTE_TOPIC_CLUSTERS_TASK
 
 CLUSTER_RECOMPUTE_DEDUPE_KEY_PREFIX = "ml:dedupe:cr"
@@ -13,6 +15,7 @@ CLUSTER_RECOMPUTE_WORKFLOW_FIELDS = (
     "workflow_granularity",
     "enqueue_cluster_dynamics",
 )
+logger = get_logger(__name__)
 
 
 def cluster_recompute_dedupe_key(
@@ -58,6 +61,13 @@ def acquire_cluster_recompute_topic_ids(
         )
         if redis_adapter.acquire_lock(key, ttl_seconds=ttl_seconds):
             accepted.append(normalized_id)
+    log_event(
+        logger,
+        "cluster_recompute_dedupe_acquired",
+        level=logging.DEBUG,
+        accepted_count=len(accepted),
+        requested_count=len(topic_ids),
+    )
     return accepted
 
 
@@ -67,7 +77,8 @@ def release_cluster_recompute_dedupe_keys(
 ) -> None:
     force_summary = bool(message.get("force_summary", False))
     options = _dedupe_workflow_options(message)
-    for topic_id in _topic_ids_from_message(message):
+    topic_ids = _topic_ids_from_message(message)
+    for topic_id in topic_ids:
         redis_adapter.release_lock(
             cluster_recompute_dedupe_key(
                 topic_id,
@@ -75,6 +86,12 @@ def release_cluster_recompute_dedupe_keys(
                 **options,
             )
         )
+    log_event(
+        logger,
+        "cluster_recompute_dedupe_released",
+        level=logging.DEBUG,
+        released_count=len(topic_ids),
+    )
 
 
 def build_cluster_recompute_message(

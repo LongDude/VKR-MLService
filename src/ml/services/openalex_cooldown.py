@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 from math import ceil
 from typing import Any
 
 from adapters.redis_adapter import RedisAdapter
+from core.logging import get_logger, log_event
 
 OPENALEX_COOLDOWN_KEY = "ml:cooldown:openalex"
 OPENALEX_COOLDOWN_FALLBACK_SECONDS = 900
 OPENALEX_TOPIC_STATS_PENDING_QUEUE = "queue:openalex_topic_stats_pending"
 OPENALEX_BOOTSTRAP_PAPERS_PENDING_QUEUE = "queue:openalex_bootstrap_papers_pending"
+logger = get_logger(__name__)
 
 
 def resolve_openalex_cooldown_seconds(value: float | int | None) -> int:
@@ -57,6 +60,15 @@ def set_openalex_cooldown(
         OPENALEX_COOLDOWN_KEY,
         payload,
         ttl_seconds=ttl_seconds,
+    )
+    log_event(
+        logger,
+        "openalex_cooldown_set",
+        level=logging.WARNING,
+        reason=reason,
+        retry_after_seconds=ttl_seconds,
+        source_queue=source_queue,
+        task_type=task_type,
     )
     return payload
 

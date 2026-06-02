@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Any, TypeVar
 
 from core.exceptions import AppError, InvalidRequestError
+from core.logging import get_logger, logged_call
 from dto.common import BatchOperationResultDTO, OperationResultDTO
 from dto.external import (
     ExternalAuthorDTO,
@@ -22,6 +23,7 @@ from repositories.taxonomy import TaxonomyRepository
 
 T = TypeVar("T")
 R = TypeVar("R")
+logger = get_logger(__name__)
 
 
 class PaperUploaderFacade:
@@ -85,6 +87,7 @@ class PaperUploaderFacade:
             details=result.model_dump(mode="json"),
         )
 
+    @logged_call(logger, "paper_upload_import_batch")
     def import_batch(self, papers: list[ExternalPaperDTO]) -> BatchOperationResultDTO:
         """Import external papers in dependency-aware batches.
 

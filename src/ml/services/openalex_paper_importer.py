@@ -9,6 +9,7 @@ from tqdm.auto import tqdm
 
 from dto.external import ExternalPaperDTO
 from dto.openalex import BatchImportResultDTO
+from core.logging import get_logger, logged_call
 from ml.facades.papers_uploading import PaperUploaderFacade
 from repositories import (
     AuthorRepository,
@@ -17,6 +18,8 @@ from repositories import (
     PaperRepository,
     TaxonomyRepository,
 )
+
+logger = get_logger(__name__)
 
 
 class OpenAlexPaperImporter:
@@ -33,6 +36,7 @@ class OpenAlexPaperImporter:
         self.batch_size = max(1, min(500, batch_size))
         self.source_name = source_name
 
+    @logged_call(logger, "openalex_import_papers")
     async def import_papers(
         self,
         papers: list[ExternalPaperDTO],
