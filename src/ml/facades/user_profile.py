@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 from adapters.qdrant_adapter import QdrantAdapter
 from core.exceptions import InsufficientUserProfileDataError
-from core.logging import get_logger, logged_call
+from core.logging import get_logger, log_event
 from dto.qdrant import QdrantPointDTO
 from dto.recommendations import UserProfileDTO
 from ml.constants import (
@@ -58,12 +60,48 @@ class UserProfileFacade:
         self.research_entities_collection = research_entities_collection
         self.user_profiles_collection = user_profiles_collection
 
-    @logged_call(logger, "user_profile_recompute")
     def recompute_user_profile(
         self,
         user_id: int,
     ) -> UserProfileDTO:
         """Recompute a user profile vector and upsert it into Qdrant."""
+        started_at = time.monotonic()
+        log_event(logger, "user_profile_recompute_started", user_id=user_id)
+        try:
+            profile = self._recompute_user_profile(user_id)
+        except InsufficientUserProfileDataError as exc:
+            log_event(
+                logger,
+                "user_profile_recompute_skipped",
+                level=logging.WARNING,
+                elapsed_seconds=round(time.monotonic() - started_at, 3),
+                reason=exc.code,
+                user_id=user_id,
+            )
+            raise
+        except Exception as exc:
+            log_event(
+                logger,
+                "user_profile_recompute_failed",
+                level=logging.ERROR,
+                exc_info=True,
+                elapsed_seconds=round(time.monotonic() - started_at, 3),
+                error_type=exc.__class__.__name__,
+                user_id=user_id,
+            )
+            raise
+        log_event(
+            logger,
+            "user_profile_recompute_completed",
+            elapsed_seconds=round(time.monotonic() - started_at, 3),
+            user_id=user_id,
+        )
+        return profile
+
+    def _recompute_user_profile(
+        self,
+        user_id: int,
+    ) -> UserProfileDTO:
         self._emit(
             "user_profile_started",
             entity_id=user_id,
@@ -71,22 +109,6 @@ class UserProfileFacade:
             message="Starting user profile recompute",
         )
         sources = self._load_source_ids(user_id)
-        if not self._has_any_source(sources):
-            self._emit(
-                "user_profile_failed",
-                entity_id=user_id,
-                stage="failed",
-                message="User profile has no source data",
-                payload={"source_counts": self._source_counts(sources)},
-            )
-            raise InsufficientUserProfileDataError(
-                "User profile has no source data",
-                details={
-                    "user_id": user_id,
-                    "source_counts": self._source_counts(sources),
-                },
-            )
-
         self._emit(
             "user_profile_sources_loaded",
             entity_id=user_id,
